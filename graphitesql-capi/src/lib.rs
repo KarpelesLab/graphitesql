@@ -1723,6 +1723,61 @@ pub unsafe extern "C" fn sqlite3_update_hook(
     core::ptr::null_mut()
 }
 
+/// The C `sqlite3_commit_hook` callback: returns non-zero to convert the pending
+/// commit into a rollback.
+type CommitHookCb = Option<unsafe extern "C" fn(*mut c_void) -> c_int>;
+/// The C `sqlite3_rollback_hook` callback.
+type RollbackHookCb = Option<unsafe extern "C" fn(*mut c_void)>;
+
+/// Register a commit callback (`sqlite3_commit_hook`): invoked just before each
+/// write transaction commits; a non-zero return converts the commit into a
+/// rollback. A NULL callback removes the hook. Returns the previous `pArg` — not
+/// tracked here, so always NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_commit_hook(
+    db: *mut sqlite3,
+    cb: CommitHookCb,
+    arg: *mut c_void,
+) -> *mut c_void {
+    if db.is_null() {
+        return core::ptr::null_mut();
+    }
+    let db = unsafe { &mut *db };
+    match cb {
+        Some(f) => {
+            let a = arg as usize;
+            db.conn
+                .register_commit_hook(move || unsafe { f(a as *mut c_void) });
+        }
+        None => db.conn.remove_commit_hook(),
+    }
+    core::ptr::null_mut()
+}
+
+/// Register a rollback callback (`sqlite3_rollback_hook`): invoked whenever a
+/// transaction rolls back. A NULL callback removes the hook. Returns the previous
+/// `pArg` — not tracked here, so always NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_rollback_hook(
+    db: *mut sqlite3,
+    cb: RollbackHookCb,
+    arg: *mut c_void,
+) -> *mut c_void {
+    if db.is_null() {
+        return core::ptr::null_mut();
+    }
+    let db = unsafe { &mut *db };
+    match cb {
+        Some(f) => {
+            let a = arg as usize;
+            db.conn
+                .register_rollback_hook(move || unsafe { f(a as *mut c_void) });
+        }
+        None => db.conn.remove_rollback_hook(),
+    }
+    core::ptr::null_mut()
+}
+
 // --- incremental BLOB I/O -----------------------------------------------------
 //
 // SQLite streams a single cell's bytes from disk; graphitesql's value model

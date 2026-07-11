@@ -324,6 +324,18 @@ pub struct Connection {
     /// when no hook is registered.
     #[allow(clippy::type_complexity)]
     update_hook: core::cell::RefCell<Option<Box<dyn FnMut(UpdateOp, &str, &str, i64)>>>,
+    /// The commit callback, the equivalent of `sqlite3_commit_hook`: invoked just
+    /// before a transaction (explicit `COMMIT`, an autocommit write, or the
+    /// finalizing release of an implicit transaction's outermost savepoint) is
+    /// committed. Returning a non-zero value converts the commit into a rollback
+    /// (and fires the [`rollback_hook`](Self::rollback_hook)). `None` when unset.
+    #[allow(clippy::type_complexity)]
+    commit_hook: core::cell::RefCell<Option<Box<dyn FnMut() -> i32>>>,
+    /// The rollback callback, the equivalent of `sqlite3_rollback_hook`: invoked
+    /// whenever a transaction rolls back (explicit `ROLLBACK`, or a commit vetoed
+    /// by the [`commit_hook`](Self::commit_hook)). `None` when unset.
+    #[allow(clippy::type_complexity)]
+    rollback_hook: core::cell::RefCell<Option<Box<dyn FnMut()>>>,
 }
 
 /// The kind of row change reported to an [update hook](Connection::register_update_hook).
@@ -475,6 +487,8 @@ impl Connection {
             use_vdbe: core::cell::Cell::new(true),
             session: core::cell::RefCell::new(None),
             update_hook: core::cell::RefCell::new(None),
+            commit_hook: core::cell::RefCell::new(None),
+            rollback_hook: core::cell::RefCell::new(None),
         })
     }
 
@@ -529,6 +543,8 @@ impl Connection {
             use_vdbe: core::cell::Cell::new(true),
             session: core::cell::RefCell::new(None),
             update_hook: core::cell::RefCell::new(None),
+            commit_hook: core::cell::RefCell::new(None),
+            rollback_hook: core::cell::RefCell::new(None),
         })
     }
 
@@ -4887,6 +4903,76 @@ impl Connection {
         *self.update_hook.borrow_mut() = None;
     }
 
+    /// Register a commit callback — the equivalent of `sqlite3_commit_hook`. The
+    /// callback is invoked just before each transaction commits (an explicit
+    /// `COMMIT`, an autocommit write statement, or the finalizing release of an
+    /// implicit transaction's outermost savepoint). If it returns a non-zero
+    /// value the commit is converted into a rollback (and the rollback hook, if
+    /// any, fires). Registering a new hook replaces any previous one.
+    ///
+    /// The callback must not modify the database (SQLite's rule); it is
+    /// temporarily removed while it runs, so a change it nonetheless attempts is
+    /// not reported to it recursively.
+    pub fn register_commit_hook<F>(&self, hook: F)
+    where
+        F: FnMut() -> i32 + 'static,
+    {
+        *self.commit_hook.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// Remove any callback set by [`register_commit_hook`](Self::register_commit_hook).
+    pub fn remove_commit_hook(&self) {
+        *self.commit_hook.borrow_mut() = None;
+    }
+
+    /// Register a rollback callback — the equivalent of `sqlite3_rollback_hook`.
+    /// The callback is invoked whenever a transaction rolls back (an explicit
+    /// `ROLLBACK`, or a commit vetoed by the commit hook). Registering a new hook
+    /// replaces any previous one. As with the other hooks it is removed while it
+    /// runs so it cannot recurse.
+    pub fn register_rollback_hook<F>(&self, hook: F)
+    where
+        F: FnMut() + 'static,
+    {
+        *self.rollback_hook.borrow_mut() = Some(Box::new(hook));
+    }
+
+    /// Remove any callback set by [`register_rollback_hook`](Self::register_rollback_hook).
+    pub fn remove_rollback_hook(&self) {
+        *self.rollback_hook.borrow_mut() = None;
+    }
+
+    /// Fire the commit hook (if any), returning `true` when it vetoed the commit
+    /// (returned non-zero). The hook is detached while it runs so it cannot
+    /// recurse into itself. A no-op returning `false` when no hook is set.
+    fn fire_commit_hook(&self) -> bool {
+        let taken = self.commit_hook.borrow_mut().take();
+        if let Some(mut hook) = taken {
+            let veto = hook() != 0;
+            // Restore unless the hook replaced itself while running.
+            let mut slot = self.commit_hook.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+            veto
+        } else {
+            false
+        }
+    }
+
+    /// Fire the rollback hook (if any). Detached while it runs so it cannot
+    /// recurse.
+    fn fire_rollback_hook(&self) {
+        let taken = self.rollback_hook.borrow_mut().take();
+        if let Some(mut hook) = taken {
+            hook();
+            let mut slot = self.rollback_hook.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(hook);
+            }
+        }
+    }
+
     /// Fire the update hook (if any) for one row change. Takes the callback out
     /// for the duration of the call so a reentrant change does not double-borrow
     /// or recurse; restores it afterward unless the callback replaced it.
@@ -4944,6 +5030,18 @@ impl Connection {
                 // transaction stays open (SQLite leaves it active so the caller
                 // can repair the data and COMMIT again) — nothing is committed.
                 self.check_deferred_fks()?;
+                // The commit hook fires just before committing a *write*
+                // transaction; a non-zero return converts the COMMIT to a
+                // ROLLBACK (SQLite's `sqlite3_commit_hook` semantics).
+                if self.backend.writer()?.resident_dirty_pages() > 0 && self.fire_commit_hook() {
+                    self.backend.writer()?.rollback();
+                    self.rollback_attached()?;
+                    self.in_tx = false;
+                    self.open_savepoints = 0;
+                    self.schema = Schema::read(self.backend.source())?;
+                    self.fire_rollback_hook();
+                    return Ok(0);
+                }
                 self.backend.writer()?.commit()?;
                 // Cross-database transaction: commit the temp + attached
                 // databases alongside main (a clean pager commit is a no-op).
@@ -4963,12 +5061,21 @@ impl Connection {
                 self.release_attached(name)?;
                 self.open_savepoints = self.backend.writer()?.savepoint_depth();
                 // Releasing the outermost savepoint of an implicit transaction
-                // finalizes it — verify deferred foreign keys first.
+                // finalizes it — verify deferred foreign keys first, then fire the
+                // commit hook (a veto converts the finalizing commit to a rollback).
                 if self.open_savepoints == 0 && !self.in_tx {
                     self.check_deferred_fks()?;
-                    self.backend.writer()?.commit()?;
-                    self.commit_attached()?;
-                    self.schema = Schema::read(self.backend.source())?;
+                    if self.backend.writer()?.resident_dirty_pages() > 0 && self.fire_commit_hook()
+                    {
+                        self.backend.writer()?.rollback();
+                        self.rollback_attached()?;
+                        self.schema = Schema::read(self.backend.source())?;
+                        self.fire_rollback_hook();
+                    } else {
+                        self.backend.writer()?.commit()?;
+                        self.commit_attached()?;
+                        self.schema = Schema::read(self.backend.source())?;
+                    }
                 }
                 return Ok(0);
             }
@@ -4993,6 +5100,8 @@ impl Connection {
                 self.in_tx = false;
                 self.open_savepoints = 0;
                 self.schema = Schema::read(self.backend.source())?;
+                // The rollback hook fires whenever a transaction is rolled back.
+                self.fire_rollback_hook();
                 return Ok(0);
             }
             _ => {}
@@ -5404,9 +5513,18 @@ impl Connection {
         };
 
         if !self.in_tx && self.open_savepoints == 0 {
-            self.backend.writer()?.commit()?;
-            // Refresh the catalog from the committed image.
-            self.schema = Schema::read(self.backend.source())?;
+            // Autocommit: this statement is its own transaction. Fire the commit
+            // hook when it wrote changes; a veto converts the implicit commit into
+            // a rollback (the statement's changes are discarded).
+            if self.backend.writer()?.resident_dirty_pages() > 0 && self.fire_commit_hook() {
+                self.backend.writer()?.rollback();
+                self.schema = Schema::read(self.backend.source())?;
+                self.fire_rollback_hook();
+            } else {
+                self.backend.writer()?.commit()?;
+                // Refresh the catalog from the committed image.
+                self.schema = Schema::read(self.backend.source())?;
+            }
         }
         Ok(affected)
     }
@@ -5497,8 +5615,17 @@ impl Connection {
                 self.total_changes
                     .set(self.total_changes.get() + affected as i64);
                 if !self.in_tx && self.open_savepoints == 0 {
-                    self.backend.writer()?.commit()?;
-                    self.schema = Schema::read(self.backend.source())?;
+                    // Autocommit write: fire the commit hook (a veto rolls the
+                    // statement's changes back instead of committing).
+                    if self.backend.writer()?.resident_dirty_pages() > 0 && self.fire_commit_hook()
+                    {
+                        self.backend.writer()?.rollback();
+                        self.schema = Schema::read(self.backend.source())?;
+                        self.fire_rollback_hook();
+                    } else {
+                        self.backend.writer()?.commit()?;
+                        self.schema = Schema::read(self.backend.source())?;
+                    }
                 }
                 Ok(affected)
             }

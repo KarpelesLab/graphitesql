@@ -151,6 +151,8 @@ const void *sqlite3_errmsg16(sqlite3 *db);
 void *sqlite3_update_hook(sqlite3 *db,
     void (*xCallback)(void *, int op, char const *zDb, char const *zTable, sqlite3_int64 rowid),
     void *pArg);
+void *sqlite3_commit_hook(sqlite3 *db, int (*xCallback)(void *), void *pArg);
+void *sqlite3_rollback_hook(sqlite3 *db, void (*xCallback)(void *), void *pArg);
 
 /* Incremental BLOB I/O (buffered) */
 typedef struct sqlite3_blob sqlite3_blob;

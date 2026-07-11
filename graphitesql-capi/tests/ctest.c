@@ -89,6 +89,10 @@ static void update_cb(void *arg, int op, const char *db, const char *tbl, long l
   uh_last_rowid = rowid;
 }
 
+static int ch_commits = 0, rh_rollbacks = 0, ch_veto = 0;
+static int commit_cb(void *arg) { (void)arg; ch_commits++; return ch_veto; }
+static void rollback_cb(void *arg) { (void)arg; rh_rollbacks++; }
+
 int main(void) {
   sqlite3 *db = NULL;
   int rc = sqlite3_open(":memory:", &db);
@@ -394,6 +398,31 @@ int main(void) {
   sqlite3_update_hook(db, NULL, NULL);
   sqlite3_exec(db, "INSERT INTO h VALUES (9)", NULL, NULL, NULL);
   CHECK("removed hook: still 3 inserts", uh_inserts == 3);
+
+  /* Commit / rollback hooks (sqlite3_commit_hook / sqlite3_rollback_hook). */
+  sqlite3_commit_hook(db, commit_cb, NULL);
+  sqlite3_rollback_hook(db, rollback_cb, NULL);
+  ch_commits = 0; rh_rollbacks = 0; ch_veto = 0;
+  sqlite3_exec(db, "CREATE TABLE ct(x)", NULL, NULL, NULL);   /* autocommit write */
+  sqlite3_exec(db, "INSERT INTO ct VALUES(1)", NULL, NULL, NULL);
+  CHECK("commit hook fired on autocommit writes", ch_commits == 2);
+  sqlite3_exec(db, "BEGIN", NULL, NULL, NULL);
+  sqlite3_exec(db, "INSERT INTO ct VALUES(2)", NULL, NULL, NULL);
+  sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+  CHECK("rollback hook fired on ROLLBACK", rh_rollbacks == 1);
+  /* Veto: a non-zero commit hook converts the commit into a rollback. */
+  ch_veto = 1;
+  sqlite3_exec(db, "INSERT INTO ct VALUES(3)", NULL, NULL, NULL);
+  {
+    sqlite3_stmt *cs = NULL;
+    sqlite3_prepare_v2(db, "SELECT count(*) FROM ct", -1, &cs, NULL);
+    sqlite3_step(cs);
+    CHECK("commit veto rolled the write back", sqlite3_column_int(cs, 0) == 1);
+    sqlite3_finalize(cs);
+  }
+  CHECK("commit veto fired the rollback hook", rh_rollbacks == 2);
+  sqlite3_commit_hook(db, NULL, NULL);
+  sqlite3_rollback_hook(db, NULL, NULL);
 
   /* Incremental BLOB I/O: open a cell, read it, overwrite a byte, verify. */
   sqlite3_exec(db, "CREATE TABLE blobs(id INTEGER PRIMARY KEY, data BLOB)", NULL, NULL, NULL);
