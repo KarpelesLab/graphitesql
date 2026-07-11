@@ -781,7 +781,7 @@ impl Parser {
     /// the source text verbatim (or `incomplete input` past the end).
     fn near_msg(&self, idx: usize) -> String {
         match self.syntax_error(idx) {
-            Error::Parse(m) => m,
+            Error::Parse(m) | Error::ParseAt(m, _) => m,
             _ => String::new(),
         }
     }
