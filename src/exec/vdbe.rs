@@ -273,8 +273,34 @@ pub enum Op {
     GroupAgg { slot: usize, dest: usize },
     /// Advance the group cursor; jump back to `target` if a group remains.
     GroupNext { target: usize },
+    /// Evaluate a *correlated* scalar subquery (`(SELECT … WHERE inner = outer)`)
+    /// against the current cursor-0 row, storing its single-column value (or NULL
+    /// for an empty result) in `dest`. `sub` indexes [`Program::subqueries`]. The
+    /// interpreter re-runs the subquery through the executor's tree-walker with the
+    /// current outer row bound as an outer frame (via the [`SubqueryEval`]
+    /// callback), so the value matches the tree-walker and SQLite exactly. Only
+    /// emitted for a live single-table scan (which supplies the callback).
+    CorrelatedScalar { sub: usize, dest: usize },
+    /// Evaluate a *correlated* `[NOT] EXISTS (SELECT … WHERE inner = outer)`
+    /// against the current cursor-0 row, storing `1`/`0` in `dest` (inverted when
+    /// `negated`). Same callback mechanism as [`Op::CorrelatedScalar`].
+    CorrelatedExists {
+        sub: usize,
+        negated: bool,
+        dest: usize,
+    },
     /// Stop execution.
     Halt,
+}
+
+/// A correlated subquery captured at compile time, re-evaluated per outer row by
+/// the interpreter through the [`SubqueryEval`] callback. The stored `Select` is
+/// the subquery body verbatim; an outer-column reference inside it resolves to the
+/// current outer row that the callback pushes as an outer frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CorrelatedSub {
+    /// The subquery body (its own `FROM`/`WHERE`/projection).
+    pub select: Select,
 }
 
 /// One per-group aggregate in a [`Op::GroupStep`]: its function and the register
@@ -395,6 +421,11 @@ pub struct Program {
     pub n_registers: usize,
     /// Output column labels (parallel to each `ResultRow`'s register span).
     pub columns: Vec<String>,
+    /// Correlated subqueries referenced by [`Op::CorrelatedScalar`] /
+    /// [`Op::CorrelatedExists`] (by index). Non-empty only for the live
+    /// single-table scan path that supplies a [`SubqueryEval`] callback; every
+    /// other construction path leaves it empty.
+    pub subqueries: Vec<CorrelatedSub>,
 }
 
 impl Program {
@@ -532,6 +563,8 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
         forbid_raw_columns: false,
         rowid_index: None,
         cursor_boundaries: None,
+        correlated_subqueries: false,
+        subqueries: Vec::new(),
     };
     // A FROM-less `SELECT … WHERE <pred>` evaluates the predicate once over the
     // single (rowless) row and emits the projection only when it is true; a NULL
@@ -622,6 +655,7 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
     }
     Ok(Program {
         ops: c.ops,
+        subqueries: core::mem::take(&mut c.subqueries),
         n_registers: c.next_reg,
         columns,
     })
@@ -1055,6 +1089,8 @@ fn compile_aggregate_select(
         forbid_raw_columns: false,
         rowid_index: None,
         cursor_boundaries: None,
+        correlated_subqueries: false,
+        subqueries: Vec::new(),
     };
     let rewind = c.ops.len();
     c.ops.push(Op::Rewind { target: 0 });
@@ -1114,6 +1150,7 @@ fn compile_aggregate_select(
     c.ops.push(Op::Halt);
     Ok(Program {
         ops: c.ops,
+        subqueries: core::mem::take(&mut c.subqueries),
         n_registers: c.next_reg,
         columns: projections.iter().map(|(_, l)| l.clone()).collect(),
     })
@@ -1465,6 +1502,8 @@ fn compile_group_select(
         forbid_raw_columns: false,
         rowid_index: None,
         cursor_boundaries: boundaries.map(|b| b.to_vec()),
+        correlated_subqueries: false,
+        subqueries: Vec::new(),
     };
     // Resolve each grouping key. A bare column becomes a (combined) column index;
     // any other expression is kept and evaluated per row in the fold (its value
@@ -2039,6 +2078,7 @@ fn compile_group_select(
     c.ops.push(Op::Halt);
     Ok(Program {
         ops: c.ops,
+        subqueries: core::mem::take(&mut c.subqueries),
         n_registers: c.next_reg,
         columns: projections.iter().map(|(_, l)| l.clone()).collect(),
     })
@@ -2069,6 +2109,8 @@ fn compile_group_emit(
         forbid_raw_columns: false,
         rowid_index: None,
         cursor_boundaries: boundaries.map(|b| b.to_vec()),
+        correlated_subqueries: false,
+        subqueries: Vec::new(),
     };
     // Classify each output column as a grouping-key reference or an aggregate.
     // Column refs resolve through `resolve_column` (qualifier-aware) so a join's
@@ -2152,6 +2194,7 @@ fn compile_group_emit(
     c.ops.push(Op::Halt);
     Ok(Program {
         ops: c.ops,
+        subqueries: core::mem::take(&mut c.subqueries),
         n_registers: c.next_reg,
         columns: projections.iter().map(|(_, l)| l.clone()).collect(),
     })
@@ -2169,6 +2212,25 @@ pub fn compile_table_select(
     collations: &[Collation],
     rowid: bool,
 ) -> Result<Program> {
+    compile_table_select_opts(sel, columns, tables, affinities, collations, rowid, false)
+}
+
+/// Like [`compile_table_select`], but `allow_correlated` opts the single-cursor
+/// scan into compiling a correlated scalar / `EXISTS` subquery to an
+/// [`Op::CorrelatedScalar`] / [`Op::CorrelatedExists`] callback op (B5c-2). Only
+/// the live single-table scan sets it, because only that path supplies the
+/// [`SubqueryEval`] callback the op needs at run time; every other caller leaves
+/// it `false`, so an unfoldable subquery defers to the tree-walker exactly as
+/// before.
+pub fn compile_table_select_opts(
+    sel: &Select,
+    columns: &[String],
+    tables: &[String],
+    affinities: &[Affinity],
+    collations: &[Collation],
+    rowid: bool,
+    allow_correlated: bool,
+) -> Result<Program> {
     if !sel.compound.is_empty() {
         return Err(Error::Unsupported("VDBE: only plain table projections"));
     }
@@ -2185,6 +2247,7 @@ pub fn compile_table_select(
     if matches!(&sel.limit, Some(Expr::Literal(Literal::Integer(0)))) {
         return Ok(Program {
             ops: alloc::vec![Op::Halt],
+            subqueries: Vec::new(),
             n_registers: projections.len(),
             columns: projections.iter().map(|(_, l)| l.clone()).collect(),
         });
@@ -2242,6 +2305,8 @@ pub fn compile_table_select(
         forbid_raw_columns: false,
         rowid_index,
         cursor_boundaries: None,
+        correlated_subqueries: allow_correlated,
+        subqueries: Vec::new(),
     };
     // Optional LIMIT (constant integer only): a counter register decremented
     // after each emitted row, halting the loop at zero.
@@ -2442,6 +2507,7 @@ pub fn compile_table_select(
     c.ops.push(Op::Halt);
     Ok(Program {
         ops: c.ops,
+        subqueries: core::mem::take(&mut c.subqueries),
         n_registers: c.next_reg,
         columns: projections.into_iter().map(|(_, l)| l).collect(),
     })
@@ -2622,6 +2688,7 @@ pub fn compile_join2(
     if matches!(&sel.limit, Some(Expr::Literal(Literal::Integer(0)))) {
         return Ok(Program {
             ops: alloc::vec![Op::Halt],
+            subqueries: Vec::new(),
             n_registers: count,
             columns: projections.into_iter().map(|(_, l)| l).collect(),
         });
@@ -2637,6 +2704,8 @@ pub fn compile_join2(
         forbid_raw_columns: false,
         rowid_index: None,
         cursor_boundaries: Some(boundaries.to_vec()),
+        correlated_subqueries: false,
+        subqueries: Vec::new(),
     };
     // LIMIT / OFFSET counters (constant integer only; negative LIMIT = unlimited,
     // non-positive OFFSET = none).
@@ -2832,6 +2901,7 @@ pub fn compile_join2(
     }
     Ok(Program {
         ops: c.ops,
+        subqueries: core::mem::take(&mut c.subqueries),
         n_registers: c.next_reg,
         columns: projections.into_iter().map(|(_, l)| l).collect(),
     })
@@ -2904,6 +2974,8 @@ pub fn compile_aggregate_join(
         forbid_raw_columns: false,
         rowid_index: None,
         cursor_boundaries: Some(boundaries.to_vec()),
+        correlated_subqueries: false,
+        subqueries: Vec::new(),
     };
     // N-deep nested loop (cursor 0 outermost), as in `compile_join2`.
     let mut rewind_at = alloc::vec![0usize; n];
@@ -2982,6 +3054,7 @@ pub fn compile_aggregate_join(
     c.ops.push(Op::Halt);
     Ok(Program {
         ops: c.ops,
+        subqueries: core::mem::take(&mut c.subqueries),
         n_registers: c.next_reg,
         columns: projections.into_iter().map(|(_, l)| l).collect(),
     })
@@ -3086,6 +3159,7 @@ pub fn compile_left_join2(
     if matches!(&sel.limit, Some(Expr::Literal(Literal::Integer(0)))) {
         return Ok(Program {
             ops: alloc::vec![Op::Halt],
+            subqueries: Vec::new(),
             n_registers: count,
             columns: projections.into_iter().map(|(_, l)| l).collect(),
         });
@@ -3101,6 +3175,8 @@ pub fn compile_left_join2(
         forbid_raw_columns: false,
         rowid_index: None,
         cursor_boundaries: Some(alloc::vec![n_left, columns.len()]),
+        correlated_subqueries: false,
+        subqueries: Vec::new(),
     };
     let limit_reg = match &sel.limit {
         None => None,
@@ -3386,6 +3462,7 @@ pub fn compile_left_join2(
     }
     Ok(Program {
         ops: c.ops,
+        subqueries: core::mem::take(&mut c.subqueries),
         n_registers: c.next_reg,
         columns: projections.into_iter().map(|(_, l)| l).collect(),
     })
@@ -3498,6 +3575,7 @@ pub fn compile_full_join2(
     if matches!(&sel.limit, Some(Expr::Literal(Literal::Integer(0)))) {
         return Ok(Program {
             ops: alloc::vec![Op::Halt],
+            subqueries: Vec::new(),
             n_registers: count,
             columns: projections.into_iter().map(|(_, l)| l).collect(),
         });
@@ -3513,6 +3591,8 @@ pub fn compile_full_join2(
         forbid_raw_columns: false,
         rowid_index: None,
         cursor_boundaries: Some(alloc::vec![n_left, columns.len()]),
+        correlated_subqueries: false,
+        subqueries: Vec::new(),
     };
     let limit_reg = match &sel.limit {
         None => None,
@@ -3793,6 +3873,7 @@ pub fn compile_full_join2(
     }
     Ok(Program {
         ops: c.ops,
+        subqueries: core::mem::take(&mut c.subqueries),
         n_registers: c.next_reg,
         columns: projections.into_iter().map(|(_, l)| l).collect(),
     })
@@ -4002,6 +4083,7 @@ pub fn compile_left_join_n(
     if matches!(&sel.limit, Some(Expr::Literal(Literal::Integer(0)))) {
         return Ok(Program {
             ops: alloc::vec![Op::Halt],
+            subqueries: Vec::new(),
             n_registers: count,
             columns: projections.into_iter().map(|(_, l)| l).collect(),
         });
@@ -4017,6 +4099,8 @@ pub fn compile_left_join_n(
         forbid_raw_columns: false,
         rowid_index: None,
         cursor_boundaries: Some(boundaries.to_vec()),
+        correlated_subqueries: false,
+        subqueries: Vec::new(),
     };
     let limit_reg = match &sel.limit {
         None => None,
@@ -4135,6 +4219,7 @@ pub fn compile_left_join_n(
     }
     Ok(Program {
         ops: c.ops,
+        subqueries: core::mem::take(&mut c.subqueries),
         n_registers: c.next_reg,
         columns: projections.into_iter().map(|(_, l)| l).collect(),
     })
@@ -4179,6 +4264,17 @@ struct Compiler {
     /// multi-cursor `Op::ColumnC`; when `None` (every single-cursor path) it emits
     /// the plain `Op::Column` against cursor 0.
     cursor_boundaries: Option<Vec<usize>>,
+    /// When `true`, a scalar / `EXISTS` subquery the inline const path cannot fold
+    /// (a real `FROM`, a correlated reference, …) is compiled to an
+    /// [`Op::CorrelatedScalar`] / [`Op::CorrelatedExists`] callback op instead of
+    /// deferring — the interpreter re-runs it per outer row through the tree-walker
+    /// (B5c-2). Enabled only for the live single-table scan (which supplies the
+    /// [`SubqueryEval`] callback); every other path leaves it `false` so behaviour
+    /// is unchanged.
+    correlated_subqueries: bool,
+    /// Correlated subqueries registered by the compiler (parallel to the `sub`
+    /// index in the emitted ops); moved into [`Program::subqueries`].
+    subqueries: Vec<CorrelatedSub>,
 }
 
 impl Compiler {
@@ -4741,6 +4837,24 @@ impl Compiler {
             // `Unsupported` and defers to the tree-walker, which evaluates or
             // rejects it exactly as SQLite does.
             Expr::Subquery(sel) => {
+                // Live single-table scan (B5c-2): re-evaluate the subquery per outer
+                // row through the [`SubqueryEval`] callback (which pushes the outer
+                // row as an outer frame and re-runs the tree-walker), so a
+                // *correlated* reference resolves to the outer value. Every subquery
+                // reaching compilation here is already unfoldable (the non-correlated
+                // ones were folded to constants before this program was compiled), so
+                // routing them all through the callback is both correct and identical
+                // to the tree-walker. Only enabled on the live path (`allow_correlated`),
+                // where the callback is supplied; every other path keeps the inline
+                // const grammar below.
+                if self.correlated_subqueries {
+                    let sub = self.subqueries.len();
+                    self.subqueries.push(CorrelatedSub {
+                        select: (**sel).clone(),
+                    });
+                    self.ops.push(Op::CorrelatedScalar { sub, dest });
+                    return Ok(());
+                }
                 if sel.from.is_some()
                     || !sel.ctes.is_empty()
                     || !sel.window_defs.is_empty()
@@ -4801,6 +4915,21 @@ impl Compiler {
                 select: sel,
                 negated,
             } => {
+                // Live single-table scan (B5c-2): re-evaluate per outer row through
+                // the callback, so a correlated `EXISTS`/`NOT EXISTS` resolves its
+                // outer reference (see the `Expr::Subquery` arm above).
+                if self.correlated_subqueries {
+                    let sub = self.subqueries.len();
+                    self.subqueries.push(CorrelatedSub {
+                        select: (**sel).clone(),
+                    });
+                    self.ops.push(Op::CorrelatedExists {
+                        sub,
+                        negated: *negated,
+                        dest,
+                    });
+                    return Ok(());
+                }
                 if sel.from.is_some()
                     || !sel.ctes.is_empty()
                     || !sel.window_defs.is_empty()
@@ -4946,6 +5075,21 @@ pub trait Cursor0Source {
     fn column(&self, col: usize) -> Value;
 }
 
+/// Callback the live-scan interpreter uses to evaluate a correlated subquery
+/// against the current outer row. The single implementor (in `exec::mod`) reads
+/// the current outer row's columns from `cur` (it knows the outer scan's column
+/// layout), pushes them as an outer frame, and re-runs the subquery through the
+/// tree-walker — so the result is identical to the tree-walker's own correlated
+/// evaluation (and thus to SQLite).
+pub trait SubqueryEval {
+    /// Evaluate correlated `(SELECT …)` to its single scalar value (NULL for an
+    /// empty result), binding the current row of `cur` as the outer frame.
+    fn scalar(&self, sel: &Select, cur: &dyn Cursor0Source) -> Result<Value>;
+    /// Evaluate correlated `EXISTS (SELECT …)` to a boolean, binding the current
+    /// row of `cur` as the outer frame.
+    fn exists(&self, sel: &Select, cur: &dyn Cursor0Source) -> Result<bool>;
+}
+
 /// A [`Cursor0Source`] over an already-materialized row-set — the classic path
 /// used by [`run_rows`] / [`run_rows_multi`]. Cheap positional indexing; no I/O.
 pub struct MaterializedCursor0<'a> {
@@ -4993,7 +5137,18 @@ pub fn run_rows(program: &Program, table_rows: &[Vec<Value>]) -> Result<Vec<Vec<
 /// row-sets. The projection, filter, sort, DISTINCT, LIMIT, aggregate and
 /// GROUP BY machinery is shared verbatim with [`run_rows_multi`].
 pub fn run_live_scan(program: &Program, src: &mut dyn Cursor0Source) -> Result<Vec<Vec<Value>>> {
-    run_rows_multi_impl(program, &[], src)
+    run_rows_multi_impl(program, &[], src, None)
+}
+
+/// Like [`run_live_scan`] but with a [`SubqueryEval`] callback so the program may
+/// emit [`Op::CorrelatedScalar`] / [`Op::CorrelatedExists`] — a correlated
+/// subquery is re-evaluated per outer row against the current cursor-0 row (B5c-2).
+pub fn run_live_scan_with_subqueries(
+    program: &Program,
+    src: &mut dyn Cursor0Source,
+    eval: &dyn SubqueryEval,
+) -> Result<Vec<Vec<Value>>> {
+    run_rows_multi_impl(program, &[], src, Some(eval))
 }
 
 /// Run a compiled program over several cursors' materialized row-sets (the
@@ -5004,7 +5159,7 @@ pub fn run_rows_multi(program: &Program, rowsets: &[&[Vec<Value>]]) -> Result<Ve
     // Cursor 0's single-cursor ops read from a materialized view over `rowsets[0]`;
     // the multi-cursor join ops still index `rowsets` directly.
     let mut c0 = MaterializedCursor0::new(rowsets.first().copied().unwrap_or(&[]));
-    run_rows_multi_impl(program, rowsets, &mut c0)
+    run_rows_multi_impl(program, rowsets, &mut c0, None)
 }
 
 /// Shared interpreter body for both the materialized ([`run_rows_multi`]) and the
@@ -5017,6 +5172,7 @@ fn run_rows_multi_impl(
     program: &Program,
     rowsets: &[&[Vec<Value>]],
     c0: &mut dyn Cursor0Source,
+    subquery_eval: Option<&dyn SubqueryEval>,
 ) -> Result<Vec<Vec<Value>>> {
     let mut regs: Vec<Value> = alloc::vec![Value::Null; program.n_registers];
     let mut out = Vec::new();
@@ -5547,6 +5703,24 @@ fn run_rows_multi_impl(
                 if gcursor < emit_groups.len() {
                     pc = *target;
                 }
+            }
+            // A correlated subquery: re-evaluate it against the current outer row
+            // via the callback (which pushes the row as an outer frame and re-runs
+            // the tree-walker). Emitted only on the live-scan path, so the callback
+            // is always present when these ops appear; a missing callback is a
+            // compiler bug, surfaced as an internal error rather than a panic.
+            Op::CorrelatedScalar { sub, dest } => {
+                let eval = subquery_eval.ok_or(Error::Unsupported(
+                    "VDBE: correlated subquery without evaluator",
+                ))?;
+                regs[*dest] = eval.scalar(&program.subqueries[*sub].select, c0)?;
+            }
+            Op::CorrelatedExists { sub, negated, dest } => {
+                let eval = subquery_eval.ok_or(Error::Unsupported(
+                    "VDBE: correlated subquery without evaluator",
+                ))?;
+                let found = eval.exists(&program.subqueries[*sub].select, c0)?;
+                regs[*dest] = Value::Integer((found ^ *negated) as i64);
             }
             Op::Halt => break,
         }

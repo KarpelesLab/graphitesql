@@ -707,18 +707,20 @@ fn noncorrelated_scalar_and_exists_subqueries_fold_on_vdbe() {
         );
     }
 
-    // A *correlated* subquery references the outer row, so it is NOT folded and
-    // the VDBE defers to the tree-walker (which is still correct). A scalar
-    // subquery projecting a bare column is likewise left alone (it would carry
-    // that column's affinity, which a plain literal would not).
-    assert!(
-        c.query_vdbe("SELECT v FROM t a WHERE v > (SELECT avg(v) FROM t b WHERE b.g = a.g)")
-            .is_err()
-    );
-    assert!(
-        c.query_vdbe("SELECT v FROM t WHERE g = (SELECT g FROM t WHERE v = 25)")
-            .is_err()
-    );
+    // A *correlated* subquery now runs on the VDBE (B5c-2): the interpreter
+    // re-evaluates the body per outer row through the tree-walker, so the result
+    // is byte-identical to the tree-walker's. (Before B5c-2 these deferred; the
+    // gated invariant is still VDBE == tree-walker.)
+    for q in [
+        "SELECT v FROM t a WHERE v > (SELECT avg(v) FROM t b WHERE b.g = a.g)",
+        "SELECT v FROM t WHERE g = (SELECT g FROM t WHERE v = 25)",
+    ] {
+        assert_eq!(
+            c.query_vdbe(q).unwrap().rows,
+            c.query(q).unwrap().rows,
+            "VDBE must match the tree-walker for {q}"
+        );
+    }
 }
 
 #[test]

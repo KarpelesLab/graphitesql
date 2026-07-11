@@ -75,15 +75,20 @@ fn nested_subquery_folds_on_vdbe_and_matches_tree_walker() {
 }
 
 #[test]
-fn correlated_nested_subquery_falls_back() {
+fn correlated_nested_subquery_runs_on_vdbe() {
     let c = conn();
     // The innermost subquery references the OUTERMOST row (`x.g`), so the middle
-    // subquery is correlated and must not be folded to a constant.
+    // subquery is correlated (not foldable to a constant). B5c-2 now runs it on
+    // the VDBE, re-evaluating the correlated body per outer row — byte-identical
+    // to the tree-walker.
     let q = "SELECT x.g, (SELECT max(n) FROM t WHERE n < \
              (SELECT avg(n) FROM t t2 WHERE t2.g = x.g)) \
              FROM t x ORDER BY x.g, x.n";
-    assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
-    assert!(c.query(q).is_ok(), "tree-walker should run {q}");
+    assert_eq!(
+        c.query_vdbe(q).unwrap().rows,
+        c.query(q).unwrap().rows,
+        "VDBE must match the tree-walker for {q}"
+    );
 }
 
 #[test]

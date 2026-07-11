@@ -276,17 +276,18 @@ result or declines to it — never a wrong answer), so this track is
   collation and skips the comparison-affinity that `o.x = t.k` applies — routing
   it risks a silent false-negative that wouldn't fall back; needs the tree-walker's
   affinity machinery threaded in first).
-- **B5c-2 — correlated subqueries on the VDBE.** Any subquery reading an outer
-  column defers to the tree-walker today. *Attempted and reverted (2026-07-09,
-  revert 0623182):* a runtime callback re-running the subquery per outer row
-  cannot replicate sqlite's **PREPARE-time validation** — an invalid subquery over
-  a zero-row outer scan (`(SELECT 1,2)`, `(SELECT unknown.col)` over an empty
-  table) is never evaluated, so graphite silently accepted what sqlite rejects
-  (regressed `row_value_misuse` + `subquery_body_columns`, caught by CI). The redo
-  must **validate the subquery body at compile time** (resolve every column against
-  the scope, check scalar arity) and route only provably-valid correlated
-  subqueries, bailing the rest to the tree-walker. Low priority — no user-visible
-  benefit (results already match via the tree-walker).
+- **B5c-2 — correlated subqueries on the VDBE. DONE 2026-07-11.** A correlated
+  scalar/`EXISTS` subquery on a single-table live scan now runs on the VDBE (a
+  `SubqueryEval` callback re-evaluates the body per outer row through the
+  tree-walker, so the value matches). The **prepare-time validation gap** that
+  forced the 2026-07-09 revert is closed: `run_core`'s post-VDBE-success path now
+  runs the same subquery-body/arity/row-value checks the tree-walker runs
+  (`validate_subquery_body_columns` → `reject_invalid_in_subquery_arity` →
+  `reject_invalid_scalar_subquery_arity` → `reject_row_value_misuse`), over the
+  outer FROM scope resolved *without materializing rows* (`window_join_source_columns`)
+  — so `a > (SELECT 1,2)` and `(SELECT u.a)` over a zero-row/filtered scan error
+  exactly as SQLite, not silently accepted. `row_value_misuse` + `subquery_body_columns`
+  green again; results byte-identical to the tree-walker (`tests/vdbe_correlated_subquery.rs`).
 - **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT seek; RIGHT/FULL still
   materialize the inner table (correct, just not seek-driven).
 
