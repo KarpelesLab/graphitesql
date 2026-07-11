@@ -89,6 +89,9 @@ fn one_shot_error_rendering_matches_sqlite() {
         "SELECT 1 INTERSECT SELECT 1,2",
         "VALUES(1),(1,2)", // VALUES term-count mismatch
         "REINDEX nope",    // unable to identify the object to be reindexed
+        "SELECT ?0",       // variable number must be between ?1 and ?32766
+        "SELECT ?40000",
+        "SELECT ?9999999999999", // too large for u32, same range message
         "CREATE TABLE a(x); CREATE TABLE b(y); SELECT * FROM a JOIN b USING(x)", // USING col not in both
         "CREATE TABLE t(a); ALTER TABLE t DROP COLUMN a", // cannot drop last column
         "CREATE TABLE t(a PRIMARY KEY, b); ALTER TABLE t DROP COLUMN a", // cannot drop PK column

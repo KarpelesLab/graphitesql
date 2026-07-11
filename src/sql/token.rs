@@ -521,10 +521,16 @@ impl<'a> Tokenizer<'a> {
                 if self.pos == start {
                     Ok(Token::Param(Param::Anonymous))
                 } else {
-                    let n = self.src[start..self.pos]
-                        .parse::<u32>()
-                        .map_err(|_| self.err("invalid parameter number"))?;
-                    Ok(Token::Param(Param::Numbered(n)))
+                    // SQLite bounds `?N` to `1 ..= SQLITE_MAX_VARIABLE_NUMBER`
+                    // (32766 by default); anything else — including a value too
+                    // large for `u32` — is rejected at prepare time with this exact
+                    // message (no byte position, unlike other lex errors).
+                    match self.src[start..self.pos].parse::<u32>() {
+                        Ok(n) if (1..=32766).contains(&n) => Ok(Token::Param(Param::Numbered(n))),
+                        _ => Err(Error::Parse(
+                            "variable number must be between ?1 and ?32766".into(),
+                        )),
+                    }
                 }
             }
             _ => {
