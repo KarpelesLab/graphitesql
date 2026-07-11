@@ -140,3 +140,42 @@ fn matches_sqlite_cli() {
         .collect();
     assert_eq!(got.join("\n"), want);
 }
+
+/// `INSERT … SELECT … RETURNING …` — a `RETURNING` clause following a `SELECT`
+/// data source (rather than `VALUES`). `RETURNING` is a reserved word, so the
+/// SELECT-source parse must stop at it and let the INSERT consume it; previously
+/// `opt_alias` tried to read `RETURNING` as an implicit column/table alias and
+/// the parse failed at `near "RETURNING"`. Verified against the sqlite3 CLI,
+/// including a leading `WITH`, an `ORDER BY`/`LIMIT` and `UNION` in the source,
+/// and that a bare `returning` used as an alias still errors identically.
+#[test]
+fn insert_select_returning_matches_sqlite() {
+    if !sqlite3_available() {
+        eprintln!("sqlite3 CLI not found; skipping");
+        return;
+    }
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    let out = |bin: &str, sql: &str| -> String {
+        let o = Command::new(bin).arg(":memory:").arg(sql).output().unwrap();
+        let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+        s.push_str(&String::from_utf8_lossy(&o.stderr));
+        s.trim_end().to_string()
+    };
+    let base = "CREATE TABLE u(a INTEGER PRIMARY KEY, b); \
+                CREATE TABLE t(a, b); INSERT INTO t VALUES(10,'x'),(20,'y');";
+    for sql in [
+        "INSERT INTO u SELECT * FROM t RETURNING *;",
+        "INSERT INTO u SELECT * FROM t RETURNING a, b, a*2;",
+        "INSERT INTO u(b) SELECT b FROM t WHERE a>10 RETURNING a, b;",
+        "INSERT INTO u SELECT * FROM t ORDER BY a DESC LIMIT 1 RETURNING b AS bee;",
+        "WITH s AS (SELECT * FROM t) INSERT INTO u SELECT * FROM s RETURNING rowid, *;",
+        "INSERT INTO u SELECT * FROM (SELECT * FROM t) RETURNING a;",
+        // `RETURNING` is reserved: a bare/aliased use still errors identically.
+        "INSERT INTO u SELECT * FROM t RETURNING nosuchcol;",
+        "SELECT 2 returning;",
+        "SELECT 2 AS returning;",
+    ] {
+        let full = format!("{base} {sql}");
+        assert_eq!(out("sqlite3", &full), out(g, &full), "for {sql}");
+    }
+}

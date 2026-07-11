@@ -3318,6 +3318,14 @@ fn is_reserved_after_expr(w: &str) -> bool {
             | "window"
             | "indexed"
             | "not"
+            // `RETURNING` ends the SELECT that sources an `INSERT … SELECT …
+            // RETURNING …`: without this, `opt_alias` treats it as an implicit
+            // column/table alias and `ident()` then rejects the reserved word,
+            // failing the parse at `RETURNING` before the INSERT's own
+            // `returning_clause` runs. A bare `returning` in expression/alias
+            // position is still rejected (it is in `is_reserved_name`, so a
+            // standalone `SELECT 2 returning` stays `near "returning"`).
+            | "returning"
     )
 }
 
