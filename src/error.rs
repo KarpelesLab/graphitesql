@@ -61,11 +61,13 @@ impl Error {
     /// equivalent concept.
     pub fn code(&self) -> i32 {
         match self {
-            // A "datatype mismatch" is SQLite's `SQLITE_MISMATCH` (20) — e.g. a
-            // non-integer `LIMIT`/`OFFSET`, or an incompatible INTEGER PRIMARY KEY
-            // value. Its message is a fixed SQLite string, so key the code off it
-            // rather than adding a dedicated variant.
+            // A few generic (`Error`) messages map to a specific SQLite extended
+            // code, keyed off the fixed message rather than a dedicated variant: a
+            // "datatype mismatch" (non-integer `LIMIT`/`OFFSET`, incompatible INTEGER
+            // PRIMARY KEY value) is `SQLITE_MISMATCH` (20), and a "string or blob too
+            // big" is `SQLITE_TOOBIG` (18).
             Error::Error(m) | Error::ErrorAt(m, _) if m == "datatype mismatch" => 20,
+            Error::Error(m) | Error::ErrorAt(m, _) if m == "string or blob too big" => 18,
             Error::Error(_)
             | Error::ErrorAt(..)
             | Error::Parse(_)
@@ -113,3 +115,26 @@ impl fmt::Display for Error {
 
 #[cfg(feature = "std")]
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+    use alloc::string::ToString;
+
+    #[test]
+    fn message_keyed_extended_codes() {
+        // A datatype mismatch is SQLITE_MISMATCH (20), a too-big value is
+        // SQLITE_TOOBIG (18); every other generic error stays SQLITE_ERROR (1).
+        assert_eq!(Error::Error("datatype mismatch".to_string()).code(), 20);
+        assert_eq!(
+            Error::ErrorAt("datatype mismatch".to_string(), 4).code(),
+            20
+        );
+        assert_eq!(
+            Error::Error("string or blob too big".to_string()).code(),
+            18
+        );
+        assert_eq!(Error::Error("no such column: x".to_string()).code(), 1);
+        assert_eq!(Error::Constraint("UNIQUE …".to_string()).code(), 19);
+    }
+}
