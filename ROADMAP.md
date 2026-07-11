@@ -308,6 +308,12 @@ result or declines to it — never a wrong answer), so this track is
   subquery against it through the same `SubqueryEval` callback. A reference to a non-key
   column, or a `HAVING`/`ORDER BY`/`DISTINCT` grouped shape (the general path), still defers
   to the tree-walker. Byte-identical to sqlite (`tests/vdbe_correlated_subquery.rs`).
+  *Extended to materialized single sources (2026-07-11):* the materialized single-source
+  path (a derived table / CTE / view / TVF / `WITHOUT ROWID` table — the shapes the
+  live-scan path declines) now compiles with `allow_correlated` and, when the program
+  carries a subquery, runs it through a `LiveSubqueryEval` over the source's columns — so a
+  correlated scalar/`EXISTS` (per row) or a group-key correlated `GROUP BY` projection (per
+  group) over a derived/CTE source runs on the VDBE instead of deferring.
   (`GROUP BY`-**join** correlated, and non-key grouped references, still defer.)
 - **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT seek; RIGHT/FULL still
   materialize the inner table (correct, just not seek-driven).

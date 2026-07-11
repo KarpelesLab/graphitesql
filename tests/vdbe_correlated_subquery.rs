@@ -258,3 +258,31 @@ fn noncorrelated_subqueries_unregressed() {
         vec![vec![i(1)], vec![i(2)], vec![i(3)]],
     );
 }
+
+#[test]
+fn correlated_subquery_over_derived_and_cte_source() {
+    let c = setup();
+    // A correlated scalar subquery over a *derived-table* source runs on the VDBE
+    // materialized single-source path (previously deferred): the derived row is the
+    // outer scope, and `d.k` correlates into the inner predicate.
+    both(
+        &c,
+        "SELECT x, (SELECT count(*) FROM b WHERE b.p = d.k) \
+         FROM (SELECT * FROM a) d ORDER BY x",
+        vec![vec![i(1), i(1)], vec![i(2), i(2)], vec![i(3), i(0)]],
+    );
+    // A group-key correlated subquery in a GROUP BY projection over a derived source.
+    both(
+        &c,
+        "SELECT k, (SELECT count(*) FROM b WHERE b.p = d.k) \
+         FROM (SELECT * FROM a) d GROUP BY k",
+        vec![vec![i(10), i(1)], vec![i(20), i(2)], vec![i(30), i(0)]],
+    );
+    // A correlated EXISTS over a CTE source.
+    both(
+        &c,
+        "WITH d AS (SELECT * FROM a) \
+         SELECT x FROM d WHERE EXISTS (SELECT 1 FROM b WHERE b.p = d.k) ORDER BY x",
+        vec![vec![i(1)], vec![i(2)]],
+    );
+}

@@ -3066,15 +3066,44 @@ impl Connection {
                 }
             }
         }
-        let prog = vdbe::compile_table_select(
+        // Compile with `allow_correlated` so a correlated scalar/`EXISTS` subquery
+        // over this materialized source (a derived table / CTE / view / TVF /
+        // `WITHOUT ROWID` table — the shapes the live-scan path declines) runs on
+        // the VDBE too, re-evaluated per row (or per group, for a group-key
+        // correlated GROUP BY projection) through the `SubqueryEval` callback. A
+        // program without such a subquery leaves `subqueries` empty and takes the
+        // plain `run_rows` path unchanged.
+        let prog = vdbe::compile_table_select_opts(
             sel,
             &col_names,
             &col_tables,
             &col_aff,
             &col_coll,
             has_rowid,
+            true,
         )?;
-        let result = vdbe::run_rows(&prog, &rows)?;
+        let result = if prog.subqueries.is_empty() {
+            vdbe::run_rows(&prog, &rows)?
+        } else {
+            let cols: Vec<ColumnInfo> = (0..col_names.len())
+                .map(|i| ColumnInfo {
+                    name: col_names[i].clone(),
+                    table: col_tables[i].clone(),
+                    affinity: col_aff[i],
+                    collation: col_coll[i],
+                    schema: None,
+                    hidden: false,
+                })
+                .collect();
+            // The rowid, when present, is the trailing value each row carries past
+            // the named columns (see the `has_rowid` append above).
+            let eval = LiveSubqueryEval {
+                conn: self,
+                columns: &cols,
+                rowid_index: has_rowid.then_some(col_names.len()),
+            };
+            vdbe::run_rows_multi_with_subqueries(&prog, &[&rows], &eval)?
+        };
         Ok(QueryResult {
             columns: prog.columns,
             rows: result,
