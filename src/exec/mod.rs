@@ -37052,14 +37052,15 @@ fn is_temp_schema_table(name: &str) -> bool {
         || name.eq_ignore_ascii_case("sqlite_temp_master")
 }
 
-/// Reject a direct DML write to the schema catalog, as SQLite does (the catalog
-/// is maintained by DDL, not by `INSERT`/`UPDATE`/`DELETE`).
+/// Reject a direct DML write to a schema catalog, as SQLite does (the catalog is
+/// maintained by DDL, not by `INSERT`/`UPDATE`/`DELETE`). Covers both the main
+/// catalog (`sqlite_master` / `sqlite_schema`) and the temp catalog
+/// (`sqlite_temp_master` / `sqlite_temp_schema`); SQLite spells each canonically
+/// in the message regardless of the alias written and rejects it before the
+/// table-existence check (so a temp catalog with no temp database still errors
+/// `table sqlite_temp_master may not be modified`, not `no such table`).
 fn reject_schema_write(table: &str) -> Result<()> {
-    if is_main_schema_table(table) {
-        // SQLite spells the catalog `sqlite_master` in this message regardless of
-        // the alias written (`DELETE FROM sqlite_schema` → `table sqlite_master
-        // may not be modified`).
-        let display = schema_catalog_display_name(table).unwrap_or(table);
+    if let Some(display) = schema_catalog_display_name(table) {
         return Err(Error::Error(alloc::format!(
             "table {display} may not be modified"
         )));
