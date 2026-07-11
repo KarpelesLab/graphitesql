@@ -269,11 +269,13 @@ result or declines to it — never a wrong answer), so this track is
   are byte-identical (`distinct_eq_coll(_,Binary)==distinct_eq`,
   `cmp_values_coll(_,Binary)==cmp_values`), so only previously-deferring queries
   change. The blanket bail is narrowed to defer only what still folds under BINARY:
-  a `SELECT DISTINCT … GROUP BY` post-group dedup, or a `has_collation_sensitive_
-  aggregate` (`DISTINCT`/ordered aggregate, single-arg `min`/`max`); a
-  computed/explicit-`COLLATE` group key still defers. Differential vs sqlite3 3.50.4
-  across multi-key/NULL-group/HAVING/WHERE/DESC/join grouping
-  (`tests/vdbe_group_collate.rs`).
+  a `SELECT DISTINCT … GROUP BY` post-group dedup. A collated aggregate *fold* is
+  handled too (8e073d1): `AggSpec`/`AggAcc` carry the argument collation, so
+  `min`/`max` (the reduction) and `count(DISTINCT …)` (the dedup) run on the grouped
+  VDBE path under the argument's collation. An explicit-`COLLATE` argument (via
+  `agg_kind_distinct`) or group key still defers. Differential vs sqlite3 3.50.4
+  across multi-key/NULL-group/HAVING/WHERE/DESC/join grouping and NOCASE/RTRIM
+  min/max/count(DISTINCT) (`tests/vdbe_group_collate.rs`).
 - **B-distinct-collate — collation-aware single-table `DISTINCT` on the VDBE. DONE
   2026-07-12.** A `SELECT DISTINCT` over a single-table scan whose projected columns
   carry a non-BINARY collation used to defer (the VDBE's `DistinctCheck` compared
