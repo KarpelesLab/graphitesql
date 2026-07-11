@@ -23883,8 +23883,11 @@ impl Connection {
         }
         // Every ORDER BY term pinned to a constant by a `col = <const>` WHERE
         // equality (even on a plain SCAN, so `seek_order_prefix` does not apply): the
-        // whole ORDER BY is then vacuously satisfied, so no sort is needed.
-        if self.order_const_lead(sel, params) == sel.order_by.len() {
+        // whole ORDER BY is then vacuously satisfied, so no sort is needed. Guarded on
+        // a NON-empty ORDER BY — with none, `order_const_lead` is a vacuous `0 == 0`
+        // and this must not claim satisfaction (that would perturb no-ORDER-BY plans
+        // like a `count(*)` covering-index scan).
+        if !sel.order_by.is_empty() && self.order_const_lead(sel, params) == sel.order_by.len() {
             return Some(false);
         }
         match self.seek_order_prefix(sel, params) {
