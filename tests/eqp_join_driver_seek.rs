@@ -14,6 +14,7 @@ use graphitesql::{Connection, Value};
 use std::process::Command;
 
 const SETUP: &str = "CREATE TABLE big(id INTEGER PRIMARY KEY, k, v); \
+                     CREATE INDEX bk ON big(k); \
                      CREATE TABLE small(id INTEGER PRIMARY KEY, k, v); \
                      CREATE INDEX sk ON small(k); \
                      INSERT INTO big VALUES(5,1,'b5'),(7,2,'b7'),(9,2,'b9'); \
@@ -76,9 +77,54 @@ fn driver_rowid_seek_eqp_matches_sqlite() {
         "SELECT * FROM big JOIN small ON big.k=small.v",
         // The reversed projection and an extra WHERE term still seek the driver.
         "SELECT small.v, big.v FROM big JOIN small ON big.k=small.v WHERE big.id=7 AND small.v>'a'",
+        // A single-column *secondary* index equality on the driver seeks the index
+        // (`SEARCH big USING INDEX bk (k=?)`) and scans the unindexed inner. `big.k=2`
+        // matches multiple rows — they share the key, so they arrive in rowid order,
+        // matching the executor.
+        "SELECT * FROM big JOIN small ON big.v=small.v WHERE big.k=2",
+        // With an inner that has a real index on the join column, that index is used.
+        "SELECT * FROM big JOIN small ON big.k=small.k WHERE big.id=7",
     ] {
         assert_eq!(sqlite_eqp(q), graphite_eqp(&c, q), "EQP diverged on `{q}`");
     }
+}
+
+#[test]
+fn secondary_index_driver_seek_rows_match_sqlite() {
+    if !sqlite_available() {
+        return;
+    }
+    let c = seeded();
+    let q = "SELECT big.v, small.v FROM big JOIN small ON big.v=small.v WHERE big.k=2 \
+             ORDER BY big.v, small.v";
+    let got: Vec<Vec<String>> = c
+        .query(q)
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| {
+            r.iter()
+                .map(|v| match v {
+                    Value::Text(t) => t.clone(),
+                    Value::Null => String::new(),
+                    Value::Integer(i) => i.to_string(),
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        })
+        .collect();
+    let out = Command::new("sqlite3")
+        .arg(":memory:")
+        .args(["-separator", "|"])
+        .arg(format!("{SETUP} {q};"))
+        .output()
+        .unwrap();
+    let want: Vec<Vec<String>> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| l.split('|').map(str::to_string).collect())
+        .collect();
+    assert_eq!(got, want);
 }
 
 #[test]

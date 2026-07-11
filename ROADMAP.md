@@ -463,10 +463,15 @@ result or declines to it — never a wrong answer), so this track is
   `AUTOMATIC COVERING INDEX` label to a plain `SCAN` (a real index on the inner still
   renders `SEARCH … USING INDEX`). Byte-exact vs sqlite (`tests/eqp_join_driver_seek.rs`),
   full corpus green. Tightly scoped (plain `main` rowid driver, no swap/N-table
-  reorder, no covering index, no `INDEXED BY`). Still open: the **secondary-index**
-  driver seek (`WHERE big.k=7` on an indexed non-rowid column → `SEARCH big USING
-  INDEX bk (k=?)`) — the same shape one level up, needs the collation-aware index
-  pick threaded into the driver path.
+  reorder, no covering index, no `INDEXED BY`). **Secondary-index driver seek DONE
+  2026-07-11:** a driver equality on the sole column of a single-column secondary
+  index now renders `SEARCH big USING INDEX bk (k=?)` too (`join_first_index_seek`,
+  collation-aware via `collect_eq_constraints_coll`) and likewise suppresses the inner
+  auto-index to `SCAN`. EQP-only — a single-column equality's matches share the key,
+  so they arrive in rowid order, identical to the executor's scan + re-applied-WHERE
+  order (no execution change). Scoped to an *unambiguous* single-candidate
+  single-column index (a multi-column index would reorder matches by its trailing
+  columns; two candidates need the unmodelled cost decision).
 - **B9j — collation-aware index *selection* for a non-default-collation index.**
   An index carrying a non-default collation (`CREATE INDEX ib ON t(b COLLATE
   NOCASE)`) is mis-selected (rows still correct via the WHERE re-apply). The model —

@@ -19188,6 +19188,15 @@ impl Connection {
                     "SEARCH {} USING INTEGER PRIMARY KEY (rowid=?)",
                     eqp_label(&from.first)
                 )
+            } else if let Some((idx, col)) = self.join_first_index_seek(sel, from, params) {
+                // The driver carries an equality on a single-column secondary index —
+                // sqlite seeks it: `SEARCH <driver> USING INDEX <idx> (<col>=?)`. The
+                // matches share the key value so they arrive in rowid order, matching
+                // the executor's scan + re-applied-WHERE order (EQP-only, no exec change).
+                alloc::format!(
+                    "SEARCH {} USING INDEX {idx} ({col}=?)",
+                    eqp_label(&from.first)
+                )
             } else {
                 // Joins run as nested-loop scans in `join_from` order — declaration
                 // order, or the cost-based N-table permutation. The driver may read a
@@ -19452,17 +19461,17 @@ impl Connection {
                     let auto_col = if join.natural
                         || !join.using.is_empty()
                         || !matches!(join.kind, JoinKind::Inner | JoinKind::Left)
-                        // When the driver is a single-row rowid seek, sqlite does not
-                        // build a transient auto-index for one probe — it scans the
-                        // inner. Suppress the AUTOMATIC-COVERING-INDEX label to match
-                        // (graphite nested-loops either way, so this is EQP-only). A
-                        // real index on the inner still takes the `index_join_seek`
+                        // When the driver is itself seeked (a rowid or single-column
+                        // secondary-index equality), sqlite does not build a transient
+                        // auto-index for the inner — it scans it (a seek estimates few
+                        // driver rows). Suppress the AUTOMATIC-COVERING-INDEX label to
+                        // match (graphite nested-loops either way, so this is EQP-only).
+                        // A real index on the inner still takes the `index_join_seek`
                         // branch above and renders `SEARCH … USING INDEX`.
-                        || sel
-                            .from
-                            .as_ref()
-                            .is_some_and(|f| self.join_first_rowid_seek(sel, f, params).is_some())
-                    {
+                        || sel.from.as_ref().is_some_and(|f| {
+                            self.join_first_rowid_seek(sel, f, params).is_some()
+                                || self.join_first_index_seek(sel, f, params).is_some()
+                        }) {
                         None
                     } else {
                         join.on.as_ref().and_then(|on| {
@@ -30845,6 +30854,74 @@ impl Connection {
             rows.push(row);
         }
         Ok((columns, rows))
+    }
+
+    /// The secondary-index analogue of [`join_first_rowid_seek`]: when the driver
+    /// (`from.first`) of an INNER join carries an equality on the sole column of a
+    /// single-column secondary index (with matching collation), sqlite seeks that
+    /// index — `SEARCH <driver> USING INDEX <idx> (<col>=?)` — instead of scanning.
+    /// Returns `(index name, column name)` for the EQP emitter. This is EQP-only: a
+    /// single-column equality's matches all share that key value, so they arrive in
+    /// rowid order — identical to the executor's full-scan + re-applied-WHERE order —
+    /// no execution change is needed. Scoped like the rowid case, and to an
+    /// *unambiguous* single-candidate index (a multi-column index would reorder the
+    /// matches by its trailing columns; two candidates would need the cost model).
+    fn join_first_index_seek(
+        &self,
+        sel: &Select,
+        from: &FromClause,
+        params: &Params,
+    ) -> Option<(String, String)> {
+        if from.joins.is_empty()
+            || self.two_table_rowid_inner_swap(from).is_some()
+            || self.two_table_index_inner_swap(from).is_some()
+            || self.ntable_join_order(sel, from).is_some()
+            || self.join_first_rowid_seek(sel, from, params).is_some()
+        {
+            return None;
+        }
+        let tref = &from.first;
+        if tref.subquery.is_some()
+            || tref.tvf_args.is_some()
+            || self.is_bare_tvf(tref)
+            || tref.schema.is_some()
+            || tref.index_hint.is_some()
+            || self.lookup_cte(&tref.name, tref.alias.as_deref()).is_some()
+            || self.is_view(&tref.name)
+            || self.unqualified_db(&tref.name) != DbRef::Main
+        {
+            return None;
+        }
+        let meta = self.table_meta(&tref.name, tref.alias.as_deref()).ok()?;
+        if meta.without_rowid
+            || self
+                .join_scan_covering_index(sel, from, tref, &meta)
+                .is_some()
+        {
+            return None;
+        }
+        let where_expr = sel.where_clause.as_ref()?;
+        let mut eqs: Vec<(usize, Value, crate::value::Collation)> = Vec::new();
+        collect_eq_constraints_coll(where_expr, &meta.columns, params, &mut eqs);
+        if eqs.is_empty() {
+            return None;
+        }
+        let indexes = self.indexes_of(&tref.name).ok()?;
+        let is_candidate = |idx: &IndexMeta| -> bool {
+            idx.cols.len() == 1
+                && idx.partial.is_none()
+                && idx.key_exprs.is_none()
+                && eqs.iter().any(|(c, _, coll)| {
+                    *c == idx.cols[0]
+                        && *coll == idx.collations.first().copied().unwrap_or_default()
+                })
+        };
+        let mut candidates = indexes.iter().filter(|idx| is_candidate(idx));
+        let idx = candidates.next()?;
+        if candidates.next().is_some() {
+            return None; // ambiguous — leave it to the (unmodelled) cost decision
+        }
+        Some((idx.name.clone(), meta.columns[idx.cols[0]].name.clone()))
     }
 
     /// Scan a `WITHOUT ROWID` table's clustered index b-tree, decoding each entry
