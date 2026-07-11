@@ -378,6 +378,10 @@ pub struct AggSpec {
     pub order: Vec<AggOrderKey>,
     /// Constant `group_concat`/`string_agg` separator (`None` = default `,`).
     pub sep: Option<String>,
+    /// The argument's collating sequence (declared column collation, else BINARY),
+    /// driving the `DISTINCT` dedup and `min`/`max` reduction. BINARY reproduces the
+    /// previous behaviour exactly.
+    pub collation: Collation,
 }
 
 /// One output column of a [`Op::GroupEmit`]: a group-key value (by key index) or
@@ -464,6 +468,10 @@ struct AggAcc {
     /// The `group_concat`/`string_agg` separator, captured on the first folded
     /// value (`None` = the default `,`).
     sep: Option<String>,
+    /// The argument's collating sequence, captured on the first folded value
+    /// (default `BINARY`). Drives the `min`/`max` reduction in `finalize_agg` and a
+    /// `DISTINCT` dedup — a `NOCASE`/`RTRIM`/custom-collation argument folds under it.
+    collation: Collation,
 }
 /// One `GROUP BY` group: its key values and one accumulator per aggregate slot.
 type Group = (Vec<Value>, Vec<AggAcc>);
@@ -1394,58 +1402,6 @@ enum GroupKeySpec {
     Expr(alloc::boxed::Box<Expr>),
 }
 
-/// Emit the GROUP-BY fold loop into `c`: allocate the contiguous group-key
-/// registers (one per grouping column), scan the row source, apply `WHERE`, load
-/// each grouping key and aggregate argument, and `GroupStep`. The row source is a
-/// single cursor when `c.cursor_boundaries` is `None`, else an N-deep nested loop
-/// over the cursors (cursor 0 outermost, matching the cross-product fold order).
-/// All scan/exit edges are backpatched so control falls through to whatever emit
-/// phase the caller appends next. Shared by the single-table and nested-loop-join
-/// grouped compilers, so a `GROUP BY` join inherits the full grouped grammar.
-/// Whether the query contains an aggregate that folds its argument under a
-/// collation the grouped VDBE path performs under BINARY: a `DISTINCT` aggregate
-/// (`count(DISTINCT x)`), an ordered aggregate (`group_concat(x ORDER BY y)`), or
-/// a single-argument `min`/`max`. When such an aggregate is present *and* a
-/// non-BINARY collation is in play, the grouped compiler defers to the tree-walker
-/// (which honors the collation) — an explicit `COLLATE` on the argument already
-/// defers via `agg_kind_distinct`, but a column's *declared* collation would not.
-/// A window call (`over` set) is not an aggregate here.
-fn has_collation_sensitive_aggregate(sel: &Select) -> bool {
-    let mut found = false;
-    let mut check = |e: &Expr| {
-        if let Expr::Function {
-            name,
-            distinct,
-            args,
-            star,
-            over,
-            order_by,
-            ..
-        } = e
-            && over.is_none()
-        {
-            let is_minmax = args.len() == 1
-                && !*star
-                && matches!(name.to_ascii_lowercase().as_str(), "min" | "max");
-            if *distinct || !order_by.is_empty() || is_minmax {
-                found = true;
-            }
-        }
-    };
-    for rc in &sel.columns {
-        if let ResultColumn::Expr { expr, .. } = rc {
-            crate::exec::window::visit(expr, &mut check);
-        }
-    }
-    if let Some(h) = &sel.having {
-        crate::exec::window::visit(h, &mut check);
-    }
-    for t in &sel.order_by {
-        crate::exec::window::visit(&t.expr, &mut check);
-    }
-    found
-}
-
 /// The collating sequence each group key is compared/ordered under: a bare
 /// column's declared collation (from the source-indexed `c.collations`), else a
 /// computed key's resolved collation (explicit `COLLATE`, else its column's, else
@@ -1463,6 +1419,14 @@ fn group_key_collations(c: &Compiler, group_keys: &[GroupKeySpec]) -> Vec<Collat
         .collect()
 }
 
+/// Emit the GROUP-BY fold loop into `c`: allocate the contiguous group-key
+/// registers (one per grouping column), scan the row source, apply `WHERE`, load
+/// each grouping key and aggregate argument, and `GroupStep`. The row source is a
+/// single cursor when `c.cursor_boundaries` is `None`, else an N-deep nested loop
+/// over the cursors (cursor 0 outermost, matching the cross-product fold order).
+/// All scan/exit edges are backpatched so control falls through to whatever emit
+/// phase the caller appends next. Shared by the single-table and nested-loop-join
+/// grouped compilers, so a `GROUP BY` join inherits the full grouped grammar.
 fn emit_group_fold(
     c: &mut Compiler,
     sel: &Select,
@@ -1576,6 +1540,13 @@ fn emit_group_fold(
             None => None,
         };
         let order_keys = compile_order_keys(c, order)?;
+        // The argument's collation for the DISTINCT dedup / min-max reduction. An
+        // explicit `COLLATE` argument already defers (via `agg_kind_distinct`), so
+        // only a column's declared collation reaches here; BINARY otherwise.
+        let collation = arg
+            .as_ref()
+            .and_then(|e| c.explicit_collation(e).or_else(|| c.col_collation(e)))
+            .unwrap_or_default();
         aggs.push(AggSpec {
             kind: *kind,
             arg: arg_reg,
@@ -1584,6 +1555,7 @@ fn emit_group_fold(
             filter: filter_reg,
             order: order_keys,
             sep: sep.clone(),
+            collation,
         });
     }
     // With bare-column representatives and exactly one min()/max() aggregate,
@@ -1699,14 +1671,13 @@ fn compile_group_select(
     boundaries: Option<&[usize]>,
     allow_correlated: bool,
 ) -> Result<Program> {
-    // Group-key matching, ordering and the min()/max() companion reduction are now
-    // collation-aware (`GroupStep`/`sort_groups_by_key` carry per-key collations).
-    // The comparisons still done under BINARY are a `SELECT DISTINCT … GROUP BY`'s
-    // post-grouping dedup and a DISTINCT/ordered *aggregate*'s internal argument
-    // comparison, so defer only when a non-BINARY collation could reach one of those.
-    if collations.iter().any(|c| *c != Collation::Binary)
-        && (sel.distinct || has_collation_sensitive_aggregate(sel))
-    {
+    // Group-key matching/ordering, the min()/max() companion, and each aggregate's
+    // DISTINCT dedup / min-max reduction are now collation-aware (per-key collations
+    // on `GroupStep`/`sort_groups_by_key`; the argument collation on `AggSpec`). The
+    // one comparison still done under BINARY is a `SELECT DISTINCT … GROUP BY`'s
+    // post-grouping dedup (the grouped `DistinctCheck` carries no collations), so
+    // defer only that case when a projected column carries a non-BINARY collation.
+    if sel.distinct && collations.iter().any(|c| *c != Collation::Binary) {
         return Err(Error::Unsupported("VDBE: non-BINARY collation in GROUP BY"));
     }
     let has_having = sel.having.is_some();
@@ -6294,11 +6265,15 @@ fn run_rows_multi_impl(
                             || !matches!(regs[r], Value::Null))
                     {
                         let v = regs[r].clone();
-                        // A DISTINCT aggregate folds each distinct argument
-                        // value once per group (BINARY equality; non-BINARY
-                        // bails before compilation).
+                        // Record the argument collation (for the finalize-time
+                        // min/max reduction) and, for a DISTINCT aggregate, fold each
+                        // distinct value once under it.
+                        groups[gi].1[j].collation = spec.collation;
                         if !spec.distinct
-                            || !groups[gi].1[j].vals.iter().any(|p| distinct_eq(p, &v))
+                            || !groups[gi].1[j]
+                                .vals
+                                .iter()
+                                .any(|p| distinct_eq_coll(p, &v, spec.collation))
                         {
                             groups[gi].1[j].vals.push(v);
                             push_order_key(&mut groups[gi].1[j], &spec.order, &regs);
@@ -6597,6 +6572,7 @@ fn finalize_agg(kind: AggKind, acc: AggAcc) -> Result<Value> {
         keys,
         dirs,
         sep,
+        collation,
     } = acc;
     let sep = sep.as_deref().unwrap_or(",");
     Ok(match kind {
@@ -6611,7 +6587,7 @@ fn finalize_agg(kind: AggKind, acc: AggAcc) -> Result<Value> {
         AggKind::Min => vals
             .into_iter()
             .reduce(|a, b| {
-                if eval::compare(&b, &a) == Ordering::Less {
+                if crate::value::cmp_values_coll(&b, &a, collation) == Ordering::Less {
                     b
                 } else {
                     a
@@ -6621,7 +6597,7 @@ fn finalize_agg(kind: AggKind, acc: AggAcc) -> Result<Value> {
         AggKind::Max => vals
             .into_iter()
             .reduce(|a, b| {
-                if eval::compare(&b, &a) == Ordering::Greater {
+                if crate::value::cmp_values_coll(&b, &a, collation) == Ordering::Greater {
                     b
                 } else {
                     a

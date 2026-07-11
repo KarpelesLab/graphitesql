@@ -1,14 +1,13 @@
-//! `GROUP BY` over a non-BINARY-collation key runs on the VDBE: `GroupStep`
-//! matches group identity, `sort_groups_by_key` orders the emitted groups, and the
-//! single `min`/`max` companion reduction all compare under each key's collation
-//! (declared `NOCASE`/`RTRIM`/custom). With all-BINARY keys the comparisons are
-//! byte-identical to the previous BINARY-only path.
+//! `GROUP BY` over a non-BINARY-collation key runs on the VDBE: `GroupStep` matches
+//! group identity, `sort_groups_by_key` orders the emitted groups, the `min`/`max`
+//! companion reduction, and each aggregate's `DISTINCT` dedup / `min`/`max`
+//! reduction (`AggSpec.collation`) all compare under the relevant collation
+//! (declared `NOCASE`/`RTRIM`/custom). With all-BINARY collations the comparisons
+//! are byte-identical to the previous BINARY-only path.
 //!
-//! Still deferred to the tree-walker (which honors the collation): a `DISTINCT`
-//! aggregate (`count(DISTINCT x)`), an ordered aggregate, a single-arg `min`/`max`
-//! (its argument fold), and a `SELECT DISTINCT … GROUP BY` (post-group dedup) —
-//! anything whose collated comparison the grouped VDBE path does not thread.
-//! Verified against sqlite3 3.50.4.
+//! Still deferred to the tree-walker: a `SELECT DISTINCT … GROUP BY` (its
+//! post-group dedup compares output rows under BINARY) and an explicit `COLLATE`
+//! group key. Verified against sqlite3 3.50.4.
 
 #![cfg(feature = "std")]
 
@@ -69,6 +68,12 @@ fn grouped_over_collation_key_runs_on_vdbe() {
         "SELECT a, count(*) FROM t GROUP BY a HAVING count(*) > 1 ORDER BY a",
         // Default (no explicit ORDER BY) group emit order is collation-sorted too.
         "SELECT a, count(*) FROM t GROUP BY a",
+        // An aggregate that folds its argument under a collation — `min`/`max`
+        // (the reduction) and `count(DISTINCT …)` (the dedup) — now runs on the VDBE
+        // too, honoring the argument's declared collation.
+        "SELECT a, max(x) FROM t GROUP BY a ORDER BY a",
+        "SELECT a, max(c), min(c) FROM t GROUP BY a ORDER BY a",
+        "SELECT a, count(DISTINCT c) FROM t GROUP BY a ORDER BY a",
     ] {
         let r = c
             .query_vdbe(q)
@@ -82,18 +87,15 @@ fn grouped_over_collation_key_runs_on_vdbe() {
 #[test]
 fn collation_sensitive_grouped_shapes_defer() {
     let c = conn();
-    // These fold a (potentially collated) argument the grouped VDBE path compares
-    // under BINARY, so they must defer to the tree-walker.
+    // Still deferred: a `SELECT DISTINCT … GROUP BY` — its post-grouping dedup
+    // compares the output rows under BINARY (the grouped `DistinctCheck` carries no
+    // collations) — and an explicit `COLLATE` group key.
     for q in [
-        "SELECT a, max(x) FROM t GROUP BY a", // min/max aggregate
-        "SELECT a, count(DISTINCT c) FROM t GROUP BY a", // DISTINCT aggregate
         "SELECT DISTINCT a FROM t GROUP BY a, x", // DISTINCT over grouped output
+        "SELECT a COLLATE NOCASE, count(*) FROM t GROUP BY a COLLATE NOCASE", // explicit key COLLATE
     ] {
         assert!(c.query_vdbe(q).is_err(), "expected VDBE to defer on {q}");
-        // The deferred result (tree-walker, unchanged by this feature) is still
-        // correct — the row set matches the enabled grouping. (Exact ordering/NULL
-        // rendering is covered by the broad differential corpus; here we just
-        // confirm the query runs and returns rows.)
+        // The deferred result (tree-walker, unchanged by this feature) still runs.
         assert!(c.query(q).is_ok(), "tree-walker failed on {q}");
     }
 }
