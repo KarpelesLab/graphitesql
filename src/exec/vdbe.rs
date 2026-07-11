@@ -212,6 +212,9 @@ pub enum Op {
         slot: usize,
         kind: AggKind,
         arg: Option<usize>,
+        /// Second argument register — the value of `json_group_object`; `None`
+        /// otherwise.
+        arg2: Option<usize>,
         distinct: bool,
         filter: Option<usize>,
         order: Vec<AggOrderKey>,
@@ -341,8 +344,12 @@ pub struct CorrelatedSub {
 pub struct AggSpec {
     /// Which aggregate to fold.
     pub kind: AggKind,
-    /// Argument register, or `None` for `count(*)`.
+    /// Argument register, or `None` for `count(*)`. For `json_group_object` this
+    /// is the *key* register.
     pub arg: Option<usize>,
+    /// Second argument register — the *value* register of `json_group_object`;
+    /// `None` for every one-argument aggregate.
+    pub arg2: Option<usize>,
     /// When set, fold only over distinct argument values (BINARY equality), so
     /// the slot computes e.g. `count(DISTINCT x)` per group.
     pub distinct: bool,
@@ -395,6 +402,15 @@ pub enum AggKind {
     JsonGroupArray {
         jsonb: bool,
     },
+    /// `json_group_object(k, v)` / `jsonb_group_object(k, v)` — collect every
+    /// key/value pair (the key coerced to text like the tree-walker, the value
+    /// kept even when NULL) into a JSON object; `jsonb` selects the binary
+    /// encoding. Admitted only when the *value* argument does not statically carry
+    /// the JSON subtype. The key register is `AggSpec::arg`, the value register
+    /// `AggSpec::arg2`.
+    JsonGroupObject {
+        jsonb: bool,
+    },
 }
 
 /// One `ORDER BY` key for [`Op::SorterSort`]: direction, NULL placement, and the
@@ -414,8 +430,12 @@ pub struct SortKey {
 /// …)` — the parallel `ORDER BY` key rows plus their per-key sort directions.
 #[derive(Debug, Clone, Default)]
 struct AggAcc {
-    /// Collected non-NULL argument values.
+    /// Collected non-NULL argument values. For `json_group_object` these are the
+    /// keys, parallel to `vals2`.
     vals: Vec<Value>,
+    /// Collected `json_group_object` values, parallel to `vals` (empty for every
+    /// other aggregate).
+    vals2: Vec<Value>,
     /// Row counter, used by `count(*)`.
     count: i64,
     /// Parallel to `vals`: each collected value's `ORDER BY` key row (empty when
@@ -433,8 +453,10 @@ type Group = (Vec<Value>, Vec<AggAcc>);
 
 /// A compile-time aggregate spec from [`agg_kind_distinct`]: the kind, the
 /// argument expression, the `DISTINCT` flag, the optional `FILTER (WHERE …)`
-/// predicate, the `ORDER BY` terms (only meaningful for `group_concat`), and the
-/// constant `group_concat`/`string_agg` separator (`None` = the default `,`).
+/// predicate, the `ORDER BY` terms (only meaningful for `group_concat`), the
+/// constant `group_concat`/`string_agg` separator (`None` = the default `,`), and
+/// the optional *second* argument expression — the value of `json_group_object`
+/// (`None` for every one-argument aggregate).
 type AggCallSpec = (
     AggKind,
     Option<Expr>,
@@ -442,6 +464,7 @@ type AggCallSpec = (
     Option<Expr>,
     Vec<OrderTerm>,
     Option<String>,
+    Option<Expr>,
 );
 
 /// One `ORDER BY` key inside an ordered aggregate (`group_concat(x ORDER BY …)`):
@@ -990,6 +1013,7 @@ fn agg_kind_distinct(expr: &Expr) -> Option<AggCallSpec> {
                 filter,
                 Vec::new(),
                 None,
+                None,
             ));
         }
         "count" if args.len() == 1 => (AggKind::Count, None),
@@ -1024,6 +1048,20 @@ fn agg_kind_distinct(expr: &Expr) -> Option<AggCallSpec> {
                 None,
             )
         }
+        // `json_group_object(k, v)` collects key/value pairs into a JSON object.
+        // Admitted only when the *value* argument does not statically carry the
+        // JSON subtype (the key is always text-coerced). `DISTINCT` is not
+        // meaningful here — leave it to the tree-walker.
+        "json_group_object" | "jsonb_group_object"
+            if args.len() == 2 && !*distinct && !super::func::produces_json(&args[1]) =>
+        {
+            (
+                AggKind::JsonGroupObject {
+                    jsonb: name.eq_ignore_ascii_case("jsonb_group_object"),
+                },
+                None,
+            )
+        }
         _ => return None,
     };
     let (kind, sep) = kind;
@@ -1045,7 +1083,11 @@ fn agg_kind_distinct(expr: &Expr) -> Option<AggCallSpec> {
     if collation_sensitive && arg.as_ref().is_some_and(explicit_non_binary_collation) {
         return None;
     }
-    Some((kind, arg, *distinct, filter, order, sep))
+    // `json_group_object`'s value argument (the key is `arg`).
+    let arg2 = matches!(kind, AggKind::JsonGroupObject { .. })
+        .then(|| args.get(1).cloned())
+        .flatten();
+    Some((kind, arg, *distinct, filter, order, sep, arg2))
 }
 
 /// True when `expr` carries an explicit `COLLATE` that is not BINARY (peeling
@@ -1173,8 +1215,12 @@ fn compile_aggregate_select(
         }
         None => None,
     };
-    for (slot, (kind, arg, distinct, filter, order, sep)) in slots.iter().enumerate() {
+    for (slot, (kind, arg, distinct, filter, order, sep, arg2)) in slots.iter().enumerate() {
         let arg_reg = match arg {
+            Some(expr) => Some(c.compile_expr(expr)?),
+            None => None,
+        };
+        let arg2_reg = match arg2 {
             Some(expr) => Some(c.compile_expr(expr)?),
             None => None,
         };
@@ -1187,6 +1233,7 @@ fn compile_aggregate_select(
             slot,
             kind: *kind,
             arg: arg_reg,
+            arg2: arg2_reg,
             distinct: *distinct,
             filter: filter_reg,
             order: order_keys,
@@ -1205,7 +1252,7 @@ fn compile_aggregate_select(
         *target = end;
     }
     // Finalize each slot into its output register, then emit the single row.
-    for (slot, (kind, _, _, _, _, _)) in slots.iter().enumerate() {
+    for (slot, (kind, _, _, _, _, _, _)) in slots.iter().enumerate() {
         c.ops.push(Op::AggFinal {
             slot,
             kind: *kind,
@@ -1435,8 +1482,12 @@ fn emit_group_fold(
     // Evaluate each aggregate argument (and its FILTER predicate) into a register
     // for this row.
     let mut aggs: Vec<AggSpec> = Vec::new();
-    for (kind, arg, distinct, filter, order, sep) in agg_specs {
+    for (kind, arg, distinct, filter, order, sep, arg2) in agg_specs {
         let arg_reg = match arg {
+            Some(expr) => Some(c.compile_expr(expr)?),
+            None => None,
+        };
+        let arg2_reg = match arg2 {
             Some(expr) => Some(c.compile_expr(expr)?),
             None => None,
         };
@@ -1448,6 +1499,7 @@ fn emit_group_fold(
         aggs.push(AggSpec {
             kind: *kind,
             arg: arg_reg,
+            arg2: arg2_reg,
             distinct: *distinct,
             filter: filter_reg,
             order: order_keys,
@@ -1951,7 +2003,7 @@ fn compile_group_select(
     // Finalize groups and position the group cursor; the emit loop body follows.
     let gfin = c.ops.len();
     c.ops.push(Op::GroupFinalize {
-        agg_kinds: agg_specs.iter().map(|(k, _, _, _, _, _)| *k).collect(),
+        agg_kinds: agg_specs.iter().map(|(k, _, _, _, _, _, _)| *k).collect(),
         key_count: group_keys.len(),
         target: 0,
     });
@@ -2478,7 +2530,7 @@ fn compile_group_emit(
     c.ops.push(Op::GroupEmit {
         outputs,
         key_count: group_cols.len(),
-        agg_kinds: agg_specs.iter().map(|(k, _, _, _, _, _)| *k).collect(),
+        agg_kinds: agg_specs.iter().map(|(k, _, _, _, _, _, _)| *k).collect(),
         group_cols: if needs_sub {
             group_cols.to_vec()
         } else {
@@ -3301,8 +3353,12 @@ pub fn compile_aggregate_join(
         None => None,
     };
     // Fold the surviving combined row into every aggregate slot.
-    for (slot, (kind, arg, distinct, filter, order, sep)) in slots.iter().enumerate() {
+    for (slot, (kind, arg, distinct, filter, order, sep, arg2)) in slots.iter().enumerate() {
         let arg_reg = match arg {
+            Some(expr) => Some(c.compile_expr(expr)?),
+            None => None,
+        };
+        let arg2_reg = match arg2 {
             Some(expr) => Some(c.compile_expr(expr)?),
             None => None,
         };
@@ -3315,6 +3371,7 @@ pub fn compile_aggregate_join(
             slot,
             kind: *kind,
             arg: arg_reg,
+            arg2: arg2_reg,
             distinct: *distinct,
             filter: filter_reg,
             order: order_keys,
@@ -3343,7 +3400,7 @@ pub fn compile_aggregate_join(
         *target = next_at[n - 1];
     }
     // Finalize each slot into its output register, then emit the single row.
-    for (slot, (kind, _, _, _, _, _)) in slots.iter().enumerate() {
+    for (slot, (kind, _, _, _, _, _, _)) in slots.iter().enumerate() {
         c.ops.push(Op::AggFinal {
             slot,
             kind: *kind,
@@ -5952,6 +6009,7 @@ fn run_rows_multi_impl(
                 slot,
                 kind,
                 arg,
+                arg2,
                 distinct,
                 filter,
                 order,
@@ -5970,6 +6028,13 @@ fn run_rows_multi_impl(
                     // fall through without folding this row into the slot
                 } else if *kind == AggKind::CountStar {
                     agg[*slot].count += 1;
+                } else if let (AggKind::JsonGroupObject { .. }, Some(k), Some(v)) =
+                    (*kind, arg, arg2)
+                {
+                    // Collect the key/value pair (NULLs kept — the object keeps
+                    // every pair; the key is text-coerced at finalize).
+                    agg[*slot].vals.push(regs[*k].clone());
+                    agg[*slot].vals2.push(regs[*v].clone());
                 } else if let Some(r) = arg
                     && (matches!(*kind, AggKind::JsonGroupArray { .. })
                         || !matches!(regs[*r], Value::Null))
@@ -6059,6 +6124,12 @@ fn run_rows_multi_impl(
                     }
                     if spec.kind == AggKind::CountStar {
                         groups[gi].1[j].count += 1;
+                    } else if let (AggKind::JsonGroupObject { .. }, Some(k), Some(v)) =
+                        (spec.kind, spec.arg, spec.arg2)
+                    {
+                        // Collect the key/value pair (NULLs kept).
+                        groups[gi].1[j].vals.push(regs[k].clone());
+                        groups[gi].1[j].vals2.push(regs[v].clone());
                     } else if let Some(r) = spec.arg
                         && (matches!(spec.kind, AggKind::JsonGroupArray { .. })
                             || !matches!(regs[r], Value::Null))
@@ -6355,6 +6426,7 @@ fn finalize_agg(kind: AggKind, acc: AggAcc) -> Result<Value> {
     use core::cmp::Ordering;
     let AggAcc {
         vals,
+        vals2,
         count: star,
         keys,
         dirs,
@@ -6418,6 +6490,23 @@ fn finalize_agg(kind: AggKind, acc: AggAcc) -> Result<Value> {
                 Value::Blob(arr.to_jsonb())
             } else {
                 Value::Text(arr.serialize())
+            }
+        }
+        AggKind::JsonGroupObject { jsonb } => {
+            // Each collected (key, value) pair becomes an object member: the key is
+            // coerced to text (matching the tree-walker's `to_text`), the value
+            // serialized via the same `value_to_json` (NULL → JSON `null`). An
+            // empty group yields `{}`.
+            let pairs: Vec<_> = vals
+                .iter()
+                .zip(vals2.iter())
+                .map(|(k, v)| (eval::to_text(k), None, crate::exec::json::value_to_json(v)))
+                .collect();
+            let obj = crate::exec::json::Json::Object(pairs);
+            if jsonb {
+                Value::Blob(obj.to_jsonb())
+            } else {
+                Value::Text(obj.serialize())
             }
         }
     })

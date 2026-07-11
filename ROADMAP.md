@@ -348,6 +348,12 @@ result or declines to it — never a wrong answer), so this track is
   (`func::produces_json` — a `json(x)` / `->` argument defers, since its text must be
   spliced in unquoted). `DISTINCT` dedups via the existing per-group path. Verified vs
   sqlite3 (`tests/vdbe_json_group_array.rs`).
+  *`json_group_object` / `jsonb_group_object` (2026-07-11):* the two-argument object
+  aggregate now runs on the VDBE too. `AggSpec`/`Op::AggStep` gained a second value
+  register (`arg2`) and `AggAcc` a parallel `vals2`, so the fold collects key/value
+  pairs (NULLs kept); the finalizer text-coerces each key and serializes via the same
+  `Json::Object` path (empty group → `{}`). Gated on the *value* argument not carrying
+  the JSON subtype.
 
 **Cost model & EQP fidelity** *(rows already correct — plan/perf only)*:
 

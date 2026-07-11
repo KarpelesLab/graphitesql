@@ -1,10 +1,10 @@
-//! `json_group_array(x)` / `jsonb_group_array(x)` run on the VDBE aggregate path
-//! (previously deferred to the tree-walker). Unlike the other collecting
-//! aggregates it *includes* NULL arguments (as JSON `null`) and yields `[]` — not
-//! NULL — over an empty group, so the fold keeps NULLs for this kind and the
-//! finalizer serializes the array via the same `value_to_json` the tree-walker
-//! uses. A JSON-subtype argument (`json(x)`, `x -> …`) still defers, since its
-//! text must be spliced in unquoted.
+//! `json_group_array(x)` / `jsonb_group_array(x)` and `json_group_object(k, v)` /
+//! `jsonb_group_object(k, v)` run on the VDBE aggregate path (previously deferred
+//! to the tree-walker). Unlike the other collecting aggregates they *include* NULL
+//! arguments (as JSON `null`) and yield `[]` / `{}` — not NULL — over an empty
+//! group, so the fold keeps NULLs for these kinds and the finalizer serializes via
+//! the same `value_to_json` the tree-walker uses. A JSON-subtype argument
+//! (`json(x)`, `x -> …`) still defers, since its text must be spliced in unquoted.
 //!
 //! `query_vdbe` errors on any fallback, so a passing `query_vdbe` proves the
 //! aggregate ran on the VDBE. Every case is checked against the tree-walker and,
@@ -96,6 +96,58 @@ fn json_subtype_argument_defers() {
     assert_eq!(
         both(&c, "SELECT json_group_array(x) FROM t"),
         vec![vec![Value::Text(r#"["[1,2]","{\"a\":1}"]"#.into())]],
+    );
+}
+
+#[test]
+fn json_group_object_scalar_and_grouped() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(g INTEGER, k TEXT, v)").unwrap();
+    c.execute("INSERT INTO t VALUES(1,'a',10),(1,'b',20),(2,'c',5),(2,'d',NULL)")
+        .unwrap();
+    // A NULL value is kept as JSON `null` (the object keeps every pair).
+    assert_eq!(
+        both(&c, "SELECT json_group_object(k, v) FROM t"),
+        vec![vec![Value::Text(
+            r#"{"a":10,"b":20,"c":5,"d":null}"#.into()
+        )]],
+    );
+    // Grouped; the g=2 group carries a NULL value.
+    assert_eq!(
+        both(&c, "SELECT g, json_group_object(k, v) FROM t GROUP BY g"),
+        vec![
+            vec![Value::Integer(1), Value::Text(r#"{"a":10,"b":20}"#.into())],
+            vec![Value::Integer(2), Value::Text(r#"{"c":5,"d":null}"#.into())],
+        ],
+    );
+    // A computed value argument works.
+    assert_eq!(
+        both(&c, "SELECT json_group_object(k, v + 1) FROM t WHERE g = 1"),
+        vec![vec![Value::Text(r#"{"a":11,"b":21}"#.into())]],
+    );
+    // An empty group yields `{}`.
+    assert_eq!(
+        both(&c, "SELECT json_group_object(k, v) FROM t WHERE 0"),
+        vec![vec![Value::Text("{}".into())]],
+    );
+    // The `jsonb_` variant returns a blob.
+    let rows = both(&c, "SELECT jsonb_group_object(k, v) FROM t");
+    assert!(matches!(rows[0][0], Value::Blob(_)));
+}
+
+#[test]
+fn json_group_object_subtype_value_defers() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE TABLE t(k TEXT, x TEXT)").unwrap();
+    c.execute(r#"INSERT INTO t VALUES('a','[1]'),('b','{"z":2}')"#)
+        .unwrap();
+    // A `json(x)` value argument carries the JSON subtype (spliced unquoted) — the
+    // VDBE path does not model it, so the whole query defers to the tree-walker.
+    let q = "SELECT json_group_object(k, json(x)) FROM t";
+    assert!(c.query_vdbe(q).is_err(), "subtype value must fall back");
+    assert_eq!(
+        c.query(q).unwrap().rows,
+        vec![vec![Value::Text(r#"{"a":[1],"b":{"z":2}}"#.into())]],
     );
 }
 
