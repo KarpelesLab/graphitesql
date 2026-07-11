@@ -2578,7 +2578,7 @@ fn is_prepare_error(e: &graphitesql::Error, msg: &str, sql: &str) -> bool {
                 "no query solution",
                 "missing datatype for",
                 "unknown datatype for", // STRICT table column with an invalid type name
-                "AUTOINCREMENT is only allowed",
+                "AUTOINCREMENT", // "… is only allowed on …" / "… not allowed on WITHOUT ROWID …"
                 "cannot use DEFAULT on a generated column",
                 "cannot use window functions in recursive",
                 "generated columns cannot",

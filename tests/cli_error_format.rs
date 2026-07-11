@@ -105,6 +105,14 @@ fn one_shot_error_rendering_matches_sqlite() {
         // A STRICT table with an invalid column type is a prepare-time schema
         // error (`unknown datatype for …`), like the `missing datatype` case.
         "CREATE TABLE t(a ANYTHING) STRICT",
+        // AUTOINCREMENT on a WITHOUT ROWID / non-INTEGER-PK column: prepare-time.
+        "CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT) WITHOUT ROWID",
+        "CREATE TABLE t(a TEXT AUTOINCREMENT PRIMARY KEY)",
+        // A direct DML write to the schema catalog is rejected, and SQLite spells
+        // it `sqlite_master` however the alias was written.
+        "DELETE FROM sqlite_schema",
+        "UPDATE sqlite_schema SET name='x'",
+        "DELETE FROM main.sqlite_schema",
         "SELECT",
         // Step-time errors (constraints carry the (19) code, a datatype mismatch
         // the (20) SQLITE_MISMATCH code; a plain error carries none).

@@ -37000,8 +37000,12 @@ fn is_temp_schema_table(name: &str) -> bool {
 /// is maintained by DDL, not by `INSERT`/`UPDATE`/`DELETE`).
 fn reject_schema_write(table: &str) -> Result<()> {
     if is_main_schema_table(table) {
+        // SQLite spells the catalog `sqlite_master` in this message regardless of
+        // the alias written (`DELETE FROM sqlite_schema` → `table sqlite_master
+        // may not be modified`).
+        let display = schema_catalog_display_name(table).unwrap_or(table);
         return Err(Error::Error(alloc::format!(
-            "table {table} may not be modified"
+            "table {display} may not be modified"
         )));
     }
     Ok(())
