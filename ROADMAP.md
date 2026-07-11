@@ -441,6 +441,20 @@ result or declines to it — never a wrong answer), so this track is
   execution and EQP agree, and the `COVERING` label now folds in the WHERE columns.
   Gated to the no-ANALYZE case (value-specific selectivity is B4). Verified
   differentially (`single_open_range_prefers_order_index_over_seek`).
+  **ORDER-BY sort *elision* (≤1-row / all-constant) — DONE 2026-07-11:** an ORDER
+  BY over a result the planner can prove has one row (or whose every term is a
+  compile-time constant) needs no `USE TEMP B-TREE`, matching sqlite. Landed as a
+  family: (a) a single-table `WHERE` with a full **UNIQUE**-index equality (or the
+  rowid/IPK), the secondary-index analogue of `rowid_eq_single_row`
+  (`unique_eq_single_row`, collation-aligned so a `NOCASE`-column / `BINARY`-unique
+  mismatch cannot fire); (b) a two-table single-row-**driver** join whose every
+  ORDER-BY term is a driver column or an inner column ON-equated to the driver
+  (`join_order_all_constant`), plus the inner's own rowid when the inner arrives in
+  rowid order — a plain scan, an *unrelated* index, or a **single-column** join-col
+  index seek (a single-value seek → rowid tie-break); a **multi-column** join-col
+  index (key-suffix order) still sorts. Tests: `eqp_order_by_const_prefix.rs`.
+  Residual: `ORDER BY inner.id DESC` over such a join (graphite materialises
+  ascending rowid order; a reverse-scan, not a planner credit, is needed) still sorts.
   Still open: ORDER BY influencing the index *choice* among indexes (the full
   sort-avoidance cost *term*, beyond the no-seek and single-open-range cases); the tiebreak among several non-covering indexes sharing an equality
   prefix (SQLite's full LogEst row-cost, not reducible to narrower/newest); a
