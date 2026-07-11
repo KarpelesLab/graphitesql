@@ -382,8 +382,17 @@ result or declines to it — never a wrong answer), so this track is
 - **B9h — cost-model single-table index *choice*.** The purely *structural* costs
   are done (no-`WHERE` covering-scan choice; covering-preferred equality/range/
   GROUP-BY/DISTINCT/ORDER-BY seeks via `choose_seek_index`/`choose_range_index`).
-  Still open: ORDER BY influencing the index *choice* (sort-avoidance term in the
-  cost model); the tiebreak among several non-covering indexes sharing an equality
+  **ORDER-BY sort-avoidance with a non-seekable `WHERE` — DONE 2026-07-11:** a query
+  whose `WHERE` is not served by a seek index but whose `ORDER BY` is now walks the
+  ORDER-BY index to avoid the temp-b-tree sort (`SCAN t USING INDEX i_b`), matching
+  sqlite. `order_index_scan` no longer bails on any `WHERE`; it admits one exactly
+  when `eqp_access` shows a plain `SCAN` (no seek) — so when the `WHERE` *does* seek
+  an index, that seek (and the sort) is planned instead, as before. The executor
+  reaches this path only after every seek fails and `run_core` re-applies the `WHERE`
+  to the ordered rows downstream, so no execution change was needed. Verified
+  differentially against the sqlite3 CLI (`tests/eqp_sort_avoidance.rs`).
+  Still open: ORDER BY influencing the index *choice* among indexes (the full
+  sort-avoidance cost *term*, beyond the no-seek case); the tiebreak among several non-covering indexes sharing an equality
   prefix (SQLite's full LogEst row-cost, not reducible to narrower/newest); a
   *partial-prefix* covering index for a multi-column ORDER BY (unify
   `order_index_scan`/`covering_scan`); `min`/`max` over a non-leading covered

@@ -19029,7 +19029,7 @@ impl Connection {
                 }
                 // A full index scanned to satisfy ORDER BY reads as `USING INDEX`,
                 // or `USING COVERING INDEX` when it holds every referenced column.
-                else if let Some(s) = self.order_index_scan(sel) {
+                else if let Some(s) = self.order_index_scan(sel, params) {
                     let kind = if s.covering {
                         "COVERING INDEX"
                     } else {
@@ -19585,7 +19585,7 @@ impl Connection {
             // — the driver scan supplying `join_supplied` leading terms.
             let sorted = if join_supplied > 0 {
                 n - join_supplied.min(n)
-            } else if let Some(s) = self.order_index_scan(sel) {
+            } else if let Some(s) = self.order_index_scan(sel, params) {
                 s.sorted_suffix.min(n)
             } else if let Some((k, _)) = self.seek_order_prefix(sel, params) {
                 n - k.min(n)
@@ -21964,7 +21964,7 @@ impl Connection {
     /// collations, descending)`. NULLs sort first in the index (ascending),
     /// matching `ORDER BY col ASC`; reversing for `DESC` puts them last, matching
     /// `ORDER BY col DESC` — so both directions are exact.
-    fn order_index_scan(&self, sel: &Select) -> Option<OrderIndexScan> {
+    fn order_index_scan(&self, sel: &Select, params: &Params) -> Option<OrderIndexScan> {
         let from = sel.from.as_ref()?;
         if !from.joins.is_empty() {
             return None;
@@ -21978,13 +21978,33 @@ impl Connection {
         if matches!(t.index_hint, Some(IndexHint::NotIndexed)) {
             return None;
         }
-        if sel.where_clause.is_some()
-            || !sel.group_by.is_empty()
+        if !sel.group_by.is_empty()
             || sel.having.is_some()
             || sel.distinct
             || sel.order_by.is_empty()
         {
             return None;
+        }
+        // A WHERE is allowed only when it is *not* served by a seek index — i.e. the
+        // access would otherwise be a full table SCAN. SQLite then walks the
+        // ORDER-BY index to avoid the sort (B9h sort-avoidance); when the WHERE does
+        // seek an index, that seek (and any sort) is planned instead, so bail here.
+        // The executor reaches this path only after every seek attempt fails, and
+        // `run_core` re-applies the WHERE to the ordered rows downstream, so the
+        // rows stay correct either way — this gate keeps the EQP/order-satisfied
+        // decision in lockstep with SQLite.
+        if let Some(w) = &sel.where_clause {
+            let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
+            let label = t.alias.as_deref().unwrap_or(&t.name);
+            let access = self
+                .eqp_access(label, &t.name, &meta, Some(w), Some(sel), params)
+                .ok()?;
+            // A plain full scan reads as `SCAN <label>` with no `USING …` index;
+            // anything else (a `SEARCH` seek, or a covering/index scan) means the
+            // WHERE — not the ORDER BY — drives the access.
+            if !access.starts_with("SCAN ") || access.contains(" USING ") {
+                return None;
+            }
         }
         if self.has_aggregate(sel) || window::has_window(sel) {
             return None;
@@ -23622,7 +23642,7 @@ impl Connection {
         if let Some(d) = self.without_rowid_scan_filtered_order(sel, params) {
             return Some(d);
         }
-        if let Some(s) = self.order_index_scan(sel) {
+        if let Some(s) = self.order_index_scan(sel, params) {
             // A mixed-direction walk only orders the leading prefix; the caller
             // still sorts, so the ORDER BY is not fully satisfied by the scan.
             if s.sorted_suffix == 0 {
@@ -27422,7 +27442,7 @@ impl Connection {
             // with `order_satisfied_by_scan`/`eqp_access`. When the index covers
             // every referenced column (B2), build rows from the index records and
             // skip the table b-tree entirely; otherwise fetch each row by rowid.
-            if let Some(s) = self.order_index_scan(sel) {
+            if let Some(s) = self.order_index_scan(sel, params) {
                 let src = self.backend.source();
                 let encoding = src.header().text_encoding;
                 if s.covering {
