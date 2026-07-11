@@ -1913,53 +1913,58 @@ impl Connection {
                 }
                 None => sel,
             };
-            if let Some(pf) = &check_sel.from {
+            if let Some(pf) = &check_sel.from
+                && pf.joins.len() == 1
+            {
+                // Both the rowid and the single-column-UNIQUE index-inner swaps drive
+                // from the SECOND table, seeking `from.first`. The VDBE models the swap
+                // by nesting the second cursor outermost (`[1, 0]`) and scanning the
+                // materialized driver rowset in rowid / declaration order — so it
+                // reproduces the tree-walker's driven order only when the driver is
+                // ALSO scanned that way (NOT via a reordering covering index like
+                // `SCAN v USING COVERING INDEX iv`) and the shape is a plain projection
+                // (an aggregate / GROUP BY join's fold order — `group_concat` is
+                // order-sensitive — is not modelled here). Those excluded cases defer
+                // to the tree-walker.
+                let driver = &pf.joins[0].table;
+                let driver_reordered = self
+                    .table_meta(&driver.name, driver.alias.as_deref())
+                    .ok()
+                    .is_some_and(|m| {
+                        self.join_scan_covering_index(check_sel, pf, driver, &m)
+                            .is_some()
+                    });
+                let swap_runnable = !driver_reordered
+                    && sel.group_by.is_empty()
+                    && sel.having.is_none()
+                    && !self.has_aggregate(sel);
                 if self.two_table_rowid_inner_swap(pf).is_some() {
-                    // Cost-based two-table rowid-inner swap: sqlite drives from the
-                    // second table, seeking `from.first` by its cheaper rowid, which
-                    // changes the (unordered) emission order. The VDBE join now models
-                    // this by nesting the second cursor outermost (`[1, 0]`) — a rowid
-                    // join matches ≤1 inner row, so the emission order is exactly the
-                    // driver's scan order.
-                    //
-                    // But the VDBE scans the *materialized* driver rowset in rowid /
-                    // declaration order, so this only reproduces the tree-walker's
-                    // order when the driver is *also* scanned that way — NOT when it
-                    // walks a covering index that reorders it (`SCAN v USING COVERING
-                    // INDEX iv` yields index-key order). Bail in that case. Only the
-                    // plain-projection path (`compile_join2`) is taught the
-                    // permutation; an aggregate / GROUP BY join (whose fold order the
-                    // swap would also perturb — `group_concat` is order-sensitive)
-                    // still defers to the tree-walker.
-                    let driver = &pf.joins[0].table;
-                    let driver_reordered = self
-                        .table_meta(&driver.name, driver.alias.as_deref())
-                        .ok()
-                        .is_some_and(|m| {
-                            self.join_scan_covering_index(check_sel, pf, driver, &m)
-                                .is_some()
-                        });
-                    if !driver_reordered
-                        && sel.group_by.is_empty()
-                        && sel.having.is_none()
-                        && !self.has_aggregate(sel)
-                    {
+                    // A rowid join matches ≤1 inner row, so the emission order is
+                    // exactly the driver's scan order.
+                    if swap_runnable {
                         join_loop_order = alloc::vec![1, 0];
                     } else {
                         return Err(Error::Unsupported("VDBE: two-table rowid-inner swap"));
                     }
-                } else if self.two_table_index_inner_swap(pf).is_some() {
-                    // Secondary-index-inner swap: an index seek returns rows in
-                    // index-key order for multi-matches, which a scan + filter would
-                    // not reproduce — defer to the tree-walker.
-                    return Err(Error::Unsupported("VDBE: two-table index-inner swap"));
-                } else if self.ntable_join_order(check_sel, pf).is_some() {
-                    // Cost-based N-table (≥3) reorder: the VDBE join compiler scans
-                    // sources in declaration order, so a reordered drive produces a
-                    // different (observable, unordered) row order — defer to the
-                    // tree-walker, which owns the reorder (`ntable_join_order`).
-                    return Err(Error::Unsupported("VDBE: N-table cost-based join order"));
+                } else if let Some((_, _, idx)) = self.two_table_index_inner_swap(pf) {
+                    // A single-column UNIQUE index also matches ≤1 inner row (like the
+                    // rowid case) — safe to reorder. A composite or non-unique index
+                    // can match several inner rows in index-key order, which the VDBE's
+                    // scan + filter would not reproduce — defer those.
+                    if idx.unique && idx.cols.len() == 1 && swap_runnable {
+                        join_loop_order = alloc::vec![1, 0];
+                    } else {
+                        return Err(Error::Unsupported("VDBE: two-table index-inner swap"));
+                    }
                 }
+            } else if let Some(pf) = &check_sel.from
+                && self.ntable_join_order(check_sel, pf).is_some()
+            {
+                // Cost-based N-table (≥3) reorder: the VDBE join compiler scans
+                // sources in declaration order, so a reordered drive produces a
+                // different (observable, unordered) row order — defer to the
+                // tree-walker, which owns the reorder (`ntable_join_order`).
+                return Err(Error::Unsupported("VDBE: N-table cost-based join order"));
             }
         }
         // `PRAGMA case_sensitive_like = ON` makes the `LIKE` operator ASCII

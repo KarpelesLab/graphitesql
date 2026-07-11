@@ -282,9 +282,10 @@ result or declines to it — never a wrong answer), so this track is
   path and only when the driver is scanned in rowid/declaration order; a driver
   walked via a *reordering covering index* (`SCAN v USING COVERING INDEX iv`, which
   the materialized rowset scan can't reproduce) and aggregate/GROUP BY joins still
-  defer. `tests/vdbe_join_swap.rs`. (The index-inner and N-table swaps still defer —
-  index seeks return key-order for multi-matches, which a scan+filter would not
-  reproduce.)
+  defer. The **single-column-UNIQUE index-inner swap** runs on the VDBE too (same
+  `[1, 0]` permutation — a unique index also matches ≤1 inner row); a *composite* or
+  *non-unique* index-inner swap can match several inner rows in index-key order and
+  still defers, as does the N-table (≥3) reorder. `tests/vdbe_join_swap.rs`.
 - **B5b-2 — seek-driven inner cursor over real storage** *(the largest remaining
   VDBE piece)*. Inner rowid seeks (INNER + LEFT, single & N-table left-deep chain,
   compound-`ON`) already run over a live `TableCursor`. *Single-table live scan

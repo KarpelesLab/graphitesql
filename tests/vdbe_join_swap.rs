@@ -88,6 +88,62 @@ fn rowid_swap_runs_on_vdbe_and_matches() {
     }
 }
 
+/// A single-column UNIQUE secondary index on the inner also matches ≤1 row, so the
+/// index-inner swap runs on the VDBE too; a non-unique index can multi-match and
+/// still defers.
+#[test]
+fn unique_index_inner_swap_runs_but_nonunique_defers() {
+    if !sqlite3_available() {
+        return;
+    }
+    // `f.a` carries a single-column UNIQUE index; `s.k` is not seekable, so the cost
+    // model drives from `s`, seeking `f` by the unique index.
+    const SU: &str = "CREATE TABLE f(a UNIQUE, x); \
+                      INSERT INTO f VALUES(3,'f3'),(1,'f1'),(2,'f2'); \
+                      CREATE TABLE s(k, v); INSERT INTO s VALUES(2,'q'),(1,'p'),(2,'r'),(9,'z');";
+    let mut c = Connection::open_memory().unwrap();
+    for stmt in SU.split(';') {
+        let s = stmt.trim();
+        if !s.is_empty() {
+            c.execute(s).unwrap();
+        }
+    }
+    for q in [
+        "SELECT f.x, s.v FROM f JOIN s ON f.a=s.k",
+        "SELECT DISTINCT f.x FROM f JOIN s ON f.a=s.k",
+        "SELECT f.x, s.v FROM f JOIN s ON f.a=s.k WHERE s.v>'p'",
+    ] {
+        let v = c
+            .query_vdbe(q)
+            .unwrap_or_else(|e| panic!("`{q}` must run on the VDBE: {e}"));
+        let vs = render(&v.rows);
+        c.set_use_vdbe(false);
+        let tw = render(&c.query(q).unwrap().rows);
+        c.set_use_vdbe(true);
+        assert_eq!(vs, tw, "VDBE vs tree-walker for `{q}`");
+        assert_eq!(vs, sqlite(SU, q), "VDBE vs sqlite for `{q}`");
+    }
+
+    // A NON-unique index on the inner can match several rows (in index-key order),
+    // which the VDBE's scan+filter would not reproduce — it must defer.
+    const SN: &str = "CREATE TABLE f(a, x); CREATE INDEX fa ON f(a); \
+                      INSERT INTO f VALUES(1,'f1a'),(1,'f1b'),(2,'f2'); \
+                      CREATE TABLE s(k, v); INSERT INTO s VALUES(2,'q'),(1,'p');";
+    let mut c2 = Connection::open_memory().unwrap();
+    for stmt in SN.split(';') {
+        let s = stmt.trim();
+        if !s.is_empty() {
+            c2.execute(s).unwrap();
+        }
+    }
+    let q = "SELECT f.x, s.v FROM f JOIN s ON f.a=s.k";
+    assert!(
+        c2.query_vdbe(q).is_err(),
+        "a non-unique index-inner swap must defer to the tree-walker"
+    );
+    assert_eq!(render(&c2.query(q).unwrap().rows), sqlite(SN, q));
+}
+
 /// A driver walked via a reordering covering index: the VDBE cannot reproduce the
 /// index-key scan order from its rowid-order rowset, so the query defers to the
 /// tree-walker — but `query` (which falls back) still returns the correct rows.
