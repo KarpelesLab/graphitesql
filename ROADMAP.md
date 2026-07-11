@@ -427,7 +427,17 @@ result or declines to it — never a wrong answer), so this track is
   single-table WHERE restriction picking the driver) and projection-sensitive
   equal-cost driver ties — the full `whereLoopAddBtree`/`wherePathSolver` formula.
   Divergent EQP where graphite's per-cursor access paths are often cheaper than
-  sqlite's cost-reordered scans is *by design* (results correct).
+  sqlite's cost-reordered scans is *by design* (results correct). *Probed
+  2026-07-11 — a concrete sub-case:* when the join **driver** carries its own
+  selective WHERE equality (`… JOIN small ON big.v=small.v WHERE big.k=7`, or a
+  rowid `WHERE big.id=7`), sqlite renders the driver as a `SEARCH` seeking that
+  constraint (`SEARCH big USING INDEX bk (k=?)`) while graphite `SCAN`s it and
+  builds an automatic index on the inner. The *rows are identical* (the driver's
+  WHERE is re-applied) — this is EQP/perf only. Closing it needs the driver's
+  access path to become a seek (an EQP **and** join-executor change, since the
+  driver is currently always scanned), which ripples through the whole join EQP
+  corpus; deferred as a genuine `whereLoopAddBtree` driver-cost slice, not a quick
+  structural one.
 - **B9j — collation-aware index *selection* for a non-default-collation index.**
   An index carrying a non-default collation (`CREATE INDEX ib ON t(b COLLATE
   NOCASE)`) is mis-selected (rows still correct via the WHERE re-apply). The model —
