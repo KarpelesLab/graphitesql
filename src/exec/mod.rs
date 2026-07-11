@@ -24225,6 +24225,12 @@ impl Connection {
             let mut wp = 0usize;
             let mut rowid_used = false;
             let mut fully = true;
+            // The leading run of ORDER BY terms each satisfied by being
+            // equality-constant or matched by the walk/rowid in sequence. When a term
+            // eventually breaks the run, this is the correct `LAST (n - lead) TERMS`
+            // split (sqlite drops a *leading* constant term but still sorts a trailing
+            // one after any unsatisfied term).
+            let mut lead = 0usize;
             for term in &sel.order_by {
                 let Expr::Column { table, column, .. } = order_key_expr(&order_cols, &term.expr)
                 else {
@@ -24247,6 +24253,7 @@ impl Connection {
                     break;
                 };
                 if eqs.iter().any(|(c, _)| *c == pos) || is_null_cols.contains(&pos) {
+                    lead += 1;
                     continue; // constant under the WHERE equality / IS NULL
                 }
                 if !redundant_nulls(term) {
@@ -24266,6 +24273,7 @@ impl Connection {
                     && walk_colls[wp] == meta.columns[pos].collation
                 {
                     wp += 1;
+                    lead += 1;
                 } else if !rowid_used
                     && wp == walk_cols.len()
                     && !idx.is_auto
@@ -24273,6 +24281,7 @@ impl Connection {
                     && meta.ipk == Some(pos)
                 {
                     rowid_used = true;
+                    lead += 1;
                 } else {
                     fully = false;
                     break;
@@ -24283,6 +24292,11 @@ impl Connection {
                 // direction yields the required (vacuous) order.
                 return Some((sel.order_by.len(), eff.unwrap_or(false)));
             }
+            // Not fully satisfied, but a leading constant/walked run may still let
+            // sqlite sort only the trailing terms (`LAST N TERMS OF ORDER BY`). The
+            // returned direction is irrelevant here — callers ignore it unless the
+            // whole ORDER BY is satisfied (`k == n`), which this is not.
+            return Some((k.max(lead), descending));
         }
         Some((k, descending))
     }
