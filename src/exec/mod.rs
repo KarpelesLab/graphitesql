@@ -23166,34 +23166,41 @@ impl Connection {
         // index-seeked or covering-scanned into a different order). The rowid is
         // unique, so once an ORDER BY term is the inner rowid (ascending), every later
         // term is satisfied too.
-        // The inner is scanned in rowid order (so `ORDER BY inner.rowid` needs no
-        // sort) when it is a rowid table that is neither covering-scanned nor seeked:
-        // no covering index is used, no index leads with a column the `ON` equates to
-        // the driver (that would be an index-key-order seek), and no `WHERE` eq/range
-        // constraint could seek or reorder it (the join is driven purely by the
-        // single driver row). An *unrelated* secondary index is fine.
+        // The inner arrives in rowid order (so `ORDER BY inner.rowid` needs no sort)
+        // for the single driver row when its access path is rowid-ordered:
+        //   * a plain rowid-order scan (no index seek, no covering scan), or
+        //   * a single-value equality seek on a **single-column** index over the join
+        //     column — every match shares the one key value, tie-broken by rowid, so
+        //     the rows come out in rowid order (covering or not).
+        // A **multi-column** index over the join column would order by its key suffix,
+        // and a covering *scan* of any *other* index would be in that index's order —
+        // both need a sort, and are excluded. No `WHERE` eq/range on the inner may seek
+        // or reorder it (the join is driven purely by the single driver row). An
+        // *unrelated* secondary index is fine.
+        let seek_cols: Vec<usize> = inner_const
+            .iter()
+            .filter_map(|n| {
+                imeta
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(n))
+            })
+            .collect();
+        let leads_join_col =
+            |ix: &IndexMeta| ix.cols.first().is_some_and(|c| seek_cols.contains(c));
         let inner_plain_rowid_scan = imeta.ipk.is_some()
             && !imeta.without_rowid
-            && self
-                .join_scan_covering_index(sel, from, &join.table, &imeta)
-                .is_none()
-            && {
-                let seek_cols: Vec<usize> = inner_const
-                    .iter()
-                    .filter_map(|n| {
-                        imeta
-                            .columns
-                            .iter()
-                            .position(|c| c.name.eq_ignore_ascii_case(n))
-                    })
-                    .collect();
-                self.indexes_of(&join.table.name)
-                    .map(|ixs| {
-                        !ixs.iter()
-                            .any(|ix| ix.cols.first().is_some_and(|c| seek_cols.contains(c)))
-                    })
-                    .unwrap_or(false)
+            && match self.join_scan_covering_index(sel, from, &join.table, &imeta) {
+                // Plain rowid scan (nothing covers cheaper) — rowid order.
+                None => true,
+                // The only covering index allowed is the single-column join-seek index
+                // itself: that is a single-value seek (rowid order), not a scan.
+                Some(idx) => idx.cols.len() == 1 && leads_join_col(&idx),
             }
+            && self
+                .indexes_of(&join.table.name)
+                .map(|ixs| !ixs.iter().any(|ix| ix.cols.len() > 1 && leads_join_col(ix)))
+                .unwrap_or(false)
             && {
                 let mut eqs: Vec<(usize, Value)> = Vec::new();
                 let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =

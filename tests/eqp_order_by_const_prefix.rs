@@ -263,6 +263,79 @@ fn single_row_driver_join_all_constant_order_by() {
 }
 
 #[test]
+fn single_row_driver_join_on_indexed_inner_column() {
+    if !sqlite_available() {
+        return;
+    }
+    // The join is ON an *indexed* inner column. For the single driver row, `small` is
+    // seeked for one key value. A SINGLE-column index over that column yields rowid
+    // order (all matches share the key, tie-broken by rowid) → `ORDER BY small.id`
+    // needs no sort, covering or not. A MULTI-column index orders by its key suffix →
+    // it still sorts. `w` is anti-correlated with the rowid so the key order (3,1,2)
+    // and rowid order (1,2,3) genuinely differ — the multi-col case must really sort.
+    const SINGLE: &str = "CREATE TABLE big(id INTEGER PRIMARY KEY, v); \
+                          CREATE TABLE small(id INTEGER PRIMARY KEY, k, w); \
+                          CREATE INDEX sk ON small(k); \
+                          INSERT INTO big VALUES(7,5); \
+                          INSERT INTO small VALUES(3,5,'a'),(1,5,'b'),(2,5,'c'),(4,9,'z');";
+    const MULTI: &str = "CREATE TABLE big(id INTEGER PRIMARY KEY, v); \
+                         CREATE TABLE small(id INTEGER PRIMARY KEY, k, w); \
+                         CREATE INDEX skw ON small(k,w); \
+                         INSERT INTO big VALUES(7,5); \
+                         INSERT INTO small VALUES(3,5,'a'),(1,5,'b'),(2,5,'c'),(4,9,'z');";
+    let open = |setup: &str| {
+        let mut c = Connection::open_memory().unwrap();
+        for stmt in setup.split(';') {
+            let s = stmt.trim();
+            if !s.is_empty() {
+                c.execute(s).unwrap();
+            }
+        }
+        c
+    };
+    // Single-column index: covering (SELECT small.id) and non-covering (SELECT
+    // small.w) projections both skip the sort, exactly like sqlite.
+    let cs = open(SINGLE);
+    for q in [
+        "SELECT small.id FROM big JOIN small ON big.v=small.k WHERE big.id=7 ORDER BY small.id",
+        "SELECT small.id, small.w FROM big JOIN small ON big.v=small.k WHERE big.id=7 ORDER BY small.id",
+    ] {
+        assert_eq!(
+            sqlite_eqp_setup(SINGLE, q),
+            graphite_eqp(&cs, q),
+            "EQP diverged on `{q}`"
+        );
+    }
+    // Multi-column index over the join column: sqlite (and now graphite) keep the sort.
+    let cm = open(MULTI);
+    let q = "SELECT small.id FROM big JOIN small ON big.v=small.k WHERE big.id=7 ORDER BY small.id";
+    assert_eq!(
+        sqlite_eqp_setup(MULTI, q),
+        graphite_eqp(&cm, q),
+        "EQP diverged on `{q}`"
+    );
+
+    // Rows come out ascending by small.id in both — the single-col case is already
+    // rowid-ordered (sort skipped), the multi-col case genuinely sorts (its key order
+    // 3,1,2 differs from rowid order 1,2,3).
+    let ids = |c: &Connection| -> Vec<i64> {
+        c.query(
+            "SELECT small.id FROM big JOIN small ON big.v=small.k WHERE big.id=7 ORDER BY small.id",
+        )
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Integer(n) => *n,
+            v => panic!("{v:?}"),
+        })
+        .collect()
+    };
+    assert_eq!(ids(&cs), vec![1, 2, 3]);
+    assert_eq!(ids(&cm), vec![1, 2, 3]);
+}
+
+#[test]
 fn dropped_constant_term_still_returns_correct_rows() {
     if !sqlite_available() {
         return;
