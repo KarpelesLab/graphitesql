@@ -102,6 +102,11 @@ fn one_shot_error_rendering_matches_sqlite() {
         "SELECT 'bogusfn', bogusfn(1)",
         // A deep resolution error uses the left-decorated caret.
         "CREATE TABLE t(a); SELECT a, aa, bb, cc, dd, badcol FROM t",
+        // A far-right error token (offset > 50) is windowed: SQLite slides the shown
+        // source line's start forward so the caret stays at a bounded column, and
+        // caps the line at 78 chars (`shell_error_context`).
+        "CREATE TABLE t(a); SELECT 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', \
+         zzznocol FROM t",
     ];
     for sql in cases {
         assert_eq!(out("sqlite3", sql), out(g, sql), "for {sql}");
@@ -136,6 +141,9 @@ fn script_mode_error_rendering_matches_sqlite() {
         "CREATE TABLE t(a);\nSELECT 1; SELECT bad.col;\n",
         // A long statement uses the right-anchored `error here ---^` caret form.
         "SELECT aaaaaaaaaaaaaaaaaaaaaaaaaaaa FROM x SELET;\n",
+        // A far-right error token is windowed here too (offset > 50).
+        "CREATE TABLE t(a);\nSELECT 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', \
+         zzznocol FROM t;\n",
         // No error → identical (regression guard on the happy path).
         "CREATE TABLE t(a,b);\nINSERT INTO t VALUES(1,'x');\nSELECT * FROM t;\n",
     ];

@@ -693,10 +693,15 @@ peripheral — the SQL engine, not the shell, is the project's purpose):**
   `render_cli_error` in `src/bin/graphitesql.rs`: the caret token is located by a
   string/comment-skipping text search of the failed statement, and prepare-vs-step
   is decided by an *inverted* classification (a small stable set of step errors;
-  everything else is prepare). *Residuals
-  (rare; the differential corpus strips carets):* a repeated-operator token (`===`)
-  whose exact offset only the parser knows, and the long-line source *windowing* the
-  sqlite shell applies past ~column 53.
+  everything else is prepare). **Long-line *windowing* DONE 2026-07-11:** a far-right
+  error token (offset > 50) now slides the shown source line forward and caps it at
+  78 chars, keeping the caret at a bounded column, exactly as the sqlite shell's
+  `shell_error_context` does (shared `caret_block` helper; window-slide + 78-cap +
+  the offset-25 caret-direction flip). *Residual (rare):* a repeated-operator token
+  (`===`) whose exact fail offset only the parser knows — graphite text-searches the
+  first occurrence, so its caret (and any windowing keyed off it) can point at the
+  wrong `=`; closing it needs the parser's byte offset on `Error` (a public-API
+  change).
 - **CLI-2b — script/piped error *text*. DONE 2026-07-11.** The piped/`.read`/
   interactive path now renders the sqlite shell's *script* wording — `Parse error
   near line N: <msg>` (with the whitespace-collapsed statement and a `^--- error

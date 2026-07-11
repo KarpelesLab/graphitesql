@@ -2691,21 +2691,43 @@ fn locate_token(sql: &str, token: &str) -> Option<usize> {
 /// the message names a locatable token) for a prepare-time error, or
 /// `Error: stepping, <msg>[ (<code>)]` for a step-time error (the extended result
 /// code is shown when it is not the generic `SQLITE_ERROR`).
+/// Build the two-line `  <source>\n<caret>` block the SQLite shell prints under an
+/// error, given the offending statement `src` and the byte `off`set of the error
+/// token within it. Mirrors `shell_error_context`: a far-right token is kept visible
+/// by sliding the displayed line's start forward while the offset exceeds 50 (on
+/// char boundaries), the line is capped at 78 bytes, and the caret flips from the
+/// right-pointing form (`^--- error here`) to the left-pointing one
+/// (`error here ---^`) once the offset reaches 25.
+fn caret_block(src: &str, off: usize) -> String {
+    // Slide the window start forward until the offset is within 50 of it.
+    let mut start = 0usize;
+    let mut ioff = off;
+    while ioff > 50 {
+        let ch_len = src[start..].chars().next().map_or(1, |c| c.len_utf8());
+        start += ch_len;
+        ioff -= 1;
+    }
+    // Displayed line: from `start`, capped at 78 bytes on a char boundary, and with
+    // any trailing newline removed.
+    let tail = src[start..].trim_end_matches(['\n', '\r']);
+    let mut end = tail.len().min(78);
+    while end < tail.len() && !tail.is_char_boundary(end) {
+        end -= 1;
+    }
+    let shown = &tail[..end];
+    let caret = if ioff < 25 {
+        format!("{}^--- error here", " ".repeat(2 + ioff))
+    } else {
+        format!("{}error here ---^", " ".repeat(2 + ioff - 14))
+    };
+    format!("  {shown}\n{caret}")
+}
+
 fn render_cli_error(sql: &str, e: &graphitesql::Error) -> String {
     let msg = raw_error_message(e);
     if is_prepare_error(e, &msg) {
         if let Some(off) = error_offending_token(&msg).and_then(|t| locate_token(sql, t)) {
-            // The caret sits at column `2 + off` (the source line is indented two
-            // spaces). SQLite decorates it on the right (`^--- error here`) near the
-            // start of the line, but flips to the left (`error here ---^`) once the
-            // caret column reaches 27, matching its shell.
-            let caret_col = 2 + off;
-            let caret_line = if caret_col >= 27 {
-                format!("{}error here ---^", " ".repeat(caret_col - 14))
-            } else {
-                format!("{}^--- error here", " ".repeat(caret_col))
-            };
-            return format!("Error: in prepare, {msg}\n  {sql}\n{caret_line}");
+            return format!("Error: in prepare, {msg}\n{}", caret_block(sql, off));
         }
         return format!("Error: in prepare, {msg}");
     }
@@ -2750,15 +2772,10 @@ fn render_script_error(sql: &str, e: &graphitesql::Error, line: usize) -> String
     let flat = collapse_ws(sql);
     if is_prepare_error(e, &msg) {
         if let Some(off) = error_offending_token(&msg).and_then(|t| locate_token(&flat, t)) {
-            // Same caret geometry as the one-shot path: the source line is indented
-            // two spaces, and the decoration flips from right to left at column 27.
-            let caret_col = 2 + off;
-            let caret_line = if caret_col >= 27 {
-                format!("{}error here ---^", " ".repeat(caret_col - 14))
-            } else {
-                format!("{}^--- error here", " ".repeat(caret_col))
-            };
-            return format!("Parse error near line {line}: {msg}\n  {flat}\n{caret_line}");
+            return format!(
+                "Parse error near line {line}: {msg}\n{}",
+                caret_block(&flat, off)
+            );
         }
         return format!("Parse error near line {line}: {msg}");
     }
