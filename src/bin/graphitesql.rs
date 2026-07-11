@@ -2487,7 +2487,8 @@ fn raw_error_message(e: &graphitesql::Error) -> String {
         | E::Io(m)
         | E::CantOpen(m)
         | E::Constraint(m)
-        | E::Parse(m) => m.clone(),
+        | E::Parse(m)
+        | E::ParseAt(m, _) => m.clone(),
         E::Busy => String::from("database is locked"),
         E::Unsupported(m) => String::from(*m),
         // `Error` is non-exhaustive; fall back to Display for any future variant.
@@ -2505,7 +2506,7 @@ fn raw_error_message(e: &graphitesql::Error) -> String {
 fn is_prepare_error(e: &graphitesql::Error, msg: &str) -> bool {
     use graphitesql::Error as E;
     match e {
-        E::Parse(_) => true,
+        E::Parse(_) | E::ParseAt(..) => true,
         // A constraint violation, a lock/busy, a corrupt/IO/open failure is a
         // run-time (step) error.
         E::Constraint(_) | E::Busy | E::Corrupt(_) | E::Io(_) | E::CantOpen(_) => false,
@@ -2726,7 +2727,15 @@ fn caret_block(src: &str, off: usize) -> String {
 fn render_cli_error(sql: &str, e: &graphitesql::Error) -> String {
     let msg = raw_error_message(e);
     if is_prepare_error(e, &msg) {
-        if let Some(off) = error_offending_token(&msg).and_then(|t| locate_token(sql, t)) {
+        // Prefer the parser's exact byte offset (a syntax error carries it, like
+        // `sqlite3_error_offset`) so the caret is right even for a repeated token
+        // (`===`); fall back to locating the message's token by text for errors
+        // without an offset (resolution errors, etc.).
+        let off = e
+            .parse_offset()
+            .filter(|&o| o <= sql.len())
+            .or_else(|| error_offending_token(&msg).and_then(|t| locate_token(sql, t)));
+        if let Some(off) = off {
             return format!("Error: in prepare, {msg}\n{}", caret_block(sql, off));
         }
         return format!("Error: in prepare, {msg}");
@@ -2771,7 +2780,15 @@ fn render_script_error(sql: &str, e: &graphitesql::Error, line: usize) -> String
     let msg = raw_error_message(e);
     let flat = collapse_ws(sql);
     if is_prepare_error(e, &msg) {
-        if let Some(off) = error_offending_token(&msg).and_then(|t| locate_token(&flat, t)) {
+        // The parser's byte offset is into the original `sql`; it aligns with the
+        // whitespace-collapsed `flat` only when no collapse happened (a single-line
+        // statement, which the shell trims). Use it then (exact even for a repeated
+        // token); otherwise fall back to text-locating the token in `flat`.
+        let off = e
+            .parse_offset()
+            .filter(|_| flat == sql)
+            .or_else(|| error_offending_token(&msg).and_then(|t| locate_token(&flat, t)));
+        if let Some(off) = off {
             return format!(
                 "Parse error near line {line}: {msg}\n{}",
                 caret_block(&flat, off)

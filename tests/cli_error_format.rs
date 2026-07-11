@@ -107,6 +107,12 @@ fn one_shot_error_rendering_matches_sqlite() {
         // caps the line at 78 chars (`shell_error_context`).
         "CREATE TABLE t(a); SELECT 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', \
          zzznocol FROM t",
+        // A *repeated* syntax token: the caret must point at the parser's failing
+        // occurrence, not the first text match — the `Error::ParseAt` byte offset
+        // (like `sqlite3_error_offset`) places it exactly (`===`, a column-alias list
+        // `AS v(x,y)`, and a doubled function-name arity error).
+        "CREATE TABLE t(a); SELECT 1 FROM t WHERE a === 1",
+        "SELECT * FROM (SELECT 1 a) AS v(x,y)",
     ];
     for sql in cases {
         assert_eq!(out("sqlite3", sql), out(g, sql), "for {sql}");
@@ -144,6 +150,9 @@ fn script_mode_error_rendering_matches_sqlite() {
         // A far-right error token is windowed here too (offset > 50).
         "CREATE TABLE t(a);\nSELECT 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx', \
          zzznocol FROM t;\n",
+        // A repeated syntax token on a single line — the parser byte offset places
+        // the caret exactly (a collapse-free line, so the offset aligns).
+        "CREATE TABLE t(a);\nSELECT 1 FROM t WHERE a === 1;\n",
         // No error → identical (regression guard on the happy path).
         "CREATE TABLE t(a,b);\nINSERT INTO t VALUES(1,'x');\nSELECT * FROM t;\n",
     ];

@@ -237,10 +237,13 @@ impl Parser {
     /// past the bad token points at `self.pos - 1`.
     fn syntax_error(&self, idx: usize) -> Error {
         match self.tokens.get(idx) {
-            Some(s) => Error::Parse(format!(
-                "near \"{}\": syntax error",
-                &self.source[s.start..s.end]
-            )),
+            // Carry the offending token's byte offset (like `sqlite3_error_offset`) so
+            // the CLI can place the `^--- error here` caret exactly, even when the
+            // token text repeats (`===`).
+            Some(s) => Error::ParseAt(
+                format!("near \"{}\": syntax error", &self.source[s.start..s.end]),
+                s.start,
+            ),
             None => Error::Parse("incomplete input".into()),
         }
     }

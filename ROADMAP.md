@@ -731,11 +731,16 @@ peripheral — the SQL engine, not the shell, is the project's purpose):**
   error token (offset > 50) now slides the shown source line forward and caps it at
   78 chars, keeping the caret at a bounded column, exactly as the sqlite shell's
   `shell_error_context` does (shared `caret_block` helper; window-slide + 78-cap +
-  the offset-25 caret-direction flip). *Residual (rare):* a repeated-operator token
-  (`===`) whose exact fail offset only the parser knows — graphite text-searches the
-  first occurrence, so its caret (and any windowing keyed off it) can point at the
-  wrong `=`; closing it needs the parser's byte offset on `Error` (a public-API
-  change).
+  the offset-25 caret-direction flip). **Repeated-token caret DONE 2026-07-11:** a new
+  non-breaking `Error::ParseAt(String, usize)` variant (the enum is `#[non_exhaustive]`)
+  carries the parser's exact byte offset of the offending token — the equivalent of
+  `sqlite3_error_offset`, exposed as `Error::parse_offset()`. `syntax_error` builds it
+  from the token `Span`, and both CLI renderers prefer it over the text search, so
+  `===` / a column-alias list `AS v(x,y)` / a doubled function name now caret exactly.
+  *Residual:* a **resolution** error (`no such column`, `wrong number of arguments`)
+  still text-searches — those come from the executor, which does not yet thread an
+  offset (the parser-offset infra is now in place to extend to them); and the script
+  path uses the offset only for a single-line (collapse-free) statement.
 - **CLI-2b — script/piped error *text*. DONE 2026-07-11.** The piped/`.read`/
   interactive path now renders the sqlite shell's *script* wording — `Parse error
   near line N: <msg>` (with the whitespace-collapsed statement and a `^--- error

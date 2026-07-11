@@ -33,6 +33,13 @@ pub enum Error {
     /// SQL could not be tokenized or parsed, or a logic error in SQL
     /// (`SQLITE_ERROR`, surfaced separately for clearer diagnostics).
     Parse(String),
+    /// A syntax error carrying the byte offset of the offending token within the
+    /// parsed SQL (`SQLITE_ERROR`), like [`Parse`](Error::Parse) but with the
+    /// location SQLite's `sqlite3_error_offset` reports — used to place the shell's
+    /// `^--- error here` caret exactly even when the token text repeats. The message
+    /// is identical to the `Parse` form; the offset is into the SQL text passed to
+    /// the parser.
+    ParseAt(String, usize),
     /// An operation was attempted that this build does not yet implement.
     ///
     /// Not a SQLite code; it exists so the engine can fail loudly and
@@ -47,12 +54,23 @@ impl Error {
     /// equivalent concept.
     pub fn code(&self) -> i32 {
         match self {
-            Error::Error(_) | Error::Parse(_) | Error::Unsupported(_) => 1, // SQLITE_ERROR
-            Error::Corrupt(_) => 11,                                        // SQLITE_CORRUPT
-            Error::Io(_) => 10,                                             // SQLITE_IOERR
-            Error::Busy => 5,                                               // SQLITE_BUSY
-            Error::CantOpen(_) => 14,                                       // SQLITE_CANTOPEN
-            Error::Constraint(_) => 19,                                     // SQLITE_CONSTRAINT
+            Error::Error(_) | Error::Parse(_) | Error::ParseAt(..) | Error::Unsupported(_) => 1, // SQLITE_ERROR
+            Error::Corrupt(_) => 11,    // SQLITE_CORRUPT
+            Error::Io(_) => 10,         // SQLITE_IOERR
+            Error::Busy => 5,           // SQLITE_BUSY
+            Error::CantOpen(_) => 14,   // SQLITE_CANTOPEN
+            Error::Constraint(_) => 19, // SQLITE_CONSTRAINT
+        }
+    }
+
+    /// The byte offset of the offending token within the parsed SQL, when known (a
+    /// [`ParseAt`](Error::ParseAt) syntax error) — the equivalent of SQLite's
+    /// `sqlite3_error_offset`. `None` for every other error, including a `Parse`
+    /// without a locatable token (`incomplete input`).
+    pub fn parse_offset(&self) -> Option<usize> {
+        match self {
+            Error::ParseAt(_, off) => Some(*off),
+            _ => None,
         }
     }
 }
@@ -70,7 +88,7 @@ impl fmt::Display for Error {
             // string, the STRICT `cannot store …` text), matching sqlite's
             // `errmsg` verbatim — so no redundant outer prefix is added.
             Error::Constraint(m) => write!(f, "{m}"),
-            Error::Parse(m) => write!(f, "SQL error: {m}"),
+            Error::Parse(m) | Error::ParseAt(m, _) => write!(f, "SQL error: {m}"),
             Error::Unsupported(m) => write!(f, "not yet implemented: {m}"),
         }
     }
