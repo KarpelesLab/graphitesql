@@ -391,8 +391,21 @@ result or declines to it — never a wrong answer), so this track is
   reaches this path only after every seek fails and `run_core` re-applies the `WHERE`
   to the ordered rows downstream, so no execution change was needed. Verified
   differentially against the sqlite3 CLI (`tests/eqp_sort_avoidance.rs`).
+  **Seek-vs-sort with a single open-ended range — DONE 2026-07-11:** when the
+  `WHERE` is a *single open-ended* range (`b>?`, `b<?`, `b>=?`, `b<=?`, `b!=?`) on
+  one index and the `ORDER BY` is fully served by *another* index, sqlite walks the
+  ORDER-BY index to avoid the sort rather than seek the range (the range's ~1/4
+  default selectivity does not pay for losing the ordered walk) — whereas an
+  equality / bounded range (`… AND …`) / `IN` stays a seek + sort.
+  `order_index_scan` now also admits that single-open-range access (recognised
+  structurally from the `eqp_access` render), suppressing the override when the
+  chosen ORDER-BY index *is* the seek index (there the seek is already ordered —
+  B9j seek-order-credit — so the SEARCH stays); `try_index_range` defers to it so
+  execution and EQP agree, and the `COVERING` label now folds in the WHERE columns.
+  Gated to the no-ANALYZE case (value-specific selectivity is B4). Verified
+  differentially (`single_open_range_prefers_order_index_over_seek`).
   Still open: ORDER BY influencing the index *choice* among indexes (the full
-  sort-avoidance cost *term*, beyond the no-seek case); the tiebreak among several non-covering indexes sharing an equality
+  sort-avoidance cost *term*, beyond the no-seek and single-open-range cases); the tiebreak among several non-covering indexes sharing an equality
   prefix (SQLite's full LogEst row-cost, not reducible to narrower/newest); a
   *partial-prefix* covering index for a multi-column ORDER BY (unify
   `order_index_scan`/`covering_scan`); `min`/`max` over a non-leading covered

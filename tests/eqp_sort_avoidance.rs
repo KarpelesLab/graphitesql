@@ -182,6 +182,89 @@ fn order_by_collate_uses_matching_collation_index() {
 }
 
 #[test]
+fn single_open_range_prefers_order_index_over_seek() {
+    if sqlite_eqp("SELECT 1").is_none() {
+        return;
+    }
+    // Two independent indexes: one on the WHERE column (`i_b`), one on the ORDER BY
+    // column (`i_c`). When the WHERE is a *single open-ended* range, sqlite walks
+    // the ORDER-BY index to avoid the sort (its ~1/4 default selectivity does not
+    // pay for losing the ordered walk); an equality / bounded range / `IN` instead
+    // seeks `i_b` and sorts. graphite's EQP must match in every case.
+    const S: &str = "CREATE TABLE t(a, b, c, d); \
+                     CREATE INDEX i_b ON t(b); CREATE INDEX i_c ON t(c); \
+                     INSERT INTO t VALUES(1,3,'x',0),(2,1,'y',0),(3,2,'z',0),\
+                                        (4,1,'w',0),(5,4,'v',0);";
+    let sq = |sql: &str| -> Vec<String> {
+        let out = Command::new("sqlite3")
+            .arg(":memory:")
+            .arg(format!("{S} EXPLAIN QUERY PLAN {sql};"))
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| l.trim_start_matches(['`', '|', '-', ' ']).to_string())
+            .filter(|s| !s.is_empty() && s != "QUERY PLAN")
+            .collect()
+    };
+    let gr = |sql: &str| -> Vec<String> {
+        let mut c = Connection::open_memory().unwrap();
+        for stmt in S.split(';') {
+            let s = stmt.trim();
+            if !s.is_empty() {
+                c.execute(s).unwrap();
+            }
+        }
+        c.query(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match r.last() {
+                Some(graphitesql::Value::Text(t)) => t.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    };
+    for q in [
+        // Single open-ended range → walk the ORDER-BY index (no sort).
+        "SELECT * FROM t WHERE b>1 ORDER BY c",
+        "SELECT * FROM t WHERE b>=1 ORDER BY c",
+        "SELECT * FROM t WHERE b<4 ORDER BY c",
+        "SELECT * FROM t WHERE b<=4 ORDER BY c",
+        "SELECT * FROM t WHERE b!=1 ORDER BY c",
+        "SELECT c FROM t WHERE b>1 ORDER BY c",
+        // Equality / bounded range / IN → seek `i_b` and sort.
+        "SELECT * FROM t WHERE b=1 ORDER BY c",
+        "SELECT * FROM t WHERE b>1 AND b<4 ORDER BY c",
+        "SELECT * FROM t WHERE b IN (1,2) ORDER BY c",
+    ] {
+        assert_eq!(sq(q), gr(q), "EQP diverged on `{q}`");
+    }
+    // The sort-avoiding path still yields correctly ordered rows (WHERE re-applied
+    // to the ordered walk downstream): `WHERE b>1 ORDER BY c` keeps only b=3,2,4
+    // → c in ('x','z','v') sorted ascending → 'v','x','z'.
+    let mut c = Connection::open_memory().unwrap();
+    for stmt in S.split(';') {
+        let s = stmt.trim();
+        if !s.is_empty() {
+            c.execute(s).unwrap();
+        }
+    }
+    let cs: Vec<String> = c
+        .query("SELECT c FROM t WHERE b>1 ORDER BY c")
+        .unwrap()
+        .rows
+        .iter()
+        .map(|r| match &r[0] {
+            graphitesql::Value::Text(t) => t.clone(),
+            v => panic!("{v:?}"),
+        })
+        .collect();
+    assert_eq!(cs, vec!["v", "x", "z"]);
+}
+
+#[test]
 fn sort_avoided_results_are_correctly_ordered() {
     if sqlite_eqp("SELECT 1").is_none() {
         return;

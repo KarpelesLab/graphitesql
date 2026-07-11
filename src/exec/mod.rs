@@ -16537,6 +16537,17 @@ impl Connection {
             return Ok(None);
         }
 
+        // Seek-vs-sort: when this is a *single open-ended* range and the `ORDER BY`
+        // is fully served by another index, sqlite walks that ORDER-BY index to
+        // avoid the sort rather than seek the range (the range's ~1/4 default
+        // selectivity does not pay for losing the ordered walk). `order_index_scan`
+        // only returns `Some` with a WHERE present in exactly that case (its gate
+        // otherwise bails on any seek), so defer to it here; `run_core` re-applies
+        // the WHERE to the ordered rows, keeping the result correct.
+        if self.order_index_scan(sel, params).is_some() {
+            return Ok(None);
+        }
+
         // Rowid (INTEGER PRIMARY KEY) range: walk the table b-tree between integer
         // bounds. `INDEXED BY` forbids this (the rowid is not a named index). Only
         // integer bounds are taken (a non-integer literal falls to the scan); the
@@ -22019,6 +22030,10 @@ impl Connection {
         // `run_core` re-applies the WHERE to the ordered rows downstream, so the
         // rows stay correct either way — this gate keeps the EQP/order-satisfied
         // decision in lockstep with SQLite.
+        // When admitted via the single-open-range rule below, the name of the index
+        // that range would otherwise seek — the override is suppressed if the chosen
+        // ORDER-BY index turns out to be the same one (the seek is already ordered).
+        let mut seek_index: Option<String> = None;
         if let Some(w) = &sel.where_clause {
             let meta = self.table_meta(&t.name, t.alias.as_deref()).ok()?;
             let label = t.alias.as_deref().unwrap_or(&t.name);
@@ -22026,10 +22041,40 @@ impl Connection {
                 .eqp_access(label, &t.name, &meta, Some(w), Some(sel), params)
                 .ok()?;
             // A plain full scan reads as `SCAN <label>` with no `USING …` index;
-            // anything else (a `SEARCH` seek, or a covering/index scan) means the
-            // WHERE — not the ORDER BY — drives the access.
-            if !access.starts_with("SCAN ") || access.contains(" USING ") {
+            // sqlite then walks the ORDER-BY index to avoid the sort (B9h).
+            let plain_scan = access.starts_with("SCAN ") && !access.contains(" USING ");
+            // A *single open-ended* range seek (`b>?`, `b<?`, …) is not selective
+            // enough (default ~1/4 rows) to beat walking the ORDER-BY index and
+            // avoiding the sort, so sqlite prefers the ORDER-BY index there too —
+            // unlike an equality / bounded range (`… AND …`) / `IN` (all `=?`),
+            // which stay a seek + sort. Recognised structurally from the render (a
+            // lone `>`/`<` bound, no ` AND `, no bare `=`). Only without ANALYSE,
+            // whose value-specific selectivity is not modelled by this heuristic;
+            // with stats the seek-vs-scan cost decides (`run_core` re-applies the
+            // WHERE to the ordered rows, so results stay correct either way).
+            let single_open_range = access.starts_with("SEARCH ")
+                && access.contains(" (")
+                && (access.contains('>') || access.contains('<'))
+                && !access.contains(" AND ")
+                && self.stat1_map().is_empty();
+            if !plain_scan && !single_open_range {
                 return None;
+            }
+            // The index this range would seek. If the ORDER-BY index chosen below is
+            // this SAME index, the seek itself already yields ordered rows (B9j
+            // seek-order-credit → a SEARCH, not a plain SCAN), so this override must
+            // not fire; recorded here and checked after the order index is picked.
+            if single_open_range {
+                // `… USING [COVERING] INDEX <name> (<bound>)` → `<name>`.
+                seek_index = access
+                    .rsplit(" USING ")
+                    .next()
+                    .map(|s| {
+                        s.trim_start_matches("COVERING ")
+                            .trim_start_matches("INDEX ")
+                    })
+                    .and_then(|s| s.split(" (").next())
+                    .map(|s| s.trim().to_string());
             }
         }
         if self.has_aggregate(sel) || window::has_window(sel) {
@@ -22174,7 +22219,16 @@ impl Connection {
                 && !idx.is_auto
                 && idx.descending.iter().take(match_len).all(|d| !d);
             let sorted_suffix = if rowid_tail { 0 } else { cols.len() - ordered };
-            let covering = self.index_covers_query(sel, &meta, &idx.cols);
+            // `COVERING` requires the index to hold *every* referenced column —
+            // including the `WHERE` columns, which `index_covers_query` (projection
+            // + ORDER BY only) omits. When a seek predicate is served here (the
+            // single-open-range case), an uncovered WHERE column still needs the
+            // table row, so sqlite drops the `COVERING` label; fold that in.
+            let covering = self.index_covers_query(sel, &meta, &idx.cols)
+                && sel
+                    .where_clause
+                    .as_ref()
+                    .is_none_or(|w| where_cols_covered(w, &meta, &idx.cols));
             if sorted_suffix > 0 && covering {
                 continue;
             }
@@ -22198,6 +22252,14 @@ impl Connection {
                     },
                 ));
             }
+        }
+        // Suppress the single-open-range override when the ORDER-BY index picked is
+        // the very index the range seeks: there the SEARCH already reads in order
+        // (seek-order-credit), so sqlite keeps the SEARCH rather than a plain SCAN.
+        if let (Some(seek), Some((_, s))) = (&seek_index, &best)
+            && s.name.eq_ignore_ascii_case(seek)
+        {
+            return None;
         }
         best.map(|(_, s)| s)
     }
