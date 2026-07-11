@@ -2548,6 +2548,7 @@ fn is_prepare_error(e: &graphitesql::Error, msg: &str, sql: &str) -> bool {
                 "cannot join using column",
                 "unable to identify the object to be reindexed",
                 "cannot drop ", // DROP COLUMN validation (last/PK/indexed column)
+                "use DROP ",    // DROP <wrong-kind>: "use DROP TABLE/VIEW/INDEX to delete …"
                 "sub-select returns",
                 "table ", // "table X has N columns…" / "table X already exists"
                 "there is already ",

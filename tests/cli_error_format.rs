@@ -78,6 +78,8 @@ fn one_shot_error_rendering_matches_sqlite() {
         "INSERT INTO nope VALUES(1)",
         "DROP TABLE nope",
         "DROP INDEX nope",
+        "CREATE TABLE t(a); DROP VIEW t", // use DROP TABLE to delete table t
+        "CREATE VIEW v AS SELECT 1; DROP TABLE v", // use DROP VIEW to delete view v
         "CREATE TABLE t(a); SELECT a FROM t ORDER BY a COLLATE nope",
         "CREATE TABLE t(a,b); INSERT INTO t VALUES(1)",
         "CREATE TABLE t(a,a)",
