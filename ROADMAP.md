@@ -261,6 +261,17 @@ result or declines to it — never a wrong answer), so this track is
 
 **Move the last shapes onto the VDBE:**
 
+- **B-agg-collate — collation-aware bare-aggregate fold on the VDBE. DONE
+  2026-07-12.** `min`/`max` and `count(DISTINCT …)`/`group_concat(DISTINCT …)` over a
+  non-BINARY declared-collation column, with no `GROUP BY`, now run on the VDBE:
+  `Op::AggStep` carries the argument collation, the fold dedups with
+  `distinct_eq_coll` and reduces `min`/`max` with `cmp_values_coll`. Both
+  bare-aggregate bails (single-table + join) are removed. With this, **collation on
+  the VDBE is complete** — DISTINCT (single-table + join), `GROUP BY` key/order/
+  companion, and the grouped and bare aggregate folds all honor collations; only an
+  explicit-`COLLATE` group key or aggregate argument still defers (conservative, via
+  `agg_kind_distinct` / the computed-key bail). Safe by construction (BINARY
+  arguments are byte-identical). `tests/vdbe_distinct_agg.rs`.
 - **B-groupby-collate — collation-aware `GROUP BY` on the VDBE. DONE 2026-07-12.**
   `GROUP BY` over a non-BINARY declared-collation key (`NOCASE`/`RTRIM`/custom) now
   runs on the VDBE: `GroupStep` matches group identity and tracks the min/max
