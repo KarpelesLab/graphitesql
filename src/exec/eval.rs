@@ -302,29 +302,20 @@ pub struct Params {
 
 impl Params {
     fn get(&self, p: &Param, anon_index: usize) -> Result<Value> {
-        match p {
-            Param::Anonymous => self
-                .positional
-                .get(anon_index)
-                .cloned()
-                .ok_or_else(|| Error::Error(format_args_unbound(anon_index + 1))),
-            Param::Numbered(n) => self
-                .positional
-                .get((*n as usize).wrapping_sub(1))
-                .cloned()
-                .ok_or_else(|| Error::Error(format_args_unbound(*n as usize))),
+        // An unbound parameter reads as NULL, exactly as SQLite's bind API does: a
+        // statement stepped without a value bound to a `?`/`?N`/`:name`/`@name`/`$name`
+        // parameter sees NULL there (the shell relies on this for `SELECT ?1`).
+        Ok(match p {
+            Param::Anonymous => self.positional.get(anon_index).cloned(),
+            Param::Numbered(n) => self.positional.get((*n as usize).wrapping_sub(1)).cloned(),
             Param::Named(name) => self
                 .named
                 .iter()
                 .find(|(k, _)| k == name)
-                .map(|(_, v)| v.clone())
-                .ok_or_else(|| Error::Error(alloc::format!("unbound parameter {name}"))),
+                .map(|(_, v)| v.clone()),
         }
+        .unwrap_or(Value::Null))
     }
-}
-
-fn format_args_unbound(n: usize) -> String {
-    alloc::format!("unbound parameter ?{n}")
 }
 
 /// The row context an expression is evaluated against.
