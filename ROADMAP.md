@@ -420,9 +420,16 @@ result or declines to it — never a wrong answer), so this track is
   NOCASE` seeks the NOCASE index (`ib`) while a plain `= 'x'` uses the BINARY one.
   Threaded through `choose_seek_index` (+ `stat4_equal_est`), `try_index_lookup`'s
   seek-key build (which keeps the gated `eqs` for the rowid fast path), `eqp_access`,
-  and `seek_order_prefix` — all in lockstep, full corpus green. **Still open: the
-  range slice** — `choose_range_index` ignores the comparison collation, so
-  `WHERE b > 'x' COLLATE NOCASE` does not yet pick the NOCASE index.
+  and `seek_order_prefix` — all in lockstep, full corpus green. **Range slice DONE
+  2026-07-11:** a single `> 'x' COLLATE NOCASE` bound now seeks the NOCASE index too
+  (`collect_range_constraints_coll` un-gates single `<`/`>` bounds; `range_collation`
+  recovers the bound collation; `choose_range_index` matches it to the index's
+  leading-column collation). `BETWEEN`/`GLOB` keep the gated per-bound behaviour (a
+  mixed-collation `BETWEEN 'a' AND 'd' COLLATE NOCASE` still uses the BINARY index,
+  matching sqlite). **B9j WHERE is now complete for equality + range.** Residual (not
+  a regression): a range seek does not yet get ORDER-BY-collation credit
+  (`b > 'x' COLLATE NOCASE ORDER BY b COLLATE NOCASE` still shows a temp b-tree — a
+  separate order-credit path).
 - **B9b — window-function EQP.** The co-routine *body* is exactly the B9h index
   choice (SQLite picks the index that covers the input **and** serves the
   `PARTITION BY`/window-`ORDER BY`), so this is **blocked on B9h** (plus a

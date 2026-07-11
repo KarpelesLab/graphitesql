@@ -15905,6 +15905,12 @@ impl Connection {
             if !ranges.contains_key(&lead) {
                 continue;
             }
+            // The range bound serves this index only when its effective collation
+            // matches the index's leading-column collation (B9j).
+            let lead_coll = idx.collations.first().copied().unwrap_or_default();
+            if range_collation(where_expr, &meta.columns, lead) != Some(lead_coll) {
+                continue;
+            }
             n_candidates += 1;
             let covering = sel
                 .map(|s| self.seek_index_covers(s, meta, &idx.cols, where_expr))
@@ -16526,7 +16532,7 @@ impl Connection {
         }
         let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
             alloc::collections::BTreeMap::new();
-        collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+        collect_range_constraints_coll(where_expr, &meta.columns, params, &mut ranges);
         if ranges.is_empty() {
             return Ok(None);
         }
@@ -20155,7 +20161,7 @@ impl Connection {
         // leading column seeks its index.
         let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
             alloc::collections::BTreeMap::new();
-        collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+        collect_range_constraints_coll(where_expr, &meta.columns, params, &mut ranges);
         if let Some(ipk) = meta.ipk
             && let Some(b) = ranges.get(&ipk)
         {
@@ -23921,7 +23927,7 @@ impl Connection {
             // one the executor walks (see the doc comment).
             let mut ranges: alloc::collections::BTreeMap<usize, RangeBound> =
                 alloc::collections::BTreeMap::new();
-            collect_range_constraints(where_expr, &meta.columns, params, &mut ranges);
+            collect_range_constraints_coll(where_expr, &meta.columns, params, &mut ranges);
             if ranges.is_empty() {
                 return None;
             }
@@ -41502,6 +41508,95 @@ fn rowid_alias_range(e: &Expr, meta: &TableMeta, params: &Params) -> Option<Rang
 /// top-level `AND` conjuncts of `WHERE`, keyed by column index. Drives an index
 /// range scan; non-range and non-constant terms are ignored (the full `WHERE` is
 /// re-applied afterward).
+/// The *effective* collation of a single-bound range comparison on column `col`
+/// within `e` (an explicit `COLLATE` on the bound, else the column's declared
+/// collation), or `None`. `BETWEEN`/`GLOB` return the column's collation (their
+/// bounds keep the column-collation gate). Used by collation-aware range index
+/// selection to match a `> 'x' COLLATE NOCASE` bound to a `NOCASE` index (B9j).
+fn range_collation(
+    e: &Expr,
+    columns: &[ColumnInfo],
+    col: usize,
+) -> Option<crate::value::Collation> {
+    match e {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => range_collation(left, columns, col).or_else(|| range_collation(right, columns, col)),
+        Expr::Paren(inner) => range_collation(inner, columns, col),
+        Expr::Binary {
+            op: BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq,
+            left,
+            right,
+        } => {
+            if col_index(left, columns) == Some(col) {
+                Some(explicit_collation(right).unwrap_or(columns[col].collation))
+            } else if col_index(right, columns) == Some(col) {
+                Some(explicit_collation(left).unwrap_or(columns[col].collation))
+            } else {
+                None
+            }
+        }
+        Expr::Between {
+            expr,
+            negated: false,
+            ..
+        } if col_index(expr, columns) == Some(col) => Some(columns[col].collation),
+        Expr::Binary {
+            op: BinaryOp::Glob,
+            left,
+            ..
+        } if col_index(left, columns) == Some(col) => Some(columns[col].collation),
+        _ => None,
+    }
+}
+
+/// Like [`collect_range_constraints`] but WITHOUT the column-collation gate on the
+/// single `<`/`>`/`<=`/`>=` bounds (their collation is recovered by
+/// [`range_collation`]). `BETWEEN`/`GLOB` — whose bounds each carry their own
+/// collation — keep the gated per-bound behaviour, so a mixed-collation `BETWEEN`
+/// still selects only the column-collation index. Used by collation-aware range
+/// index selection (B9j).
+fn collect_range_constraints_coll(
+    e: &Expr,
+    columns: &[ColumnInfo],
+    params: &Params,
+    out: &mut alloc::collections::BTreeMap<usize, RangeBound>,
+) {
+    match e {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            collect_range_constraints_coll(left, columns, params, out);
+            collect_range_constraints_coll(right, columns, params, out);
+        }
+        Expr::Paren(inner) => collect_range_constraints_coll(inner, columns, params, out),
+        Expr::Binary { op, left, right }
+            if matches!(
+                op,
+                BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+            ) =>
+        {
+            if let (Some(ci), Some(v)) = (col_index(left, columns), const_value(right, params)) {
+                apply_bound(out.entry(ci).or_default(), *op, v);
+            } else if let (Some(ci), Some(v)) =
+                (col_index(right, columns), const_value(left, params))
+            {
+                apply_bound(out.entry(ci).or_default(), flip_cmp(*op), v);
+            }
+        }
+        // `BETWEEN` / `GLOB` keep the gated per-bound handling — delegate.
+        Expr::Between { .. }
+        | Expr::Binary {
+            op: BinaryOp::Glob, ..
+        } => collect_range_constraints(e, columns, params, out),
+        _ => {}
+    }
+}
+
 fn collect_range_constraints(
     e: &Expr,
     columns: &[ColumnInfo],

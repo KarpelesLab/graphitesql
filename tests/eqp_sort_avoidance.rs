@@ -130,6 +130,14 @@ fn order_by_collate_uses_matching_collation_index() {
         "SELECT * FROM t WHERE b = 'apple' COLLATE NOCASE",
         "SELECT * FROM t WHERE b = 'apple'",
         "SELECT * FROM t WHERE b = 'Apple'",
+        // Range comparisons likewise: a single `> 'x' COLLATE NOCASE` bound seeks
+        // the NOCASE index; a mixed-collation `BETWEEN` keeps the gated per-bound
+        // behaviour and uses the BINARY index (B9j WHERE range slice).
+        "SELECT * FROM t WHERE b > 'a' COLLATE NOCASE",
+        "SELECT * FROM t WHERE b > 'a'",
+        "SELECT * FROM t WHERE b <= 'c' COLLATE NOCASE",
+        "SELECT * FROM t WHERE b BETWEEN 'a' AND 'd' COLLATE NOCASE",
+        "SELECT * FROM t WHERE b BETWEEN 'a' AND 'd'",
     ] {
         assert_eq!(graphite(q), eqp(q), "EQP diverged on `{q}`");
     }
