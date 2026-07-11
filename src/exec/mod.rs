@@ -28102,7 +28102,11 @@ impl Connection {
         tref.tvf_args.is_none()
             && tref.subquery.is_none()
             && tref.schema.is_none()
-            && (lname.starts_with("pragma_") || matches!(lname.as_str(), "json_each" | "json_tree"))
+            && (lname.starts_with("pragma_")
+                || matches!(
+                    lname.as_str(),
+                    "json_each" | "json_tree" | "generate_series"
+                ))
             && self.lookup_cte(&tref.name, None).is_none()
             && !self.is_view(&tref.name)
             && self.unqualified_db(&tref.name) == DbRef::Main
@@ -28127,6 +28131,7 @@ impl Connection {
         // driver, the rest are an optional trailing run.
         let cols: &[&str] = match lname.as_str() {
             "json_each" | "json_tree" => &["json", "root"],
+            "generate_series" => &["start", "stop", "step"],
             _ if lname.starts_with("pragma_") => &["arg", "schema"],
             _ => return tref.clone(),
         };
@@ -28184,14 +28189,18 @@ impl Connection {
         match lname.as_str() {
             "generate_series" => {
                 if args.is_empty() {
-                    return Err(Error::Error("generate_series() requires arguments".into()));
+                    return Err(Error::Error(
+                        "first argument to \"generate_series()\" missing or unusable".into(),
+                    ));
                 }
                 let nums: Vec<i64> = args
                     .iter()
                     .map(|a| eval::eval(a, &ctx).map(|v| eval::to_i64(&v)))
                     .collect::<Result<_>>()?;
                 let start = nums[0];
-                let stop = nums.get(1).copied().unwrap_or(start);
+                // With no explicit stop, SQLite's generate_series runs to 2^32-1
+                // (0xFFFFFFFF), not to `start` — matching its documented default.
+                let stop = nums.get(1).copied().unwrap_or(0xFFFF_FFFF);
                 // SQLite's generate_series treats a step of 0 as 1.
                 let step = match nums.get(2).copied().unwrap_or(1) {
                     0 => 1,
@@ -28205,8 +28214,18 @@ impl Connection {
                         if !in_range {
                             break;
                         }
-                        // SQLite's generate_series rowid is the value itself.
-                        rows.push(alloc::vec![Value::Integer(v), Value::Integer(v)]);
+                        // Each row echoes the (effective) `start`/`stop`/`step` in its
+                        // hidden input columns — constant per row, exactly like SQLite,
+                        // so a bare `generate_series` driven from `WHERE start=… AND
+                        // stop=…` re-satisfies its own predicate. The trailing rowid is
+                        // the value itself (SQLite's generate_series rowid).
+                        rows.push(alloc::vec![
+                            Value::Integer(v),
+                            Value::Integer(start),
+                            Value::Integer(stop),
+                            Value::Integer(step),
+                            Value::Integer(v),
+                        ]);
                         match v.checked_add(step) {
                             Some(n) => v = n,
                             None => break, // i64 overflow ends the series
@@ -28216,6 +28235,9 @@ impl Connection {
                 Ok((
                     alloc::vec![
                         col("value", eval::Affinity::Integer),
+                        hcol("start", eval::Affinity::Integer),
+                        hcol("stop", eval::Affinity::Integer),
+                        hcol("step", eval::Affinity::Integer),
                         hcol("rowid", eval::Affinity::Integer),
                     ],
                     rows,
@@ -36190,7 +36212,13 @@ fn is_tvf_hidden_col(e: &Expr, label: &str, col: &str) -> bool {
 /// Whether `e` is a constant the pragma-TVF pushdown may consume as an argument:
 /// a literal or a bound parameter (both evaluate without a current row).
 fn is_const_arg(e: &Expr) -> bool {
-    matches!(e, Expr::Literal(_) | Expr::Parameter(_))
+    match e {
+        Expr::Literal(_) | Expr::Parameter(_) => true,
+        // A signed / bit-negated constant (`-2`, `+3`, `~0`) or a parenthesized one
+        // is still row-independent, so `WHERE step = -2` drives the pushdown.
+        Expr::Unary { expr, .. } | Expr::Paren(expr) => is_const_arg(expr),
+        _ => false,
+    }
 }
 
 fn pragma_has_tvf(bare: &str) -> bool {

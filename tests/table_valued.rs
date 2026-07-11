@@ -260,3 +260,37 @@ fn pragma_table_info_over_a_virtual_table() {
     assert_eq!(r.rows[0][0], Value::Integer(0)); // cid
     assert_eq!(r.rows[0][1], Value::Text("value".into())); // name
 }
+
+#[test]
+fn bare_generate_series_driven_from_where() {
+    // A bare `generate_series` (no argument list) takes its hidden `start`/`stop`/
+    // `step` input columns from top-level equality constraints in the `WHERE`,
+    // exactly like SQLite's eponymous virtual table. Verified differentially.
+    if !sqlite3_available() {
+        return;
+    }
+    let c = Connection::open_memory().unwrap();
+    let oracle = |sql: &str| -> String {
+        let out = Command::new("sqlite3")
+            .arg(":memory:")
+            .arg(sql)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .trim_end()
+            .to_string()
+    };
+    for q in [
+        "SELECT value FROM generate_series WHERE start=2 AND stop=6",
+        "SELECT value FROM generate_series WHERE start=1 AND stop=10 AND step=3",
+        "SELECT value FROM generate_series WHERE start=5 AND stop=1 AND step=-2",
+        // The hidden columns are queryable and echo the effective arguments.
+        "SELECT value,start,stop,step FROM generate_series(2,6,2)",
+        // A `WHERE` further filtering the produced value still works (the hidden
+        // columns satisfy their own equalities; `value` is filtered downstream).
+        "SELECT value FROM generate_series WHERE start=1 AND stop=10 AND value%2=0",
+    ] {
+        assert_eq!(rows_str(&c, q), oracle(q), "diverged on `{q}`");
+    }
+}

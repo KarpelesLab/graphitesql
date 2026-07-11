@@ -239,9 +239,19 @@ EXCEPT) incl. `ORDER BY`, and `WITH` CTE bodies incl. output-column provenance
   Fix = interleave the arity check with column resolution clause-by-clause
   (`result-set → HAVING → WHERE → GROUP BY/ORDER BY`, first-fault-wins). Fragile for
   cosmetic gain; low priority.
-- **A-tvf-bare-series — bare `generate_series` (no parens).** *(belongs to Track B)*
-  Its default `stop` is unbounded and the tree-walker materialises every TVF source,
-  so it needs the VDBE lazy-cursor path — tracked under Track B, not here.
+- **A-tvf-bare-series — bare `generate_series` (no parens). DONE 2026-07-11.** A
+  bare `generate_series` now takes its hidden `start`/`stop`/`step` input columns
+  from top-level `WHERE` equalities, exactly like the bare `pragma_*` / `json_each`
+  eponymous forms (`is_bare_tvf` + `push_bare_tvf_args` extended with the
+  `["start","stop","step"]` column set). `generate_series` gained the three echoed
+  hidden columns (constant per row, excluded from `*`), and `is_const_arg` now
+  accepts a signed/parenthesized constant so `WHERE step=-2` drives the pushdown.
+  Fixed a pre-existing divergence found while probing: a one-argument
+  `generate_series(N)` defaulted `stop` to `N` (one row) instead of SQLite's
+  `0xFFFFFFFF`; the no-argument error now matches SQLite's text too. The unbounded
+  default is not a problem in practice — the tree-walker still materialises, but a
+  bare form is always driven by a `WHERE stop=…`. Verified differentially
+  (`tests/table_valued.rs::bare_generate_series_driven_from_where`).
 
 ### Track B — Query planner, statistics & the VDBE
 
