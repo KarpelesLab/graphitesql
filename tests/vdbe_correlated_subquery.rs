@@ -184,6 +184,34 @@ fn correlated_subquery_over_outer_join() {
 }
 
 #[test]
+fn grouped_correlated_over_join() {
+    // A group-key-correlated projection subquery over a GROUP BY *join* runs on the
+    // VDBE: `group_cols` index the combined column space, the synthetic per-group row
+    // is built at combined width, and the callback evaluates the subquery against it.
+    let mut c = setup();
+    c.execute("CREATE TABLE s(m)").unwrap();
+    c.execute("INSERT INTO s VALUES(10),(20),(20)").unwrap();
+    both(
+        &c,
+        "SELECT a.k, count(*), (SELECT count(*) FROM b WHERE b.p = a.k) \
+         FROM a, s WHERE a.k = s.m GROUP BY a.k",
+        vec![vec![i(10), i(1), i(1)], vec![i(20), i(2), i(2)]],
+    );
+    // A non-key correlated reference (`a.x`) over the join still declines to the
+    // tree-walker (no well-defined per-group value).
+    let q = "SELECT a.k, count(*), (SELECT count(*) FROM b WHERE b.p = a.x) \
+             FROM a, s WHERE a.k = s.m GROUP BY a.k";
+    assert!(
+        c.query_vdbe(q).is_err(),
+        "non-key grouped-join ref must fall back"
+    );
+    assert_eq!(
+        c.query(q).unwrap().rows,
+        vec![vec![i(10), i(1), i(0)], vec![i(20), i(2), i(0)]],
+    );
+}
+
+#[test]
 fn grouped_correlated_scalar_in_projection() {
     let c = setup();
     // A correlated scalar subquery in a GROUP BY projection, correlated ONLY on the

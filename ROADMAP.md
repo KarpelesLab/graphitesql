@@ -322,7 +322,12 @@ result or declines to it — never a wrong answer), so this track is
   lifts the former fallback for an unfolded compound-arm `IN (SELECT 'x' UNION SELECT a …)`:
   wrapping preserves the candidate column's comparison affinity (the reason the router
   declined to fold it), so it now runs correctly rather than deferring.
-  (`GROUP BY`-**join** correlated, and non-key grouped references, still defer.)
+  *Extended to grouped joins (2026-07-11):* a group-key-correlated projection subquery over
+  a `GROUP BY` **join** now runs on the VDBE too — `group_cols` index the combined column
+  space and the synthetic per-group row is built at combined width, so the same guard and
+  `GroupEmit` machinery apply; `compile_group_join` threads `allow_correlated` and the caller
+  supplies a `LiveSubqueryEval` over the combined columns. Non-key grouped references (whose
+  per-group value is unspecified) still defer to the tree-walker.
 - **B1c — RIGHT/FULL join inner seeks.** INNER/LEFT seek; RIGHT/FULL still
   materialize the inner table (correct, just not seek-driven).
 

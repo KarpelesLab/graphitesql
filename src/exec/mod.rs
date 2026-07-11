@@ -2949,10 +2949,33 @@ impl Connection {
                     &combined_aff,
                     &combined_coll,
                     &boundaries,
+                    true,
                 ) {
                     let rowsets: Vec<&[Vec<Value>]> =
                         sources.iter().map(|s| s.4.as_slice()).collect();
-                    let result = vdbe::run_rows_multi(&prog, &rowsets)?;
+                    // A group-key-correlated subquery in the projection runs against
+                    // a synthetic per-group row over the combined columns; supply an
+                    // evaluator over that combined schema when the program carries one.
+                    let result = if prog.subqueries.is_empty() {
+                        vdbe::run_rows_multi(&prog, &rowsets)?
+                    } else {
+                        let cols: Vec<ColumnInfo> = (0..combined.len())
+                            .map(|i| ColumnInfo {
+                                name: combined[i].clone(),
+                                table: combined_tables[i].clone(),
+                                affinity: combined_aff[i],
+                                collation: combined_coll[i],
+                                schema: None,
+                                hidden: false,
+                            })
+                            .collect();
+                        let eval = LiveSubqueryEval {
+                            conn: self,
+                            columns: &cols,
+                            rowid_index: None,
+                        };
+                        vdbe::run_rows_multi_with_subqueries(&prog, &rowsets, &eval)?
+                    };
                     return Ok(QueryResult {
                         columns: prog.columns,
                         rows: result,

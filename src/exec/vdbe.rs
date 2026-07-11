@@ -3298,6 +3298,7 @@ pub fn compile_aggregate_join(
 /// Grouping/output column refs are qualifier-aware. `DISTINCT`, a non-column key, a
 /// non-grouped output, or a non-BINARY collation return `Unsupported` (the caller
 /// falls back).
+#[allow(clippy::too_many_arguments)] // cohesive: the combined column space + boundaries + gate
 pub fn compile_group_join(
     sel: &Select,
     columns: &[String],
@@ -3305,6 +3306,7 @@ pub fn compile_group_join(
     affinities: &[Affinity],
     collations: &[Collation],
     boundaries: &[usize],
+    allow_correlated: bool,
 ) -> Result<Program> {
     let n = boundaries.len();
     debug_assert!(n >= 2 && boundaries[n - 1] == columns.len());
@@ -3328,10 +3330,12 @@ pub fn compile_group_join(
         collations,
         &projections,
         Some(boundaries),
-        // A grouped correlated subquery over a *join* is out of scope (the
-        // synthetic per-group row is single-source); the join grouped path never
-        // admits one.
-        false,
+        // A group-key-correlated subquery in the projection is admissible over a
+        // join too: `group_cols` index into the combined column space and the
+        // synthetic per-group row is built at combined width, so the same guard and
+        // `GroupEmit` machinery apply. The caller supplies a `SubqueryEval` over the
+        // combined columns when the compiled program carries a subquery.
+        allow_correlated,
     )
 }
 
@@ -6549,7 +6553,7 @@ mod tests {
                 panic!()
             };
             assert!(
-                compile_group_join(&sel, &cols, &tabs, &aff, &coll, &[1, 2]).is_ok(),
+                compile_group_join(&sel, &cols, &tabs, &aff, &coll, &[1, 2], false).is_ok(),
                 "{sql} should compile as a GROUP BY join"
             );
         }
@@ -6563,7 +6567,7 @@ mod tests {
                 panic!()
             };
             assert!(
-                compile_group_join(&sel, &cols, &tabs, &aff, &coll, &[1, 2]).is_err(),
+                compile_group_join(&sel, &cols, &tabs, &aff, &coll, &[1, 2], false).is_err(),
                 "{sql} should bail from the GROUP BY join path"
             );
         }
