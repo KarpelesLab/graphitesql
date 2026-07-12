@@ -5979,14 +5979,25 @@ fn run_rows_multi_impl(
                 use crate::sql::ast::{Expr, Literal};
                 let lit_args: Vec<Expr> = regs[*arg_start..*arg_start + *arg_count]
                     .iter()
-                    .map(|v| {
-                        Expr::Literal(match v {
-                            Value::Null => Literal::Null,
-                            Value::Integer(i) => Literal::Integer(*i),
-                            Value::Real(r) => Literal::Real(*r),
-                            Value::Text(s) => Literal::Str(s.as_str().to_string()),
-                            Value::Blob(b) => Literal::Blob(b.clone()),
-                        })
+                    .map(|v| match v {
+                        Value::Null => Expr::Literal(Literal::Null),
+                        Value::Integer(i) => Expr::Literal(Literal::Integer(*i)),
+                        Value::Real(r) => Expr::Literal(Literal::Real(*r)),
+                        // Valid UTF-8 text reconstructs as a string literal; non-UTF-8
+                        // text (which a `String` literal cannot hold) reconstructs as
+                        // `CAST(<blob> AS TEXT)`, which the byte-preserving cast turns
+                        // back into the same byte-backed text — so `hex(x'ff'||x'00')`
+                        // and friends stay byte-exact through the VDBE `Op::Func` path.
+                        Value::Text(s) => match core::str::from_utf8(s.as_bytes()) {
+                            Ok(valid) => Expr::Literal(Literal::Str(valid.to_string())),
+                            Err(_) => Expr::Cast {
+                                expr: alloc::boxed::Box::new(Expr::Literal(Literal::Blob(
+                                    s.as_bytes().to_vec(),
+                                ))),
+                                type_name: alloc::string::String::from("TEXT"),
+                            },
+                        },
+                        Value::Blob(b) => Expr::Literal(Literal::Blob(b.clone())),
                     })
                     .collect();
                 let params = crate::exec::eval::Params::default();

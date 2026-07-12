@@ -853,10 +853,15 @@ peripheral — the SQL engine, not the shell, is the project's purpose):**
   (approved 2026-07-10) to use `std::fs::File::lock` for C9b cross-process locks
   (tracked as C9b-0).
 - **Numeric model** — reals are `f64` to match SQLite; no extended decimal/bignum.
-- **Text is UTF-8.** `Value::Text` is a Rust `String`, so an operation that would
-  produce *non-UTF-8* "text" (e.g. `zeroblob(2)||x'ff'`) falls back to `Value::Blob`
-  to preserve the bytes — the bytes match sqlite, but `typeof`/`quote` differ.
-  Fixing means a bytes-backed text value, a pervasive Value-model change; deferred.
+- **Text is byte-backed (was UTF-8-only). DONE 2026-07-12.** `Value::Text` now holds
+  a `Text` newtype over `Vec<u8>` rather than a `String`, so text whose bytes are
+  not valid UTF-8 (`x'ff' || x'00'`, `CAST(<blob> AS TEXT)`) keeps its storage class
+  `text` — `typeof` matches sqlite instead of falling back to a blob — and such text
+  round-trips through storage (`decode_text` no longer validates UTF-8, which sqlite
+  doesn't either). `Text` `Deref`s to `&str` (lossy for invalid) for the ~300 read
+  sites; byte-exact paths (record encoding + length, comparison, `hex`, `CAST` to
+  blob, `||`) use `as_bytes()`. Residual: `quote()` / `char()` of a *non-UTF-8* value
+  still route through a `String` (a further-niche edge). Test: `tests/text_non_utf8.rs`.
 - **Parser** stays hand-written (no build-time codegen, friendlier errors);
   `parse.y` remains the source of truth for precedence and accepted forms.
 - **Performance** is deliberately secondary to correctness until the VDBE + planner

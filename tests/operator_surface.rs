@@ -63,10 +63,9 @@ fn operator_surface_matches_sqlite3() {
     let mut g = Connection::open_memory().unwrap();
 
     // ---- `||` concatenation: bytes via hex() agree for every pair, and the
-    // storage class (typeof) agrees whenever the result is valid UTF-8. The two
-    // blobs `x'00'||x'ff'` would be non-UTF-8 text in sqlite; graphitesql models
-    // text as UTF-8 so returns those bytes as a blob — bytes still match via
-    // hex(), which is what these assertions check.
+    // storage class (typeof) agrees with sqlite in all cases now that Value::Text
+    // is byte-backed: `x'00'||x'ff'` is non-UTF-8 *text* (not a blob), and hex()
+    // (which these assertions check) reads the exact bytes either way.
     assert_matches(
         &mut g,
         &[
