@@ -1400,17 +1400,13 @@ fn eval_binary(op: BinaryOp, l: Value, r: Value, case_sensitive_like: bool) -> R
                 // SQLite's `||` concatenates the *raw bytes* of each operand's
                 // text representation (a blob contributes its bytes verbatim, a
                 // number its decimal text), yielding a value whose storage class
-                // is text. Because graphitesql models `Value::Text` as UTF-8, a
-                // result holding non-UTF-8 bytes (e.g. `x'00' || x'ff'` ->
-                // `00FF`) is returned as a `Value::Blob` so the exact bytes are
-                // preserved; a UTF-8-valid result stays text, matching SQLite's
-                // `typeof` in the common case.
+                // is always TEXT — even when the bytes are not valid UTF-8
+                // (`x'00' || x'ff'` -> the 2-byte text `00FF`, `typeof` = `text`).
+                // `Value::Text` is byte-backed, so those bytes are kept as text
+                // exactly like SQLite.
                 let mut bytes = text_bytes(&l);
                 bytes.extend_from_slice(&text_bytes(&r));
-                match String::from_utf8(bytes) {
-                    Ok(s) => Value::Text(s.into()),
-                    Err(e) => Value::Blob(e.into_bytes()),
-                }
+                Value::Text(crate::value::Text::from_bytes(bytes))
             }
         }
         BitAnd | BitOr | LShift | RShift => {
@@ -1476,19 +1472,16 @@ pub fn like_glob_values(glob: bool, l: &Value, r: &Value) -> Value {
 
 /// Concatenate two values for `||`, matching SQLite: NULL on either side yields
 /// NULL; otherwise the operands' byte representations are joined (a blob
-/// contributes its bytes, a number its decimal text), yielding text when the
-/// result is valid UTF-8 and a blob otherwise (so `x'00' || x'ff'` keeps its
-/// exact bytes). Public wrapper used by the VDBE interpreter.
+/// contributes its bytes, a number its decimal text), always yielding TEXT — the
+/// bytes are kept as text even when not valid UTF-8 (`x'00' || x'ff'`), matching
+/// SQLite's `typeof`. Public wrapper used by the VDBE interpreter.
 pub fn concat_values(l: &Value, r: &Value) -> Value {
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Value::Null;
     }
     let mut bytes = text_bytes(l);
     bytes.extend_from_slice(&text_bytes(r));
-    match String::from_utf8(bytes) {
-        Ok(s) => Value::Text(s.into()),
-        Err(e) => Value::Blob(e.into_bytes()),
-    }
+    Value::Text(crate::value::Text::from_bytes(bytes))
 }
 
 /// Apply `IS` / `IS NOT` to two values, treating NULL as a comparable value
@@ -1643,11 +1636,12 @@ pub fn cast(v: Value, type_name: &str) -> Value {
     }
     let aff = type_name.to_ascii_uppercase();
     // Casting a blob to a non-blob type first reinterprets its bytes as text, so
-    // `CAST(x'3132' AS INTEGER)` reads "12" and yields 12 (not 0).
-    let v = if matches!(v, Value::Blob(_)) && !aff.contains("BLOB") {
-        Value::Text(to_text(&v).into())
-    } else {
-        v
+    // `CAST(x'3132' AS INTEGER)` reads "12" and yields 12 (not 0). The bytes are
+    // kept verbatim (byte-backed text), so `CAST(x'ff' AS TEXT)` is non-UTF-8 text
+    // rather than a lossy conversion, matching SQLite.
+    let v = match v {
+        Value::Blob(b) if !aff.contains("BLOB") => Value::Text(crate::value::Text::from_bytes(b)),
+        other => other,
     };
     if aff.contains("INT") {
         // CAST to INTEGER takes the leading *integer* prefix of text (stopping at

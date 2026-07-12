@@ -125,7 +125,7 @@ fn decode_value(serial: SerialType, body: &[u8], encoding: TextEncoding) -> Resu
         8 => Value::Integer(0),
         9 => Value::Integer(1),
         n if n >= 12 && n.is_multiple_of(2) => Value::Blob(Vec::from(body)),
-        _ => Value::Text(decode_text(body, encoding)?.into()),
+        _ => Value::Text(crate::value::Text::from_bytes(decode_text(body, encoding)?)),
     })
 }
 
@@ -140,10 +140,13 @@ fn sign_extend(body: &[u8], nbytes: usize) -> i64 {
     ((v << shift) as i64) >> shift
 }
 
-fn decode_text(body: &[u8], encoding: TextEncoding) -> Result<String> {
+fn decode_text(body: &[u8], encoding: TextEncoding) -> Result<Vec<u8>> {
     match encoding {
-        TextEncoding::Utf8 => String::from_utf8(Vec::from(body))
-            .map_err(|_| Error::Corrupt("invalid UTF-8 text".into())),
+        // A UTF-8-encoded text body IS the text's bytes. SQLite does not validate
+        // text UTF-8 (it stores and returns the raw bytes), so neither do we —
+        // this lets non-UTF-8 text (e.g. from `x'ff' || x'00'`) round-trip through
+        // storage as text rather than being rejected as corrupt.
+        TextEncoding::Utf8 => Ok(Vec::from(body)),
         TextEncoding::Utf16Le | TextEncoding::Utf16Be => {
             if !body.len().is_multiple_of(2) {
                 return Err(Error::Corrupt("odd-length UTF-16 text".into()));
@@ -154,6 +157,7 @@ fn decode_text(body: &[u8], encoding: TextEncoding) -> Result<String> {
             });
             char::decode_utf16(units)
                 .collect::<core::result::Result<String, _>>()
+                .map(String::into_bytes)
                 .map_err(|_| Error::Corrupt("invalid UTF-16 text".into()))
         }
     }
