@@ -393,6 +393,22 @@ result or declines to it — never a wrong answer), so this track is
   collation and skips the comparison-affinity that `o.x = t.k` applies — routing
   it risks a silent false-negative that wouldn't fall back; needs the tree-walker's
   affinity machinery threaded in first).
+  *Note (2026-07-13, code-verified):* the first remaining item is **behaviourally
+  redundant**, not merely behaviour-neutral. A seekable inner join already avoids
+  materializing the inner today: the `'seek` block in `run_select`
+  (`src/exec/mod.rs` ~2850–3085) is a general N-table inner-join seek driver — for
+  each inner table it resolves a rowid (`read_row`) or single-column-index
+  (`index_seek_fetch`) seek from an `ON <inner col> = <prefix col>` conjunct,
+  drives the outer prefix, seeks the inner **over live storage without
+  materializing it**, then compiles only the final projection onto the VDBE
+  (`compile_table_select` + `run_rows`). The materialized `compile_join2`
+  nested-loop is reached only when *no* seek candidate exists (Cartesian /
+  non-equi / affinity-mismatch), where a full scan of the inner is unavoidable
+  anyway. So moving the seek into `run_rows_multi` opcodes would eliminate no
+  materialization that the hybrid path does not already eliminate, and produce
+  byte-identical rows in identical order — it is an internal code-shape change with
+  no observable effect. Not worth the hot-path risk to the multi-cursor interpreter
+  every VDBE query runs.
 - **B5c-2 — correlated subqueries on the VDBE. DONE 2026-07-11.** A correlated
   scalar/`EXISTS` subquery on a single-table live scan now runs on the VDBE (a
   `SubqueryEval` callback re-evaluates the body per outer row through the
@@ -1005,8 +1021,12 @@ independently shippable. Recommended next order:
    sources, bare-aggregate `HAVING`, constant `GROUP BY`, and scan+inner-join
    `DISTINCT` with explicit `COLLATE`. **B5c-2** correlated subqueries is DONE. The
    remaining piece is the in-interpreter `OpenRead`/`SeekRowid` opcodes — a
-   no-behavior-change refactor (the seek already runs live and correctly in the
-   tree-walker), plus narrow perf-only nested-loop refinements with correct
+   *behaviourally redundant* refactor: a seekable inner join already seeks the
+   inner over live storage without materializing it, via the `'seek` driver in
+   `run_select` (`src/exec/mod.rs` ~2850–3085), feeding only the projection to the
+   VDBE; moving the seek into `run_rows_multi` opcodes eliminates no materialization
+   that path doesn't already eliminate and yields byte-identical rows (see the
+   B5b-2 note in §4). Plus narrow perf-only nested-loop refinements with correct
    fallbacks.
 4. **Cost model (Track B)** — B9h index-choice sub-items, then B9b window EQP
    (blocked on B9h); B1b selectivity-driven join order. Plan/`EXPLAIN`-text only —
