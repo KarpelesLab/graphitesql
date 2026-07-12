@@ -565,7 +565,28 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         "quote" => {
             arity(&lname, args, 1)?;
-            Value::Text(quote_value(&v[0]).into())
+            match &v[0] {
+                // A byte-backed text may not be valid UTF-8; render the literal
+                // over its raw bytes so `quote(x'ff'||x'fe')` round-trips exactly
+                // rather than passing through a lossy `String`. Matches SQLite: the
+                // text is read as a NUL-terminated C string (an embedded NUL
+                // truncates the literal) and embedded single quotes are doubled.
+                Value::Text(s) => {
+                    let bytes = s.as_bytes();
+                    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                    let mut out = alloc::vec::Vec::with_capacity(end + 2);
+                    out.push(b'\'');
+                    for &b in &bytes[..end] {
+                        if b == b'\'' {
+                            out.push(b'\'');
+                        }
+                        out.push(b);
+                    }
+                    out.push(b'\'');
+                    Value::Text(crate::value::Text::from_bytes(out))
+                }
+                other => Value::Text(quote_value(other).into()),
+            }
         }
         "unistr" => {
             // Decode `\uXXXX` / `\UXXXXXXXX` / `\\` escapes in the argument's

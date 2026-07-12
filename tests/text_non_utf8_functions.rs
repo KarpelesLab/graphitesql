@@ -102,4 +102,17 @@ fn char_semantic_functions_on_non_utf8_match_sqlite3() {
             "SELECT substr('héllo', 2, 2), substr('abcdef', -2)", // valid unchanged
         ],
     );
+
+    // ---- quote(): renders the SQL literal over the raw bytes (NUL-truncated,
+    // single quotes doubled), checked as hex so the byte sequence is exact.
+    assert_matches(
+        &mut g,
+        &[
+            "SELECT hex(quote(x'ff' || x'fe'))",      // '<ff><fe>'
+            "SELECT hex(quote(x'c3' || x'28'))",      // '<c3>('
+            "SELECT hex(quote(CAST(x'ff' AS TEXT)))", // '<ff>'
+            "SELECT quote('abc'), quote('a''b')",     // valid utf8 unchanged
+            "SELECT quote('A' || char(0) || 'B')",    // NUL truncates -> 'A'
+        ],
+    );
 }
