@@ -2325,9 +2325,9 @@ mod tests {
     }
 
     #[test]
-    fn concat_preserves_blob_bytes() {
-        // `||` joins raw bytes; a non-UTF-8 result is returned as a blob so the
-        // exact bytes survive (sqlite stores it as text, same bytes).
+    fn concat_yields_byte_backed_text() {
+        // `||` joins raw bytes and always yields TEXT — even non-UTF-8 bytes,
+        // which `Value::Text` now holds directly (sqlite reports `typeof` = text).
         assert_eq!(
             eval_binary(
                 BinaryOp::Concat,
@@ -2336,9 +2336,9 @@ mod tests {
                 false
             )
             .unwrap(),
-            Value::Blob(vec![0x00, 0xff])
+            Value::Text(crate::value::Text::from_bytes(vec![0x00, 0xff]))
         );
-        // A UTF-8-valid result stays text.
+        // A UTF-8-valid result is the same text as before.
         assert_eq!(
             eval_binary(
                 BinaryOp::Concat,
