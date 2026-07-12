@@ -370,17 +370,26 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             match &v[0] {
                 Value::Null => Value::Null,
                 Value::Blob(b) => Value::Integer(b.len() as i64),
-                // For a string, SQLite counts characters up to (not including)
-                // the first NUL — `length('A'||char(0)||'B')` is 1, not 3.
-                // Numbers stringify without NULs, so they are unaffected.
-                other => {
-                    let t = eval::to_text(other);
-                    let n = match t.find('\0') {
-                        Some(i) => t[..i].chars().count(),
-                        None => t.chars().count(),
-                    };
-                    Value::Integer(n as i64)
+                // Faithful port of SQLite's `lengthFunc` for TEXT: count the bytes
+                // that are not UTF-8 continuation bytes (`(0xc0 & b) != 0x80`),
+                // stopping at the first NUL (C-string semantics) — so
+                // `length('A'||char(0)||'B')` is 1. Reading the raw bytes (not a
+                // lossy UTF-8 decode) makes a non-UTF-8 text count leniently like
+                // SQLite (`length(x'ff'||x'fe')` is 2) instead of collapsing to 0.
+                Value::Text(s) => {
+                    let mut n = 0i64;
+                    for &b in s.as_bytes() {
+                        if b == 0 {
+                            break;
+                        }
+                        if (b & 0xc0) != 0x80 {
+                            n += 1;
+                        }
+                    }
+                    Value::Integer(n)
                 }
+                // Numbers stringify without NULs or continuation bytes.
+                other => Value::Integer(eval::to_text(other).chars().count() as i64),
             }
         }
         "octet_length" => {
@@ -480,6 +489,17 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             arity(&lname, args, 1)?;
             match &v[0] {
                 Value::Null => Value::Null,
+                // A byte-backed text may not be valid UTF-8; decode its first
+                // character with SQLite's own lenient reader rather than a lossy
+                // `to_text` (which would drop the whole string and wrongly return
+                // NULL). A leading NUL still truncates the C string to empty → NULL.
+                Value::Text(s) => {
+                    let bytes = s.as_bytes();
+                    match bytes.first() {
+                        None | Some(0) => Value::Null,
+                        Some(_) => Value::Integer(i64::from(utf8_read_first(bytes))),
+                    }
+                }
                 other => {
                     // SQLite reads the argument as a NUL-terminated C string
                     // (`sqlite3_value_text`), so an embedded NUL truncates it —
@@ -1712,6 +1732,63 @@ fn trim_fn(v: &[Value], left: bool, right: bool) -> Value {
     Value::Text(chars[start..end].iter().collect::<String>().into())
 }
 
+/// Decode the first UTF-8 character of `bytes` to its codepoint — a faithful port
+/// of SQLite's `sqlite3Utf8Read` (util/utf.c). It is deliberately lenient: a lead
+/// byte below 0xC0 (ASCII or a stray continuation byte) yields the byte value
+/// itself, and a malformed multi-byte sequence (overlong, surrogate, or a
+/// non-character) yields U+FFFD — never a decode failure. `bytes` must be
+/// non-empty (callers check first). This lets `unicode()` of a non-UTF-8 text
+/// return the same codepoint SQLite does instead of collapsing to NULL.
+fn utf8_read_first(bytes: &[u8]) -> u32 {
+    // `sqlite3Utf8Trans1`: the low bits contributed by each lead byte 0xC0..=0xFF.
+    const TRANS1: [u8; 64] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+        0x0d, 0x0e, 0x0f, 0x00, 0x01, 0x02, 0x03, 0x00, 0x01, 0x02, 0x03, 0x00, 0x01, 0x02, 0x03,
+        0x00, 0x01, 0x02, 0x03,
+    ];
+    let first = bytes[0];
+    if first < 0xc0 {
+        return u32::from(first);
+    }
+    let mut c = u32::from(TRANS1[(first - 0xc0) as usize]);
+    let mut i = 1;
+    while i < bytes.len() && (bytes[i] & 0xc0) == 0x80 {
+        c = (c << 6) + u32::from(bytes[i] & 0x3f);
+        i += 1;
+    }
+    if c < 0x80 || (c & 0xffff_f800) == 0xd800 || (c & 0xffff_fffe) == 0xfffe {
+        0xfffd
+    } else {
+        c
+    }
+}
+
+/// Byte offsets at which each UTF-8 "character" begins, plus a final sentinel at
+/// `bytes.len()`, using SQLite's lenient `SKIP_UTF8` stepping (a lead byte
+/// consumes the following continuation bytes; anything else is its own unit).
+/// `boundaries.len() - 1` is the character count and unit `k` spans
+/// `boundaries[k]..boundaries[k + 1]`. For valid UTF-8 this matches `char`
+/// boundaries exactly; for non-UTF-8 text it steps byte-wise like SQLite instead
+/// of going through a lossy decode.
+fn utf8_unit_boundaries(bytes: &[u8]) -> alloc::vec::Vec<usize> {
+    let mut bounds = alloc::vec::Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        bounds.push(i);
+        let lead = bytes[i];
+        i += 1;
+        if lead >= 0xc0 {
+            while i < bytes.len() && (bytes[i] & 0xc0) == 0x80 {
+                i += 1;
+            }
+        }
+    }
+    bounds.push(bytes.len());
+    bounds
+}
+
 fn substr(v: &[Value]) -> Result<Value> {
     if v.len() < 2 || v.len() > 3 {
         return Err(wrong_arg_count("substr"));
@@ -1720,22 +1797,27 @@ fn substr(v: &[Value]) -> Result<Value> {
         return Ok(Value::Null);
     }
     // `substr` of a blob slices bytes and returns a blob; otherwise it slices
-    // characters of the text form and returns text.
+    // characters of the text form and returns text. Both are modelled as a byte
+    // buffer `data` split into units by `bounds`: for a blob each byte is a unit;
+    // for text the units are UTF-8 characters (lenient for non-UTF-8 bytes, so a
+    // byte-backed text slices exactly like SQLite rather than via a lossy decode).
     let blob = matches!(v[0], Value::Blob(_));
-    let units: alloc::vec::Vec<char> = if blob {
-        match &v[0] {
-            Value::Blob(b) => b.iter().map(|&x| x as char).collect(),
-            _ => unreachable!(),
-        }
+    let data: alloc::vec::Vec<u8> = match &v[0] {
+        Value::Blob(b) => b.clone(),
+        Value::Text(s) => s.as_bytes().to_vec(),
+        other => eval::to_text(other).into_bytes(),
+    };
+    let bounds: alloc::vec::Vec<usize> = if blob {
+        (0..=data.len()).collect()
     } else {
-        eval::to_text(&v[0]).chars().collect()
+        utf8_unit_boundaries(&data)
     };
     // `substr(x, NULL [, …])` returns NULL — a NULL start position propagates
     // like any other NULL argument (the length already does, below).
     if matches!(v[1], Value::Null) {
         return Ok(Value::Null);
     }
-    let len = units.len() as i64;
+    let len = (bounds.len() - 1) as i64;
     // Faithful port of SQLite's `substrFunc` (src/func.c): `p1` is a 1-based
     // start (negative counts from the end), `p2` a signed length (negative
     // means "the |p2| units ending at p1"). The default `p2` for the 2-arg form
@@ -1777,14 +1859,16 @@ fn substr(v: &[Value]) -> Result<Value> {
         }
         p1 = p1.saturating_sub(p2);
     }
-    // `p1 >= 0 && p2 >= 0` now holds. Clamp the window to the available units.
-    let start = (p1.max(0) as usize).min(units.len());
-    let take = (p2.max(0) as usize).min(units.len() - start);
-    let slice = &units[start..start + take];
+    // `p1 >= 0 && p2 >= 0` now holds. Clamp the window to the available units,
+    // then map the unit window back to a byte range via `bounds`.
+    let unit_count = bounds.len() - 1;
+    let start = (p1.max(0) as usize).min(unit_count);
+    let take = (p2.max(0) as usize).min(unit_count - start);
+    let out = data[bounds[start]..bounds[start + take]].to_vec();
     if blob {
-        Ok(Value::Blob(slice.iter().map(|&c| c as u8).collect()))
+        Ok(Value::Blob(out))
     } else {
-        Ok(Value::Text(slice.iter().collect::<String>().into()))
+        Ok(Value::Text(crate::value::Text::from_bytes(out)))
     }
 }
 
