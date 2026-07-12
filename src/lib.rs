@@ -55,7 +55,9 @@ pub mod error;
 pub mod util;
 
 mod value;
-pub use value::{Collation, SerialType, Value, ValueRef, cmp_text, cmp_values, cmp_values_coll};
+pub use value::{
+    Collation, SerialType, Text, Value, ValueRef, cmp_text, cmp_values, cmp_values_coll,
+};
 
 pub mod btree;
 pub mod exec;
