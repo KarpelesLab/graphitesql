@@ -198,4 +198,24 @@ fn char_semantic_functions_on_non_utf8_match_sqlite3() {
             "SELECT printf('%d %05d %+d %#x', 42, 7, 3, 255)", // numeric unaffected
         ],
     );
+
+    // ---- LIKE / GLOB over non-UTF-8 text: SQLite's patternCompare reads
+    // codepoints with the lenient sqlite3Utf8Read, so both operands are decoded
+    // the same lenient way (a lone/invalid lead byte -> U+FFFD). Note two distinct
+    // invalid lead bytes both decode to U+FFFD, so they compare *equal* — matching
+    // SQLite. Valid-UTF-8 matching is unchanged.
+    assert_matches(
+        &mut g,
+        &[
+            "SELECT (x'ff' || 'a') LIKE (x'ff' || 'a')", // 1 self-match
+            "SELECT (x'ff' || 'a') LIKE ('_' || 'a')",   // 1  _ matches the byte
+            "SELECT (x'ff' || 'abc') LIKE (x'ff' || 'a%')", // 1  % tail
+            "SELECT (x'ff' || 'a') LIKE (x'ff' || 'b')", // 0  a != b
+            "SELECT (x'ff' || 'x') LIKE (x'fe' || 'x')", // 1  both lead -> U+FFFD
+            "SELECT (x'ff' || 'a') GLOB (x'ff' || '?')", // 1  ? matches a
+            "SELECT (x'ff' || 'a') GLOB (x'ff' || 'b')", // 0
+            "SELECT (x'c3' || x'a9') LIKE '_'",          // 1  'é' is one char
+            "SELECT 'apple' LIKE 'a%', 'APPLE' LIKE 'a%', 'abc' GLOB 'a[bc]c'", // valid
+        ],
+    );
 }

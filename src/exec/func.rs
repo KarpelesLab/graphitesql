@@ -412,7 +412,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             if v.iter().take(2).any(|x| matches!(x, Value::Null)) {
                 Value::Null
             } else {
-                let m = eval::glob_match(&eval::to_text(&v[0]), &eval::to_text(&v[1]));
+                let m = eval::glob_match_bytes(&eval::text_bytes(&v[0]), &eval::text_bytes(&v[1]));
                 Value::Integer(m as i64)
             }
         }
@@ -717,9 +717,9 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     }
                     None => None,
                 };
-                let m = eval::like_match_escape(
-                    &eval::to_text(&v[0]),
-                    &eval::to_text(&v[1]),
+                let m = eval::like_match_escape_bytes(
+                    &eval::text_bytes(&v[0]),
+                    &eval::text_bytes(&v[1]),
                     escape,
                     ctx.subqueries.is_some_and(|s| s.case_sensitive_like()),
                 );

@@ -1428,14 +1428,14 @@ fn eval_binary(op: BinaryOp, l: Value, r: Value, case_sensitive_like: bool) -> R
             if matches!(l, Value::Null) || matches!(r, Value::Null) {
                 Value::Null
             } else {
-                let text = to_text(&l);
-                let pat = to_text(&r);
+                let text = text_bytes(&l);
+                let pat = text_bytes(&r);
                 let m = if matches!(op, Like) {
                     // GLOB ignores `case_sensitive_like` (always case-sensitive);
                     // LIKE folds ASCII case unless the pragma is on.
-                    like_match_escape(&pat, &text, None, case_sensitive_like)
+                    like_match_escape_bytes(&pat, &text, None, case_sensitive_like)
                 } else {
-                    glob_match(&pat, &text)
+                    glob_match_bytes(&pat, &text)
                 };
                 bool_value(m)
             }
@@ -1460,12 +1460,12 @@ pub fn like_glob_values(glob: bool, l: &Value, r: &Value) -> Value {
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Value::Null;
     }
-    let text = to_text(l);
-    let pat = to_text(r);
+    let text = text_bytes(l);
+    let pat = text_bytes(r);
     let m = if glob {
-        glob_match(&pat, &text)
+        glob_match_bytes(&pat, &text)
     } else {
-        like_match(&pat, &text)
+        like_match_escape_bytes(&pat, &text, None, false)
     };
     bool_value(m)
 }
@@ -2156,6 +2156,7 @@ pub fn format_real(r: f64) -> String {
 
 /// SQLite `LIKE`: `%` matches any run, `_` any single char; case-insensitive for
 /// ASCII (SQLite's default — `case_sensitive` false).
+#[cfg(test)]
 fn like_match(pattern: &str, text: &str) -> bool {
     like_match_escape(pattern, text, None, false)
 }
@@ -2173,6 +2174,61 @@ pub fn like_match_escape(
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     like_rec(&p, &t, escape, case_sensitive)
+}
+
+/// `LIKE` over raw text bytes: decodes both operands with SQLite's lenient
+/// `sqlite3Utf8Read` stepping (the same reader `patternCompare` uses), so a
+/// non-UTF-8 operand matches on the exact codepoints SQLite would see rather than
+/// on a lossy decode. Byte-identical to [`like_match_escape`] for valid UTF-8.
+pub fn like_match_escape_bytes(
+    pattern: &[u8],
+    text: &[u8],
+    escape: Option<char>,
+    case_sensitive: bool,
+) -> bool {
+    like_rec(
+        &bytes_to_chars(pattern),
+        &bytes_to_chars(text),
+        escape,
+        case_sensitive,
+    )
+}
+
+/// Decode `bytes` into `char`s with SQLite's lenient `sqlite3Utf8Read` (util/utf.c):
+/// a lead byte below 0xC0 (ASCII or a stray continuation byte) yields the byte
+/// value itself, and a malformed multi-byte sequence yields U+FFFD — never a
+/// decode failure. For valid UTF-8 this equals `str::chars()`.
+fn bytes_to_chars(bytes: &[u8]) -> Vec<char> {
+    // `sqlite3Utf8Trans1`: the low bits contributed by each lead byte 0xC0..=0xFF.
+    const TRANS1: [u8; 64] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+        0x0d, 0x0e, 0x0f, 0x00, 0x01, 0x02, 0x03, 0x00, 0x01, 0x02, 0x03, 0x00, 0x01, 0x02, 0x03,
+        0x00, 0x01, 0x02, 0x03,
+    ];
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let first = bytes[i];
+        i += 1;
+        let cp = if first < 0xc0 {
+            u32::from(first)
+        } else {
+            let mut c = u32::from(TRANS1[(first - 0xc0) as usize]);
+            while i < bytes.len() && (bytes[i] & 0xc0) == 0x80 {
+                c = (c << 6) + u32::from(bytes[i] & 0x3f);
+                i += 1;
+            }
+            if c < 0x80 || (c & 0xffff_f800) == 0xd800 || (c & 0xffff_fffe) == 0xfffe {
+                0xfffd
+            } else {
+                c
+            }
+        };
+        out.push(char::from_u32(cp).unwrap_or('\u{fffd}'));
+    }
+    out
 }
 
 /// Compare one pattern char to one text char, honoring ASCII case sensitivity.
@@ -2228,6 +2284,13 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     glob_rec(&p, &t)
+}
+
+/// `GLOB` over raw text bytes: decodes both operands with SQLite's lenient
+/// `sqlite3Utf8Read` stepping, so a non-UTF-8 operand matches on the exact
+/// codepoints SQLite would see. Byte-identical to [`glob_match`] for valid UTF-8.
+pub fn glob_match_bytes(pattern: &[u8], text: &[u8]) -> bool {
+    glob_rec(&bytes_to_chars(pattern), &bytes_to_chars(text))
 }
 
 fn glob_rec(p: &[char], t: &[char]) -> bool {
