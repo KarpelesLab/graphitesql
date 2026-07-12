@@ -860,8 +860,11 @@ peripheral — the SQL engine, not the shell, is the project's purpose):**
   round-trips through storage (`decode_text` no longer validates UTF-8, which sqlite
   doesn't either). `Text` `Deref`s to `&str` (lossy for invalid) for the ~300 read
   sites; byte-exact paths (record encoding + length, comparison, `hex`, `CAST` to
-  blob, `||`) use `as_bytes()`. Residual: `quote()` / `char()` of a *non-UTF-8* value
-  still route through a `String` (a further-niche edge). Test: `tests/text_non_utf8.rs`.
+  blob, `||`, and the VDBE `Op::Func` literal round-trip) use `as_bytes()`. Residual:
+  the char-semantic functions applied to a *non-UTF-8* text value — `length` /
+  `substr` / `unicode` / `quote` / `char` — still route through a lossy `String`
+  (`length(x'ff'||x'00')` reads 0, not SQLite's lenient char count); a further-niche
+  edge not exercised by the corpus. Test: `tests/text_non_utf8.rs`.
 - **Parser** stays hand-written (no build-time codegen, friendlier errors);
   `parse.y` remains the source of truth for precedence and accepted forms.
 - **Performance** is deliberately secondary to correctness until the VDBE + planner
