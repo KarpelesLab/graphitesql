@@ -130,6 +130,10 @@ fn join_distinct_over_collation_columns_runs_on_vdbe() {
         "SELECT DISTINCT t.a FROM t JOIN u ON t.a=u.b ORDER BY 1",
         "SELECT DISTINCT t.a, u.b FROM t, u ORDER BY 1, 2",
         "SELECT DISTINCT t.a COLLATE BINARY FROM t, u ORDER BY 1",
+        // Explicit non-BINARY projection COLLATE over a join now runs on the VDBE.
+        "SELECT DISTINCT t.a COLLATE NOCASE FROM t, u ORDER BY 1",
+        // An explicit COLLATE overrides the column's declared NOCASE (A/a stay distinct).
+        "SELECT DISTINCT t.a COLLATE RTRIM FROM t, u ORDER BY 1",
     ] {
         // A nested-loop join DISTINCT over NOCASE columns now runs on the VDBE.
         let r = c

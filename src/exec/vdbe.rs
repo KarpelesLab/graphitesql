@@ -3187,12 +3187,10 @@ pub fn compile_join2(
     }
     reject_aggregate_or_window_in_predicates(sel)?;
     let projections = expand_projections(sel, columns, tables)?;
-    // A row-level DISTINCT dedups under each output column's collation; the VDBE's
-    // DistinctCheck compares under BINARY, so an explicit `COLLATE` on a projection
-    // (`SELECT DISTINCT a COLLATE NOCASE`) must defer to the tree-walker.
-    if sel.distinct && projections_have_explicit_collation(&projections) {
-        return Err(Error::Unsupported("VDBE: explicit COLLATE with DISTINCT"));
-    }
+    // A row-level DISTINCT dedups each projected column under its resolved
+    // collation — this nested-loop join's `DistinctCheck` resolves an explicit
+    // projection `COLLATE` (below), exactly like the single-table scan path, so
+    // `SELECT DISTINCT a COLLATE NOCASE FROM a JOIN b …` runs on the VDBE.
     if projections.iter().any(|(e, _)| is_aggregate_expr(e)) {
         return Err(Error::Unsupported("VDBE: aggregate over a join"));
     }
