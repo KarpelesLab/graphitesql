@@ -1867,10 +1867,44 @@ impl Connection {
         {
             return Err(Error::Unsupported("VDBE: non-main schema in scope"));
         }
-        if let Some(f) = &sel.from
-            && (f.first.schema.is_some() || f.joins.iter().any(|j| j.table.schema.is_some()))
-        {
-            return Err(Error::Unsupported("VDBE: schema-qualified source"));
+        if let Some(f) = &sel.from {
+            // The attached/temp/default checks above guarantee a `main`-only
+            // context, so a `main.`-qualified source is unambiguous and equivalent
+            // to the bare name — strip the qualifier and route the equivalent
+            // query. Any *other* schema qualifier (a temp/attached name that can't
+            // resolve here) still defers to the tree-walker.
+            let mut has_main = false;
+            let mut has_other = false;
+            for s in
+                core::iter::once(&f.first.schema).chain(f.joins.iter().map(|j| &j.table.schema))
+            {
+                match s.as_deref() {
+                    Some(n) if n.eq_ignore_ascii_case("main") => has_main = true,
+                    Some(_) => has_other = true,
+                    None => {}
+                }
+            }
+            if has_other {
+                return Err(Error::Unsupported("VDBE: schema-qualified source"));
+            }
+            if has_main {
+                let strip = |sch: &mut Option<String>| {
+                    if sch
+                        .as_deref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case("main"))
+                    {
+                        *sch = None;
+                    }
+                };
+                let mut stripped = sel.clone();
+                if let Some(sf) = stripped.from.as_mut() {
+                    strip(&mut sf.first.schema);
+                    for j in &mut sf.joins {
+                        strip(&mut j.table.schema);
+                    }
+                }
+                return self.run_select_vdbe(&stripped);
+            }
         }
         // A three-part `schema.table.column` reference needs the qualifier validated
         // against the source's actual database — the VDBE resolves by table/name

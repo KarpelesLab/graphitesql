@@ -379,7 +379,13 @@ result or declines to it — never a wrong answer), so this track is
   VDBE (2026-07-13):* a `NOT INDEXED` source forces a full scan — exactly what the
   VDBE does — so it now runs on the VDBE instead of deferring; `INDEXED BY name`
   still defers (it must be honoured or rejected). Test:
-  `tests/vdbe_not_indexed.rs`. Remaining: the
+  `tests/vdbe_not_indexed.rs`. *`main.`-qualified sources on the VDBE
+  (2026-07-13):* the VDBE runs only in a `main`-only context (no attached/temp db,
+  `main` the default), so a `main.`-qualified source is unambiguous and
+  equivalent to the bare name — `run_select_vdbe` now strips the `main` qualifier
+  and routes the equivalent query instead of deferring on every schema qualifier
+  (any *other* schema, and a three-part `main.t.col` column, still defer). Test:
+  `tests/vdbe_main_qualified.rs`. Remaining: the
   in-*interpreter* `OpenRead`/`SeekRowid` opcodes over B5b-1's multi-cursor
   foundation (move the *seek* into bytecode — an internal refactor, no behavior
   change); and seek by a **secondary index** / `WITHOUT ROWID` PK, which is
