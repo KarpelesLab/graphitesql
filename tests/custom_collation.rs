@@ -17,7 +17,7 @@ fn rows(conn: &Connection, sql: &str) -> Vec<String> {
         .rows
         .into_iter()
         .map(|r| match &r[0] {
-            graphitesql::Value::Text(s) => s.clone(),
+            graphitesql::Value::Text(s) => String::from(s.as_str()),
             other => format!("{other:?}"),
         })
         .collect()

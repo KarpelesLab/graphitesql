@@ -95,7 +95,7 @@ fn graphite_access(setup: &str, query: &str) -> String {
         .iter()
         .filter_map(|r| match r.last() {
             Some(graphitesql::Value::Text(s)) if s.contains("SCAN") || s.contains("SEARCH") => {
-                Some(s.clone())
+                Some(String::from(s.as_str()))
             }
             _ => None,
         })

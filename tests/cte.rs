@@ -160,7 +160,7 @@ fn recursive_against_sqlite3() {
                         Value::Null => String::new(),
                         Value::Integer(i) => i.to_string(),
                         Value::Real(r) => format!("{r}"),
-                        Value::Text(s) => s.clone(),
+                        Value::Text(s) => String::from(s.as_str()),
                         Value::Blob(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
                     })
                     .collect::<Vec<_>>()

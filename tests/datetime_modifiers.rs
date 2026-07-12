@@ -36,7 +36,7 @@ fn render(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
         Value::Integer(i) => i.to_string(),
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         Value::Real(r) => {
             if *r == r.trunc() && r.is_finite() && r.abs() < 1e15 {
                 format!("{r:.1}")

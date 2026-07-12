@@ -11,7 +11,7 @@ fn q(c: &Connection, sql: &str) -> Value {
 
 fn text(c: &Connection, sql: &str) -> String {
     match q(c, sql) {
-        Value::Text(s) => s,
+        Value::Text(s) => String::from(s.as_str()),
         other => panic!("expected text from {sql}, got {other:?}"),
     }
 }

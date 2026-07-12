@@ -90,7 +90,7 @@ fn render(v: &graphitesql::Value) -> String {
         Null => String::new(),
         Integer(i) => i.to_string(),
         Real(r) => format!("{r}"),
-        Text(t) => t.clone(),
+        Text(t) => String::from(t.as_str()),
         Blob(b) => String::from_utf8_lossy(b).into_owned(),
     }
 }

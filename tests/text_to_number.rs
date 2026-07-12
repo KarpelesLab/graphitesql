@@ -29,7 +29,7 @@ fn graphite_scalar(sql: &str) -> String {
         Null => String::new(),
         Integer(i) => i.to_string(),
         Real(x) => graphitesql::exec::eval::format_real(*x),
-        Text(t) => t.clone(),
+        Text(t) => String::from(t.as_str()),
         Blob(_) => "<blob>".into(),
     }
 }

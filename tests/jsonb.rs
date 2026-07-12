@@ -14,7 +14,7 @@ fn one(c: &Connection, sql: &str) -> Value {
 
 fn hex(c: &Connection, sql: &str) -> String {
     match one(c, &format!("SELECT hex({sql})")) {
-        Value::Text(s) => s,
+        Value::Text(s) => String::from(s.as_str()),
         v => panic!("hex not text: {v:?}"),
     }
 }

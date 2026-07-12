@@ -10,7 +10,7 @@ use graphitesql::{Connection, Value};
 
 fn text(c: &Connection, sql: &str) -> String {
     match c.query(sql).unwrap().rows.remove(0).remove(0) {
-        Value::Text(s) => s,
+        Value::Text(s) => String::from(s.as_str()),
         other => panic!("expected text, got {other:?}"),
     }
 }

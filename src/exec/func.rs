@@ -267,7 +267,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     .subqueries
                     .and_then(|s| s.fts5_highlight(col, &text, &open, &close))
                 {
-                    return Ok(Value::Text(s));
+                    return Ok(Value::Text(s.into()));
                 }
             }
         }
@@ -292,7 +292,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     .subqueries
                     .and_then(|s| s.fts5_snippet(col, &cols, &open, &close, &ellipsis, ntokens))
                 {
-                    return Ok(Value::Text(s));
+                    return Ok(Value::Text(s.into()));
                 }
             }
         }
@@ -335,7 +335,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             if let Value::Blob(b) = &val {
                 let j = super::json::Json::from_jsonb(b)
                     .ok_or_else(|| Error::Error("JSON cannot hold BLOB values".into()))?;
-                return Ok(Value::Text(j.quote()));
+                return Ok(Value::Text(j.quote().into()));
             }
             return Ok(val);
         }
@@ -445,11 +445,11 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         "soundex" => {
             arity(&lname, args, 1)?;
             // NULL/non-alpha input yields "?000" (SQLite does not propagate NULL).
-            Value::Text(soundex(&c_text(&v[0])))
+            Value::Text(soundex(&c_text(&v[0])).into())
         }
         "typeof" => {
             arity(&lname, args, 1)?;
-            Value::Text(String::from(type_name(&v[0])))
+            Value::Text(String::from(type_name(&v[0])).into())
         }
         "nullif" => {
             arity(&lname, args, 2)?;
@@ -473,7 +473,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         "max" => scalar_min_max(&v, false)?,
         "hex" => {
             arity(&lname, args, 1)?;
-            Value::Text(hex_encode(&v[0]))
+            Value::Text(hex_encode(&v[0]).into())
         }
         "char" => char_fn(&v),
         "unicode" => {
@@ -545,7 +545,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         "quote" => {
             arity(&lname, args, 1)?;
-            Value::Text(quote_value(&v[0]))
+            Value::Text(quote_value(&v[0]).into())
         }
         "unistr" => {
             // Decode `\uXXXX` / `\UXXXXXXXX` / `\\` escapes in the argument's
@@ -553,7 +553,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             arity(&lname, args, 1)?;
             match &v[0] {
                 Value::Null => Value::Null,
-                other => Value::Text(unistr_decode(&eval::to_text(other))?),
+                other => Value::Text(unistr_decode(&eval::to_text(other))?.into()),
             }
         }
         "unistr_quote" => {
@@ -563,9 +563,9 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             arity(&lname, args, 1)?;
             match &v[0] {
                 Value::Text(s) if s.chars().any(|c| (c as u32) < 0x20) => {
-                    Value::Text(unistr_quote_text(s))
+                    Value::Text(unistr_quote_text(s).into())
                 }
-                other => Value::Text(quote_value(other)),
+                other => Value::Text(quote_value(other).into()),
             }
         }
         "subtype" => {
@@ -602,7 +602,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     s.push_str(&eval::to_text(x));
                 }
             }
-            Value::Text(s)
+            Value::Text(s.into())
         }
         "concat_ws" => {
             // A separator plus at least one value argument are required.
@@ -618,7 +618,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     .filter(|x| !matches!(x, Value::Null))
                     .map(eval::to_text)
                     .collect();
-                Value::Text(parts.join(&sep))
+                Value::Text(parts.join(&sep).into())
             }
         }
         "like" => {
@@ -773,7 +773,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             arity(&lname, args, 1)?;
             match json_root(&v[0])? {
                 None => Value::Null,
-                Some(j) => Value::Text(j.serialize()),
+                Some(j) => Value::Text(j.serialize().into()),
             }
         }
         // `jsonb(X)` — the JSONB (binary) form of `json(X)`: parse the JSON/JSON5
@@ -856,7 +856,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     let _ = other;
                     match json_root(&v[0])? {
                         None => Value::Null,
-                        Some(j) => Value::Text(j.pretty(&indent)),
+                        Some(j) => Value::Text(j.pretty(&indent).into()),
                     }
                 }
             }
@@ -873,7 +873,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     .ok_or_else(|| Error::Error("JSON cannot hold BLOB values".into()))?,
                 other => super::json::value_to_json(other),
             };
-            Value::Text(j.quote())
+            Value::Text(j.quote().into())
         }
         "json_type" => {
             if v.is_empty() || v.len() > 2 {
@@ -889,7 +889,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                         Some(&root)
                     };
                     match target {
-                        Some(j) => Value::Text(String::from(j.type_name())),
+                        Some(j) => Value::Text(String::from(j.type_name()).into()),
                         None => Value::Null,
                     }
                 }
@@ -951,7 +951,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 };
                 let val = json_value_arg(&kv[1], args.get(2 * i + 1))?;
                 // A key built from a SQL TEXT arg carries no escape provenance.
-                members.push((key.clone(), None, val));
+                members.push((String::from(key.as_str()), None, val));
             }
             json_doc_result(&lname, &super::json::Json::Object(members))
         }
@@ -1001,7 +1001,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             match json_root(&v[0])? {
                 None => Value::Null,
                 Some(mut root) => {
-                    let mut removed = Value::Text(String::new());
+                    let mut removed = Value::Text(String::new().into());
                     for p in &v[1..] {
                         // A NULL path collapses the whole call to NULL (scanning
                         // left to right, so a malformed path *before* it still
@@ -1051,7 +1051,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         "geopoly_json" => {
             arity(&lname, args, 1)?;
             match crate::geopoly::parse_value(&v[0]) {
-                Some(p) => Value::Text(p.to_json()),
+                Some(p) => Value::Text(p.to_json().into()),
                 None => Value::Null,
             }
         }
@@ -1146,7 +1146,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                             other => Some(eval::to_text(other)),
                         })
                         .collect();
-                    Value::Text(p.to_svg(&extra))
+                    Value::Text(p.to_svg(&extra).into())
                 }
                 None => Value::Null,
             }
@@ -1458,7 +1458,7 @@ fn c_text(v: &Value) -> String {
 fn str_map(v: &Value, f: impl Fn(&str) -> String) -> Value {
     match v {
         Value::Null => Value::Null,
-        other => Value::Text(f(&c_text(other))),
+        other => Value::Text(f(&c_text(other)).into()),
     }
 }
 
@@ -1529,7 +1529,7 @@ fn json_doc_result(lname: &str, j: &super::json::Json) -> Value {
     if lname.starts_with("jsonb") {
         Value::Blob(j.to_jsonb())
     } else {
-        Value::Text(j.serialize())
+        Value::Text(j.serialize().into())
     }
 }
 
@@ -1622,7 +1622,7 @@ fn json_extract(root: &super::json::Json, paths: &[Value], jsonb: bool) -> Resul
     Ok(if jsonb {
         Value::Blob(arr.to_jsonb())
     } else {
-        Value::Text(arr.serialize())
+        Value::Text(arr.serialize().into())
     })
 }
 
@@ -1709,7 +1709,7 @@ fn trim_fn(v: &[Value], left: bool, right: bool) -> Value {
             end -= 1;
         }
     }
-    Value::Text(chars[start..end].iter().collect())
+    Value::Text(chars[start..end].iter().collect::<String>().into())
 }
 
 fn substr(v: &[Value]) -> Result<Value> {
@@ -1784,7 +1784,7 @@ fn substr(v: &[Value]) -> Result<Value> {
     if blob {
         Ok(Value::Blob(slice.iter().map(|&c| c as u8).collect()))
     } else {
-        Ok(Value::Text(slice.iter().collect()))
+        Ok(Value::Text(slice.iter().collect::<String>().into()))
     }
 }
 
@@ -1821,13 +1821,13 @@ fn replace(v: &[Value]) -> Result<Value> {
     let s = c_text(&v[0]);
     let from = c_text(&v[1]);
     if from.is_empty() {
-        return Ok(Value::Text(s));
+        return Ok(Value::Text(s.into()));
     }
     if matches!(v[2], Value::Null) {
         return Ok(Value::Null);
     }
     let to = c_text(&v[2]);
-    Ok(Value::Text(s.replace(&from, &to)))
+    Ok(Value::Text(s.replace(&from, &to).into()))
 }
 
 fn round(v: &[Value]) -> Result<Value> {
@@ -1983,5 +1983,5 @@ fn char_fn(v: &[Value]) -> Value {
             .unwrap_or('\u{FFFD}');
         s.push(c);
     }
-    Value::Text(s)
+    Value::Text(s.into())
 }

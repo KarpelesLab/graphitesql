@@ -29,7 +29,7 @@ fn render(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
         Value::Integer(i) => i.to_string(),
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         // Match how sqlite3 prints doubles: whole values get a trailing `.0`.
         Value::Real(r) => {
             if *r == r.trunc() && r.is_finite() && r.abs() < 1e15 {

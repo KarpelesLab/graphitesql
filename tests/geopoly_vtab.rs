@@ -74,7 +74,7 @@ fn create_declares_shape_and_user_columns() {
     let names: Vec<String> = info
         .iter()
         .map(|r| match &r[1] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             _ => String::new(),
         })
         .collect();
@@ -302,7 +302,7 @@ fn invalid_shape_is_rejected_or_stored_verbatim() {
         rows(&c, "SELECT typeof(_shape), _shape, l FROM geo"),
         [vec![
             Value::Text("text".into()),
-            Value::Text(String::new()),
+            Value::Text(String::new().into()),
             Value::Text("e".into()),
         ]]
     );
@@ -313,7 +313,7 @@ fn explain_query_plan_matches_sqlite_geopoly_index() {
     let mut c = Connection::open_memory().unwrap();
     seed(&mut c);
     let eqp = |q: &str| match &rows(&c, q)[0][3] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         _ => String::new(),
     };
     assert_eq!(
@@ -464,7 +464,7 @@ fn reads_sqlite_written_geopoly() {
                         Value::Integer(i) => i.to_string(),
                         Value::Real(f) => graphitesql::exec::eval::format_real(*f),
                         Value::Null => String::new(),
-                        Value::Text(s) => s.clone(),
+                        Value::Text(s) => String::from(s.as_str()),
                         Value::Blob(_) => "b".into(),
                     })
                     .collect::<Vec<_>>()

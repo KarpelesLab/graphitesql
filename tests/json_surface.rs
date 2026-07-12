@@ -19,7 +19,7 @@ fn val(c: &Connection, sql: &str) -> Value {
 /// The single scalar result of `sql`, expected to be TEXT.
 fn text(c: &Connection, sql: &str) -> String {
     match val(c, sql) {
-        Value::Text(s) => s,
+        Value::Text(s) => String::from(s.as_str()),
         other => panic!("expected text from {sql:?}, got {other:?}"),
     }
 }

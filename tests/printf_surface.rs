@@ -19,7 +19,7 @@ fn sqlite3_available() -> bool {
 fn graphite(expr: &str) -> String {
     let c = Connection::open_memory().unwrap();
     match &c.query(&format!("SELECT {expr}")).unwrap().rows[0][0] {
-        graphitesql::Value::Text(t) => t.clone(),
+        graphitesql::Value::Text(t) => String::from(t.as_str()),
         graphitesql::Value::Integer(i) => i.to_string(),
         graphitesql::Value::Real(r) => r.to_string(),
         graphitesql::Value::Null => String::from("<null>"),

@@ -16,7 +16,7 @@ fn detail(conn: &Connection, sql: &str) -> Vec<String> {
     r.rows
         .iter()
         .map(|row| match &row[3] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             other => panic!("detail not text: {other:?}"),
         })
         .collect()
@@ -183,7 +183,7 @@ fn without_rowid_inner_seeks_its_primary_key() {
 }
 
 fn alloc_row(a: i64, n: &str) -> Vec<Value> {
-    vec![Value::Integer(a), Value::Text(n.to_string())]
+    vec![Value::Integer(a), Value::Text(n.to_string().into())]
 }
 
 fn alloc_null(a: i64) -> Vec<Value> {

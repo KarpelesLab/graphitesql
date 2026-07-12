@@ -289,7 +289,7 @@ fn triggers_against_sqlite3() {
                 .map(|v| match v {
                     Value::Null => String::new(),
                     Value::Integer(i) => i.to_string(),
-                    Value::Text(s) => s.clone(),
+                    Value::Text(s) => String::from(s.as_str()),
                     Value::Real(r) => graphitesql::exec::eval::format_real(*r),
                     Value::Blob(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
                 })
@@ -405,7 +405,7 @@ fn dropping_a_table_drops_its_triggers() {
         .rows
         .into_iter()
         .map(|r| match &r[0] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             v => panic!("{v:?}"),
         })
         .collect();

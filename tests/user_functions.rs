@@ -52,7 +52,7 @@ fn udf_in_where_and_over_a_table() {
 fn multi_argument_and_text() {
     let mut c = Connection::open_memory().unwrap();
     c.register_function("join2", |args: &[Value]| match args {
-        [Value::Text(a), Value::Text(b)] => Ok(Value::Text(format!("{a}-{b}"))),
+        [Value::Text(a), Value::Text(b)] => Ok(Value::Text(format!("{a}-{b}").into())),
         _ => Err(Error::Error("join2(text, text)".into())),
     });
     assert_eq!(val(&c, "SELECT join2('a','b')"), Value::Text("a-b".into()));

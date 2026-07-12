@@ -103,5 +103,5 @@ fn named_column_constraint_is_not_a_type() {
         .unwrap();
     let r = c.query("PRAGMA table_info(t)").unwrap();
     assert_eq!(r.rows[0][1], Value::Text("a".into()));
-    assert_eq!(r.rows[0][2], Value::Text(String::new())); // empty type
+    assert_eq!(r.rows[0][2], Value::Text(String::new().into())); // empty type
 }

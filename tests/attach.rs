@@ -31,7 +31,7 @@ fn database_list_reports_main() {
     let c = Connection::open(&path).unwrap();
     let r = c.query("PRAGMA database_list").unwrap();
     assert_eq!(r.rows[0][1], Value::Text("main".into()));
-    assert_eq!(r.rows[0][2], Value::Text(path.clone()));
+    assert_eq!(r.rows[0][2], Value::Text(path.clone().into()));
     let _ = std::fs::remove_file(&path);
 }
 
@@ -833,7 +833,7 @@ fn attach_file_database_cross_engine() {
         // database_list reports the file path for the attachment.
         let r = c.query("PRAGMA database_list").unwrap();
         assert_eq!(r.rows[1][1], Value::Text("d".into()));
-        assert_eq!(r.rows[1][2], Value::Text(path.clone()));
+        assert_eq!(r.rows[1][2], Value::Text(path.clone().into()));
     }
     if sqlite {
         let out = std::process::Command::new("sqlite3")

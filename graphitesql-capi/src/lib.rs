@@ -896,7 +896,7 @@ pub unsafe extern "C" fn sqlite3_bind_text(
         let bytes = unsafe { core::slice::from_raw_parts(text as *const u8, n_byte as usize) };
         String::from_utf8_lossy(bytes).into_owned()
     };
-    bind_at(unsafe { &mut *stmt }, idx, Value::Text(s))
+    bind_at(unsafe { &mut *stmt }, idx, Value::Text(s.into()))
 }
 
 #[unsafe(no_mangle)]
@@ -1476,7 +1476,7 @@ pub unsafe extern "C" fn sqlite3_result_text(
         let bytes = unsafe { core::slice::from_raw_parts(text as *const u8, n_byte as usize) };
         String::from_utf8_lossy(bytes).into_owned()
     };
-    c.result = Value::Text(s);
+    c.result = Value::Text(s.into());
 }
 
 #[unsafe(no_mangle)]
@@ -1641,7 +1641,7 @@ pub unsafe extern "C" fn sqlite3_bind_text16(
         return SQLITE_ERROR;
     }
     let s = unsafe { utf16_to_string(text, n_byte) };
-    bind_at(unsafe { &mut *stmt }, idx, Value::Text(s))
+    bind_at(unsafe { &mut *stmt }, idx, Value::Text(s.into()))
 }
 
 #[unsafe(no_mangle)]
@@ -2136,7 +2136,7 @@ unsafe fn blob_flush(blob: *mut sqlite3_blob) -> c_int {
         return SQLITE_OK;
     }
     let value = if blob.was_text {
-        Value::Text(String::from_utf8_lossy(&blob.buf).into_owned())
+        Value::Text(String::from_utf8_lossy(&blob.buf).into_owned().into())
     } else {
         Value::Blob(blob.buf.clone())
     };

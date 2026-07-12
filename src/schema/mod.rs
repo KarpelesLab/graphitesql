@@ -131,7 +131,7 @@ fn parse_schema_row(cols: &[Value]) -> Result<SchemaObject> {
     }
     let text = |v: &Value| -> Result<String> {
         match v {
-            Value::Text(s) => Ok(s.clone()),
+            Value::Text(s) => Ok(String::from(s.as_str())),
             _ => Err(Error::Corrupt("expected text in sqlite_schema".into())),
         }
     };
@@ -148,7 +148,7 @@ fn parse_schema_row(cols: &[Value]) -> Result<SchemaObject> {
         }
     };
     let sql = match &cols[4] {
-        Value::Text(s) => Some(s.clone()),
+        Value::Text(s) => Some(String::from(s.as_str())),
         Value::Null => None,
         _ => return Err(Error::Corrupt("sqlite_schema sql not text".into())),
     };

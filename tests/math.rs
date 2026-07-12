@@ -152,7 +152,7 @@ fn text(c: &Connection, sql: &str) -> String {
         .clone()
     {
         Value::Null => String::new(),
-        Value::Text(t) => t,
+        Value::Text(t) => String::from(t.as_str()),
         other => format!("{other:?}"),
     }
 }

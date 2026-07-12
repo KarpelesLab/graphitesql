@@ -309,7 +309,7 @@ fn foreign_keys_against_sqlite3() {
                     .map(|v| match v {
                         graphitesql::Value::Null => String::new(),
                         graphitesql::Value::Integer(i) => i.to_string(),
-                        graphitesql::Value::Text(s) => s.clone(),
+                        graphitesql::Value::Text(s) => String::from(s.as_str()),
                         graphitesql::Value::Real(r) => graphitesql::exec::eval::format_real(*r),
                         graphitesql::Value::Blob(b) => {
                             b.iter().map(|x| format!("{x:02x}")).collect()

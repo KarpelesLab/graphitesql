@@ -18,7 +18,7 @@ fn detail(conn: &Connection, sql: &str) -> Vec<String> {
     r.rows
         .iter()
         .map(|row| match &row[3] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             other => panic!("detail not text: {other:?}"),
         })
         .collect()
@@ -45,7 +45,7 @@ fn setup() -> Connection {
 }
 
 fn row(a: i64, n: &str) -> Vec<Value> {
-    vec![Value::Integer(a), Value::Text(n.to_string())]
+    vec![Value::Integer(a), Value::Text(n.to_string().into())]
 }
 
 fn null_row(a: i64) -> Vec<Value> {

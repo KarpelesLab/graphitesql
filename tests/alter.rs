@@ -86,7 +86,7 @@ fn add_column_appends_verbatim_to_schema_text() {
         .unwrap()
         .rows[0][0]
     {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         o => panic!("not text: {o:?}"),
     };
     assert_eq!(
@@ -108,7 +108,7 @@ fn add_column_inserts_before_table_constraints() {
         .unwrap()
         .rows[0][0]
     {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         o => panic!("not text: {o:?}"),
     };
     assert_eq!(sql, "CREATE TABLE t(a, b, c, CHECK(a>0))");
@@ -131,7 +131,7 @@ fn rename_column_preserves_schema_text() {
             .unwrap()
             .rows[0][0]
         {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             o => panic!("not text: {o:?}"),
         }
     };
@@ -177,7 +177,7 @@ fn drop_column_preserves_schema_text() {
             .unwrap()
             .rows[0][0]
         {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             o => panic!("not text: {o:?}"),
         }
     };
@@ -218,7 +218,7 @@ fn rename_table_preserves_schema_text() {
             .unwrap()
             .rows[0][0]
         {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             o => panic!("not text: {o:?}"),
         }
     };
@@ -254,7 +254,7 @@ fn rename_table_repoints_foreign_keys() {
             .unwrap()
             .rows[0][0]
         {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             o => panic!("not text: {o:?}"),
         }
     };
@@ -579,7 +579,7 @@ fn rename_column_propagates_into_foreign_keys() {
             .unwrap()
             .rows[0][0]
         {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             o => panic!("not text: {o:?}"),
         }
     };
@@ -607,7 +607,7 @@ fn rename_table_rewrites_dependent_trigger_bodies() {
             .unwrap()
             .rows[0][0]
         {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             o => panic!("not text: {o:?}"),
         }
     };
@@ -666,7 +666,7 @@ fn rename_column_propagates_into_trigger_bodies() {
             .unwrap()
             .rows[0][0]
         {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             o => panic!("not text: {o:?}"),
         }
     };
@@ -734,7 +734,7 @@ fn rename_column_propagates_into_cross_object_trigger_body() {
             .unwrap()
             .rows[0][0]
         {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             o => panic!("not text: {o:?}"),
         }
     };
@@ -800,7 +800,7 @@ fn rename_column_propagates_into_single_source_view() {
             .unwrap()
             .rows[0][0]
         {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             o => panic!("not text: {o:?}"),
         };
         assert!(
@@ -861,7 +861,7 @@ fn rename_column_propagates_into_multi_source_view() {
             .unwrap()
             .rows[0][0]
         {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             o => panic!("not text: {o:?}"),
         };
         let want = {
@@ -897,7 +897,7 @@ fn rename_column_propagates_into_single_source_trigger() {
             .unwrap()
             .rows[0][0]
         {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             o => panic!("not text: {o:?}"),
         }
     };
@@ -957,7 +957,7 @@ fn rename_column_does_not_corrupt_multi_table_view() {
         .unwrap()
         .rows[0][0]
     {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         o => panic!("not text: {o:?}"),
     };
     // `u.a` (the other table's column) is never touched.

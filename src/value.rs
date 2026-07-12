@@ -9,9 +9,125 @@
 //! these types; keeping the value model here lets the rest of the engine reason
 //! about values without pulling in disk-format details.
 
+use alloc::borrow::Cow;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
+
+/// A SQL text value — a byte string that is *usually* UTF-8.
+///
+/// SQLite text is a sequence of bytes (compared with `memcmp` under `BINARY`),
+/// and the vast majority of values are valid UTF-8. But a few operations produce
+/// text whose bytes are not — `x'ff' || x'00'` (concatenation coerces to text),
+/// `CAST(<blob> AS TEXT)`, or `char(…)` with lone surrogates. Storing the raw
+/// bytes (rather than a Rust `String`) lets those round-trip and report
+/// `typeof() = 'text'` exactly as SQLite does, instead of falling back to a blob.
+///
+/// [`Deref`](core::ops::Deref) gives ergonomic `&str` access for the common valid
+/// case; non-UTF-8 bytes read as the empty string through that path (a further
+/// niche edge), so anything that must be byte-exact — record encoding, its byte
+/// length, and comparison — uses [`as_bytes`](Text::as_bytes) /
+/// [`byte_len`](Text::byte_len) instead.
+#[derive(Clone, Default, Eq)]
+pub struct Text(Vec<u8>);
+
+impl Text {
+    /// The raw bytes (byte-exact; used for comparison and record encoding).
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+    /// The number of bytes (the record body length — not the character count).
+    pub fn byte_len(&self) -> usize {
+        self.0.len()
+    }
+    /// Whether the text is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    /// A `&str` view: the exact text for valid UTF-8, else the empty string.
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.0).unwrap_or("")
+    }
+    /// A lossy `&str` view replacing invalid bytes with U+FFFD (for display).
+    pub fn to_str_lossy(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(&self.0)
+    }
+    /// Take ownership of the underlying bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+    /// Wrap raw bytes as text without a UTF-8 check (the bytes may be non-UTF-8).
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Text(bytes)
+    }
+}
+
+impl core::ops::Deref for Text {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl core::fmt::Debug for Text {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Preserve the `Text("abc")`-style rendering for valid UTF-8 (lossy for
+        // the rare non-UTF-8 value) so `{:?}` output stays stable.
+        core::fmt::Debug::fmt(&self.to_str_lossy(), f)
+    }
+}
+
+impl core::fmt::Display for Text {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.to_str_lossy())
+    }
+}
+
+impl From<String> for Text {
+    fn from(s: String) -> Self {
+        Text(s.into_bytes())
+    }
+}
+impl From<&str> for Text {
+    fn from(s: &str) -> Self {
+        Text(s.as_bytes().to_vec())
+    }
+}
+impl From<Cow<'_, str>> for Text {
+    fn from(s: Cow<'_, str>) -> Self {
+        Text(s.into_owned().into_bytes())
+    }
+}
+impl PartialEq for Text {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl PartialEq<str> for Text {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other.as_bytes()
+    }
+}
+impl PartialEq<&str> for Text {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == other.as_bytes()
+    }
+}
+impl PartialEq<String> for Text {
+    fn eq(&self, other: &String) -> bool {
+        self.0 == other.as_bytes()
+    }
+}
+impl PartialEq<Text> for String {
+    fn eq(&self, other: &Text) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+impl PartialEq<Text> for str {
+    fn eq(&self, other: &Text) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
 
 /// A value's storage class, owning its data.
 ///
@@ -26,9 +142,8 @@ pub enum Value {
     Integer(i64),
     /// An IEEE-754 double.
     Real(f64),
-    /// A UTF-8 text value. (SQLite also supports UTF-16; graphitesql stores
-    /// text as UTF-8 internally and converts at the boundary.)
-    Text(String),
+    /// A text value — usually UTF-8, but any byte string (see [`Text`]).
+    Text(Text),
     /// A binary blob.
     Blob(Vec<u8>),
 }
@@ -55,7 +170,7 @@ impl ValueRef<'_> {
             ValueRef::Null => Value::Null,
             ValueRef::Integer(i) => Value::Integer(i),
             ValueRef::Real(r) => Value::Real(r),
-            ValueRef::Text(s) => Value::Text(String::from(s)),
+            ValueRef::Text(s) => Value::Text(String::from(s).into()),
             ValueRef::Blob(b) => Value::Blob(Vec::from(b)),
         }
     }
@@ -381,7 +496,7 @@ impl SerialType {
             }
             Value::Real(_) => 7,
             Value::Blob(b) => 12 + 2 * b.len() as u64,
-            Value::Text(s) => 13 + 2 * s.len() as u64,
+            Value::Text(s) => 13 + 2 * s.byte_len() as u64,
         })
     }
 }
@@ -424,7 +539,7 @@ mod tests {
         );
         assert_eq!(SerialType::for_value(&Value::Real(1.5)), SerialType(7));
         assert_eq!(
-            SerialType::for_value(&Value::Text("abc".to_string())),
+            SerialType::for_value(&Value::Text("abc".to_string().into())),
             SerialType(19) // 13 + 2*3
         );
         assert_eq!(
@@ -436,6 +551,9 @@ mod tests {
     #[test]
     fn value_ref_round_trips() {
         assert_eq!(ValueRef::Integer(5).to_owned(), Value::Integer(5));
-        assert_eq!(ValueRef::Text("x").to_owned(), Value::Text("x".to_string()));
+        assert_eq!(
+            ValueRef::Text("x").to_owned(),
+            Value::Text("x".to_string().into())
+        );
     }
 }

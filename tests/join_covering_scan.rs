@@ -42,7 +42,7 @@ fn fmt(v: &Value) -> String {
                 format!("{r}")
             }
         }
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         Value::Blob(b) => String::from_utf8_lossy(b).into_owned(),
     }
 }
@@ -63,7 +63,7 @@ fn graphite_plan(c: &Connection, sql: &str) -> Vec<String> {
         .rows
         .iter()
         .map(|row| match row.last() {
-            Some(Value::Text(s)) => s.clone(),
+            Some(Value::Text(s)) => String::from(s.as_str()),
             other => panic!("plan detail not text: {other:?}"),
         })
         .collect()

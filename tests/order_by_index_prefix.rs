@@ -14,7 +14,7 @@ fn plan(c: &Connection, sql: &str) -> Vec<String> {
         .rows
         .iter()
         .map(|r| match r.last() {
-            Some(Value::Text(s)) => s.clone(),
+            Some(Value::Text(s)) => String::from(s.as_str()),
             other => panic!("detail not text: {other:?}"),
         })
         .collect()

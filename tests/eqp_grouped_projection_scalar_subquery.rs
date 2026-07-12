@@ -41,7 +41,7 @@ fn g_eqp(ddl: &str, q: &str) -> String {
     let mut lines = Vec::new();
     for r in &rows {
         if let Some(graphitesql::Value::Text(s)) = r.last() {
-            lines.push(s.clone());
+            lines.push(String::from(s.as_str()));
         }
     }
     lines.join(" | ")
@@ -77,7 +77,7 @@ fn g_rows(ddl: &str, q: &str) -> String {
                     graphitesql::Value::Null => "".to_string(),
                     graphitesql::Value::Integer(i) => i.to_string(),
                     graphitesql::Value::Real(f) => format!("{f}"),
-                    graphitesql::Value::Text(s) => s.clone(),
+                    graphitesql::Value::Text(s) => String::from(s.as_str()),
                     graphitesql::Value::Blob(_) => "<blob>".to_string(),
                 })
                 .collect::<Vec<_>>()

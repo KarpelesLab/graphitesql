@@ -1147,7 +1147,7 @@ fn const_sep_text(expr: &Expr) -> Option<String> {
         Literal::Null => Value::Null,
         Literal::Integer(i) => Value::Integer(*i),
         Literal::Real(r) => Value::Real(*r),
-        Literal::Str(s) => Value::Text(s.clone()),
+        Literal::Str(s) => Value::Text(s.clone().into()),
         Literal::Blob(b) => Value::Blob(b.clone()),
         Literal::Boolean(b) => Value::Integer(*b as i64),
     };
@@ -5897,7 +5897,7 @@ fn run_rows_multi_impl(
             }
             Op::Integer { value, dest } => regs[*dest] = Value::Integer(*value),
             Op::Real { value, dest } => regs[*dest] = Value::Real(*value),
-            Op::Str { value, dest } => regs[*dest] = Value::Text(value.clone()),
+            Op::Str { value, dest } => regs[*dest] = Value::Text(value.clone().into()),
             Op::Blob { value, dest } => regs[*dest] = Value::Blob(value.clone()),
             Op::Null { dest } => regs[*dest] = Value::Null,
             Op::Negate { reg, dest } => {
@@ -5984,7 +5984,7 @@ fn run_rows_multi_impl(
                             Value::Null => Literal::Null,
                             Value::Integer(i) => Literal::Integer(*i),
                             Value::Real(r) => Literal::Real(*r),
-                            Value::Text(s) => Literal::Str(s.clone()),
+                            Value::Text(s) => Literal::Str(s.as_str().to_string()),
                             Value::Blob(b) => Literal::Blob(b.clone()),
                         })
                     })
@@ -6592,7 +6592,7 @@ fn finalize_agg(kind: AggKind, acc: AggAcc) -> Result<Value> {
                 Value::Null
             } else if keys.is_empty() {
                 let parts: Vec<String> = vals.iter().map(eval::to_text).collect();
-                Value::Text(parts.join(sep))
+                Value::Text(parts.join(sep).into())
             } else {
                 // Ordered `group_concat(x ORDER BY …)`: sort the collected values
                 // by their parallel key rows (stable, so ties keep first-seen
@@ -6600,7 +6600,7 @@ fn finalize_agg(kind: AggKind, acc: AggAcc) -> Result<Value> {
                 let mut idx: Vec<usize> = (0..vals.len()).collect();
                 idx.sort_by(|&i, &j| cmp_key_rows(&keys[i], &keys[j], &dirs));
                 let parts: Vec<String> = idx.iter().map(|&i| eval::to_text(&vals[i])).collect();
-                Value::Text(parts.join(sep))
+                Value::Text(parts.join(sep).into())
             }
         }
         AggKind::JsonGroupArray { jsonb } => {
@@ -6614,7 +6614,7 @@ fn finalize_agg(kind: AggKind, acc: AggAcc) -> Result<Value> {
             if jsonb {
                 Value::Blob(arr.to_jsonb())
             } else {
-                Value::Text(arr.serialize())
+                Value::Text(arr.serialize().into())
             }
         }
         AggKind::JsonGroupObject { jsonb } => {
@@ -6631,7 +6631,7 @@ fn finalize_agg(kind: AggKind, acc: AggAcc) -> Result<Value> {
             if jsonb {
                 Value::Blob(obj.to_jsonb())
             } else {
-                Value::Text(obj.serialize())
+                Value::Text(obj.serialize().into())
             }
         }
     })

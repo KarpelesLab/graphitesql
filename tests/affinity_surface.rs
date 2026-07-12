@@ -49,7 +49,7 @@ fn render(v: &Value) -> String {
         Value::Null => String::new(),
         Value::Integer(i) => i.to_string(),
         Value::Real(r) => graphitesql::exec::eval::format_real(*r),
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         Value::Blob(b) => String::from_utf8_lossy(b).into_owned(),
     }
 }

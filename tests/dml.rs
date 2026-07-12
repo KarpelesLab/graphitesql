@@ -343,7 +343,7 @@ fn sqlite3_reads_sql_built_database() {
 fn params(i: i64) -> graphitesql::exec::eval::Params {
     graphitesql::exec::eval::Params {
         positional: vec![
-            Value::Text(format!("item-{i}")),
+            Value::Text(format!("item-{i}").into()),
             Value::Real(i as f64 * 1.5),
         ],
         named: vec![],

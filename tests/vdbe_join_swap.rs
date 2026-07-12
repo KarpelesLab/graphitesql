@@ -23,7 +23,7 @@ fn render(rows: &[Vec<Value>]) -> String {
                 .map(|v| match v {
                     Value::Null => String::new(),
                     Value::Integer(i) => i.to_string(),
-                    Value::Text(t) => t.clone(),
+                    Value::Text(t) => String::from(t.as_str()),
                     Value::Real(r) => r.to_string(),
                     Value::Blob(_) => "blob".into(),
                 })

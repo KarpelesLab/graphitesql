@@ -6,7 +6,7 @@ use graphitesql::{Connection, Value};
 
 fn text(c: &Connection, sql: &str) -> String {
     match &c.query(sql).unwrap().rows[0][0] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         other => panic!("not text: {other:?}"),
     }
 }

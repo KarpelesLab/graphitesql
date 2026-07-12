@@ -89,7 +89,7 @@ fn render(v: &graphitesql::Value) -> String {
             let s = format!("{r}");
             s
         }
-        Text(t) => t.clone(),
+        Text(t) => String::from(t.as_str()),
         Blob(b) => String::from_utf8_lossy(b).into_owned(),
     }
 }

@@ -840,8 +840,8 @@ impl Connection {
             .map(|(addr, opcode, detail)| {
                 alloc::vec![
                     Value::Integer(addr as i64),
-                    Value::Text(opcode),
-                    Value::Text(detail),
+                    Value::Text(opcode.into()),
+                    Value::Text(detail.into()),
                 ]
             })
             .collect();
@@ -4151,8 +4151,8 @@ impl Connection {
                 }
                 let (ncol, wr, strict) = self.table_list_dims(*db, obj, &params);
                 rows.push(alloc::vec![
-                    Value::Text(db_name.clone()),
-                    Value::Text(obj.name.clone()),
+                    Value::Text(db_name.clone().into()),
+                    Value::Text(obj.name.clone().into()),
                     Value::Text(typ.into()),
                     Value::Integer(ncol),
                     Value::Integer(wr),
@@ -4166,7 +4166,7 @@ impl Connection {
                     .is_some_and(|f| f.eq_ignore_ascii_case("sqlite_master"))
             {
                 rows.push(alloc::vec![
-                    Value::Text(db_name.clone()),
+                    Value::Text(db_name.clone().into()),
                     Value::Text((*schema_tab).into()),
                     Value::Text("table".into()),
                     Value::Integer(5),
@@ -4226,21 +4226,21 @@ impl Connection {
         let mut rows = alloc::vec![alloc::vec![
             Value::Integer(0),
             Value::Text("main".into()),
-            Value::Text(self.main_file.clone()),
+            Value::Text(self.main_file.clone().into()),
         ]];
         // `temp` occupies seq 1 once it exists; attached databases begin at seq 2.
         if self.temp_db.is_some() {
             rows.push(alloc::vec![
                 Value::Integer(1),
                 Value::Text("temp".into()),
-                Value::Text(String::new()),
+                Value::Text(String::new().into()),
             ]);
         }
         for (i, db) in self.attached.iter().enumerate() {
             rows.push(alloc::vec![
                 Value::Integer((i + 2) as i64),
-                Value::Text(db.name.clone()),
-                Value::Text(db.file.clone()),
+                Value::Text(db.name.clone().into()),
+                Value::Text(db.file.clone().into()),
             ]);
         }
         QueryResult {
@@ -4397,8 +4397,8 @@ impl Connection {
                     let ty = schema.types.get(i).cloned().unwrap_or_default();
                     let mut row = alloc::vec![
                         Value::Integer(i as i64),
-                        Value::Text(name.clone()),
-                        Value::Text(ty),
+                        Value::Text(name.clone().into()),
+                        Value::Text(ty.into()),
                         Value::Integer(0),
                         Value::Null,
                         Value::Integer(0),
@@ -4476,12 +4476,12 @@ impl Connection {
                 .map_or(0, |n| n as i64 + 1);
             let mut row = alloc::vec![
                 Value::Integer(i as i64),
-                Value::Text(col.name.clone()),
-                Value::Text(canonical_type_name(
-                    col.type_name.as_deref().unwrap_or_default()
-                )),
+                Value::Text(col.name.clone().into()),
+                Value::Text(
+                    canonical_type_name(col.type_name.as_deref().unwrap_or_default()).into()
+                ),
                 Value::Integer(notnull as i64),
-                dflt.map(Value::Text).unwrap_or(Value::Null),
+                dflt.map(|s| Value::Text(s.into())).unwrap_or(Value::Null),
                 Value::Integer(pk),
             ];
             if extended {
@@ -4528,8 +4528,8 @@ impl Connection {
             .map(|(i, (name, ty))| {
                 let mut row = alloc::vec![
                     Value::Integer(i as i64),
-                    Value::Text(name),
-                    Value::Text(ty.unwrap_or_default()),
+                    Value::Text(name.into()),
+                    Value::Text(ty.unwrap_or_default().into()),
                     Value::Integer(0),
                     Value::Null,
                     Value::Integer(0),
@@ -4744,7 +4744,7 @@ impl Connection {
             };
             rows.push(alloc::vec![
                 Value::Integer(rows.len() as i64),
-                Value::Text(obj.name.clone()),
+                Value::Text(obj.name.clone().into()),
                 Value::Integer(unique),
                 Value::Text(origin.into()),
                 Value::Integer(partial),
@@ -4757,7 +4757,7 @@ impl Connection {
         if tmeta.as_ref().is_some_and(|m| m.without_rowid) && !pk_set.is_empty() {
             rows.push(alloc::vec![
                 Value::Integer(rows.len() as i64),
-                Value::Text(alloc::format!("sqlite_autoindex_{table}_1")),
+                Value::Text(alloc::format!("sqlite_autoindex_{table}_1").into()),
                 Value::Integer(1),
                 Value::Text("pk".into()),
                 Value::Integer(0),
@@ -4862,14 +4862,14 @@ impl Connection {
         let coll_name = crate::value::collation_name;
         let mut rows = Vec::new();
         for (seqno, (cid, name, desc, coll)) in keys.iter().enumerate() {
-            let name_val = name.clone().map_or(Value::Null, Value::Text);
+            let name_val = name.clone().map_or(Value::Null, |s| Value::Text(s.into()));
             if extended {
                 rows.push(alloc::vec![
                     Value::Integer(seqno as i64),
                     Value::Integer(*cid),
                     name_val,
                     Value::Integer(*desc as i64),
-                    Value::Text(coll_name(*coll)),
+                    Value::Text(coll_name(*coll).into()),
                     Value::Integer(1), // key column
                 ]);
             } else {
@@ -4901,9 +4901,9 @@ impl Connection {
                     rows.push(alloc::vec![
                         Value::Integer(seqno as i64),
                         Value::Integer(pcid as i64),
-                        Value::Text(tmeta.columns[pcid].name.clone()),
+                        Value::Text(tmeta.columns[pcid].name.clone().into()),
                         Value::Integer(0),
-                        Value::Text(coll_name(tmeta.columns[pcid].collation)),
+                        Value::Text(coll_name(tmeta.columns[pcid].collation).into()),
                         Value::Integer(0), // auxiliary, non-key
                     ]);
                     seqno += 1;
@@ -4953,16 +4953,16 @@ impl Connection {
                 rows.push(alloc::vec![
                     Value::Integer(seqno as i64),
                     Value::Integer(cid as i64),
-                    Value::Text(m.columns[cid].name.clone()),
+                    Value::Text(m.columns[cid].name.clone().into()),
                     Value::Integer(desc as i64),
-                    Value::Text(coll_name(m.columns[cid].collation)),
+                    Value::Text(coll_name(m.columns[cid].collation).into()),
                     Value::Integer(1), // key column
                 ]);
             } else {
                 rows.push(alloc::vec![
                     Value::Integer(seqno as i64),
                     Value::Integer(cid as i64),
-                    Value::Text(m.columns[cid].name.clone()),
+                    Value::Text(m.columns[cid].name.clone().into()),
                 ]);
             }
         }
@@ -4972,9 +4972,9 @@ impl Connection {
                 rows.push(alloc::vec![
                     Value::Integer((m.pk_len + k) as i64),
                     Value::Integer(cid as i64),
-                    Value::Text(m.columns[cid].name.clone()),
+                    Value::Text(m.columns[cid].name.clone().into()),
                     Value::Integer(0),
-                    Value::Text(coll_name(m.columns[cid].collation)),
+                    Value::Text(coll_name(m.columns[cid].collation).into()),
                     Value::Integer(0), // auxiliary, non-key
                 ]);
             }
@@ -5053,12 +5053,12 @@ impl Connection {
                 rows.push(alloc::vec![
                     Value::Integer(id),
                     Value::Integer(seq as i64),
-                    Value::Text(fk.ref_table.clone()),
-                    Value::Text(from.clone()),
+                    Value::Text(fk.ref_table.clone().into()),
+                    Value::Text(from.clone().into()),
                     if to.is_empty() {
                         Value::Null
                     } else {
-                        Value::Text(to)
+                        Value::Text(to.into())
                     },
                     Value::Text(action(fk.on_update).into()),
                     Value::Text(action(fk.on_delete).into()),
@@ -5124,9 +5124,9 @@ impl Connection {
                     };
                     if !self.parent_has_key(fk, &key)? {
                         rows.push(alloc::vec![
-                            Value::Text(table.clone()),
+                            Value::Text(table.clone().into()),
                             Value::Integer(rowid),
-                            Value::Text(fk.ref_table.clone()),
+                            Value::Text(fk.ref_table.clone().into()),
                             Value::Integer((n - 1 - i) as i64),
                         ]);
                     }
@@ -5208,7 +5208,7 @@ impl Connection {
                 columns: alloc::vec![String::from("integrity_check")],
                 rows: problems
                     .into_iter()
-                    .map(|p| alloc::vec![Value::Text(p)])
+                    .map(|p| alloc::vec![Value::Text(p.into())])
                     .collect(),
             })
         }
@@ -6485,7 +6485,7 @@ impl Connection {
         let params = Params::default();
         let path = match eval::eval(expr, &EvalCtx::rowless(&params))? {
             Value::Null => return Err(Error::Error("VACUUM INTO target is NULL".into())),
-            Value::Text(s) => s,
+            Value::Text(s) => String::from(s.as_str()),
             other => eval::to_text(&other),
         };
         if std::path::Path::new(&path).exists() {
@@ -6653,9 +6653,9 @@ impl Connection {
         let base = self.next_rowid(stat_root)?;
         for (i, (tbl, idx, stat)) in new_rows.into_iter().enumerate() {
             let rec = encode_record(&[
-                Value::Text(tbl),
-                idx.map_or(Value::Null, Value::Text),
-                Value::Text(stat),
+                Value::Text(tbl.into()),
+                idx.map_or(Value::Null, |s| Value::Text(s.into())),
+                Value::Text(stat.into()),
             ]);
             insert_table(self.backend.writer()?, stat_root, base + i as i64, &rec)?;
         }
@@ -6690,11 +6690,11 @@ impl Connection {
             let base4 = self.next_rowid(stat4_root)?;
             for (i, (tbl, idx, neq, nlt, ndlt, sample)) in stat4_rows.into_iter().enumerate() {
                 let rec = encode_record(&[
-                    Value::Text(tbl),
-                    Value::Text(idx),
-                    Value::Text(neq),
-                    Value::Text(nlt),
-                    Value::Text(ndlt),
+                    Value::Text(tbl.into()),
+                    Value::Text(idx.into()),
+                    Value::Text(neq.into()),
+                    Value::Text(nlt.into()),
+                    Value::Text(ndlt.into()),
                     Value::Blob(sample),
                 ]);
                 insert_table(self.backend.writer()?, stat4_root, base4 + i as i64, &rec)?;
@@ -7405,10 +7405,10 @@ impl Connection {
         let next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
         let row = encode_record(&[
             Value::Text("table".into()),
-            Value::Text(ct.name.clone()),
-            Value::Text(ct.name.clone()),
+            Value::Text(ct.name.clone().into()),
+            Value::Text(ct.name.clone().into()),
             Value::Integer(root as i64),
-            Value::Text(canonical_schema_sql("CREATE TABLE ", sql_text)),
+            Value::Text(canonical_schema_sql("CREATE TABLE ", sql_text).into()),
         ]);
         insert_table(
             self.backend.writer()?,
@@ -7442,8 +7442,8 @@ impl Connection {
             let idx_root = create_index_root(self.backend.writer()?)?;
             let idx_row = encode_record(&[
                 Value::Text("index".into()),
-                Value::Text(alloc::format!("sqlite_autoindex_{}_{}", ct.name, n + 1)),
-                Value::Text(ct.name.clone()),
+                Value::Text(alloc::format!("sqlite_autoindex_{}_{}", ct.name, n + 1).into()),
+                Value::Text(ct.name.clone().into()),
                 Value::Integer(idx_root as i64),
                 Value::Null, // automatic indexes carry no CREATE SQL
             ]);
@@ -9383,10 +9383,10 @@ impl Connection {
         let next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
         let row = encode_record(&[
             Value::Text("trigger".into()),
-            Value::Text(ct.name.clone()),
-            Value::Text(ct.table.clone()),
+            Value::Text(ct.name.clone().into()),
+            Value::Text(ct.table.clone().into()),
             Value::Integer(0),
-            Value::Text(canonical_schema_sql("CREATE TRIGGER ", sql_text)),
+            Value::Text(canonical_schema_sql("CREATE TRIGGER ", sql_text).into()),
         ]);
         insert_table(
             self.backend.writer()?,
@@ -9943,7 +9943,7 @@ impl Connection {
         let msg = match args.get(1) {
             Some(e) => match eval::eval(e, &ctx)? {
                 Value::Null => String::new(),
-                Value::Text(s) => s,
+                Value::Text(s) => s.as_str().to_string(),
                 Value::Integer(i) => {
                     let mut s = String::new();
                     let _ = core::fmt::write(&mut s, format_args!("{i}"));
@@ -10636,7 +10636,7 @@ impl Connection {
                     .filter_map(|t| t.parse().ok())
                     .collect();
                 if !nums.is_empty() {
-                    map.insert(idx.clone(), nums);
+                    map.insert(idx.as_str().to_string(), nums);
                 }
             }
         }
@@ -12006,17 +12006,20 @@ impl Connection {
         let w = self.backend.writer()?;
         let schema_row = encode_record(&[
             Value::Text("index".into()),
-            Value::Text(ci.name.clone()),
-            Value::Text(ci.table.clone()),
+            Value::Text(ci.name.clone().into()),
+            Value::Text(ci.table.clone().into()),
             Value::Integer(root as i64),
-            Value::Text(canonical_schema_sql(
-                if ci.unique {
-                    "CREATE UNIQUE INDEX "
-                } else {
-                    "CREATE INDEX "
-                },
-                sql_text,
-            )),
+            Value::Text(
+                canonical_schema_sql(
+                    if ci.unique {
+                        "CREATE UNIQUE INDEX "
+                    } else {
+                        "CREATE INDEX "
+                    },
+                    sql_text,
+                )
+                .into(),
+            ),
         ]);
         insert_table(w, crate::schema::SCHEMA_ROOT_PAGE, schema_next, &schema_row)?;
         let cookie = w.header().schema_cookie.wrapping_add(1);
@@ -12044,10 +12047,10 @@ impl Connection {
         let next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
         let row = encode_record(&[
             Value::Text("view".into()),
-            Value::Text(cv.name.clone()),
-            Value::Text(cv.name.clone()),
+            Value::Text(cv.name.clone().into()),
+            Value::Text(cv.name.clone().into()),
             Value::Integer(0), // views have no b-tree root
-            Value::Text(canonical_schema_sql("CREATE VIEW ", sql_text)),
+            Value::Text(canonical_schema_sql("CREATE VIEW ", sql_text).into()),
         ]);
         insert_table(
             self.backend.writer()?,
@@ -12150,8 +12153,8 @@ impl Connection {
         let next = self.next_rowid(crate::schema::SCHEMA_ROOT_PAGE)?;
         let row = encode_record(&[
             Value::Text("table".into()),
-            Value::Text(cvt.name.clone()),
-            Value::Text(cvt.name.clone()),
+            Value::Text(cvt.name.clone().into()),
+            Value::Text(cvt.name.clone().into()),
             Value::Integer(0), // virtual tables have no b-tree root
             Value::Text(sql_text.into()),
         ]);
@@ -14253,7 +14256,7 @@ impl Connection {
                             }
                             _ => reprint.clone(),
                         };
-                        cols[4] = Value::Text(updated);
+                        cols[4] = Value::Text(updated.into());
                         true
                     } else {
                         false
@@ -14277,8 +14280,8 @@ impl Connection {
                 let new_name = new_name.clone();
                 self.rewrite_schema_rows(|cols| {
                     if is_text(&cols[0], "table") && is_text(&cols[1], &old) {
-                        cols[1] = Value::Text(new_name.clone());
-                        cols[2] = Value::Text(new_name.clone());
+                        cols[1] = Value::Text(new_name.clone().into());
+                        cols[2] = Value::Text(new_name.clone().into());
                         // Edit the table name in the stored CREATE text in place
                         // (preserving the body verbatim), like SQLite — rather than
                         // reprinting the whole definition from the AST.
@@ -14286,30 +14289,36 @@ impl Connection {
                             // Rename the table token itself, and any self-referential
                             // foreign key (`REFERENCES <old>`) in its own body.
                             let renamed = rename_table_token_after(&old_sql, "table", &new_name);
-                            cols[4] = Value::Text(rewrite_fk_references(&renamed, &old, &new_name));
+                            cols[4] = Value::Text(
+                                rewrite_fk_references(&renamed, &old, &new_name).into(),
+                            );
                         }
                         true
                     } else if is_text(&cols[2], &old) {
                         // Dependent index/trigger/view: repoint, and rewrite an
                         // index's `ON` clause / a trigger's body to the new name.
-                        cols[2] = Value::Text(new_name.clone());
+                        cols[2] = Value::Text(new_name.clone().into());
                         if is_text(&cols[0], "index") {
                             // Repoint the index's `ON <table>` to the new name in
                             // place (preserving the rest), like SQLite.
                             if let Some(Value::Text(isql)) = cols.get(4).cloned() {
-                                cols[4] =
-                                    Value::Text(rename_table_token_after(&isql, "on", &new_name));
+                                cols[4] = Value::Text(
+                                    rename_table_token_after(&isql, "on", &new_name).into(),
+                                );
                             }
                         } else if is_text(&cols[0], "trigger") {
                             // A trigger ON the renamed table: rewrite the renamed
                             // name throughout its stored text (the `ON` clause and
                             // any body references), like SQLite.
                             if let Some(Value::Text(tsql)) = cols.get(4).cloned() {
-                                cols[4] = Value::Text(rewrite_ident_tokens(
-                                    &tsql,
-                                    &old,
-                                    &sql::print::ident(&new_name),
-                                ));
+                                cols[4] = Value::Text(
+                                    rewrite_ident_tokens(
+                                        &tsql,
+                                        &old,
+                                        &sql::print::ident(&new_name),
+                                    )
+                                    .into(),
+                                );
                             }
                         }
                         true
@@ -14319,11 +14328,14 @@ impl Connection {
                         // preserved), so `SELECT … FROM v` keeps working.
                         match cols.get(4).cloned() {
                             Some(Value::Text(vsql)) if view_uses_table(&vsql, &old) => {
-                                cols[4] = Value::Text(rewrite_ident_tokens(
-                                    &vsql,
-                                    &old,
-                                    &sql::print::ident(&new_name),
-                                ));
+                                cols[4] = Value::Text(
+                                    rewrite_ident_tokens(
+                                        &vsql,
+                                        &old,
+                                        &sql::print::ident(&new_name),
+                                    )
+                                    .into(),
+                                );
                                 true
                             }
                             _ => false,
@@ -14334,11 +14346,14 @@ impl Connection {
                         // renamed name throughout its stored text.
                         match cols.get(4).cloned() {
                             Some(Value::Text(tsql)) if trigger_uses_table(&tsql, &old) => {
-                                cols[4] = Value::Text(rewrite_ident_tokens(
-                                    &tsql,
-                                    &old,
-                                    &sql::print::ident(&new_name),
-                                ));
+                                cols[4] = Value::Text(
+                                    rewrite_ident_tokens(
+                                        &tsql,
+                                        &old,
+                                        &sql::print::ident(&new_name),
+                                    )
+                                    .into(),
+                                );
                                 true
                             }
                             _ => false,
@@ -14351,7 +14366,7 @@ impl Connection {
                             Some(Value::Text(tsql)) => {
                                 let rewritten = rewrite_fk_references(&tsql, &old, &new_name);
                                 if rewritten != tsql {
-                                    cols[4] = Value::Text(rewritten);
+                                    cols[4] = Value::Text(rewritten.into());
                                     true
                                 } else {
                                     false
@@ -14466,16 +14481,19 @@ impl Connection {
                         // any `<table>.col` self-qualified reference (e.g. a CHECK
                         // written `CHECK(t.a > 0)`), like SQLite. Other `x.col`
                         // qualifiers can't occur in a single-table definition.
-                        cols[4] = Value::Text(match cols.get(4) {
-                            Some(Value::Text(s)) => rewrite_column_tokens(
-                                s,
-                                core::slice::from_ref(&table),
-                                &old,
-                                &new_text,
-                                BareRewrite::All,
-                            ),
-                            _ => reprint.clone(),
-                        });
+                        cols[4] = Value::Text(
+                            match cols.get(4) {
+                                Some(Value::Text(s)) => rewrite_column_tokens(
+                                    s,
+                                    core::slice::from_ref(&table),
+                                    &old,
+                                    &new_text,
+                                    BareRewrite::All,
+                                ),
+                                _ => reprint.clone(),
+                            }
+                            .into(),
+                        );
                         true
                     } else if is_text(&cols[0], "index") && is_text(&cols[2], &table) {
                         // Rewrite an index over this table if it names the column —
@@ -14490,7 +14508,7 @@ impl Connection {
                                 BareRewrite::All,
                             );
                             if rewritten != isql {
-                                cols[4] = Value::Text(rewritten);
+                                cols[4] = Value::Text(rewritten.into());
                                 return true;
                             }
                         }
@@ -14502,7 +14520,7 @@ impl Connection {
                             let rewritten =
                                 rewrite_fk_parent_column(&csql, &table, &old, &new_text);
                             if rewritten != csql {
-                                cols[4] = Value::Text(rewritten);
+                                cols[4] = Value::Text(rewritten.into());
                                 return true;
                             }
                         }
@@ -14557,10 +14575,10 @@ impl Connection {
                                     // the column name is globally unique.
                                     rewrite_column_tokens(&vsql, &quals, &old, &new_text, bare)
                                 } else {
-                                    vsql.clone()
+                                    vsql.as_str().to_string()
                                 };
                                 if rewritten != vsql {
-                                    cols[4] = Value::Text(rewritten);
+                                    cols[4] = Value::Text(rewritten.into());
                                     return true;
                                 }
                                 false
@@ -14625,10 +14643,10 @@ impl Connection {
                                         BareRewrite::All,
                                     )
                                 } else {
-                                    tsql.clone()
+                                    tsql.as_str().to_string()
                                 };
                                 if rewritten != tsql {
-                                    cols[4] = Value::Text(rewritten);
+                                    cols[4] = Value::Text(rewritten.into());
                                     return true;
                                 }
                                 false
@@ -14783,11 +14801,12 @@ impl Connection {
         let new_s = new.to_string();
         self.rewrite_schema_rows(|cols| {
             if is_text(&cols[0], "table") && is_text(&cols[1], &old_s) {
-                cols[1] = Value::Text(new_s.clone());
-                cols[2] = Value::Text(new_s.clone());
+                cols[1] = Value::Text(new_s.clone().into());
+                cols[2] = Value::Text(new_s.clone().into());
                 if let Some(Value::Text(s)) = cols.get(4).cloned() {
-                    cols[4] =
-                        Value::Text(rewrite_ident_tokens(&s, &old_s, &sql::print::ident(&new_s)));
+                    cols[4] = Value::Text(
+                        rewrite_ident_tokens(&s, &old_s, &sql::print::ident(&new_s)).into(),
+                    );
                 }
                 true
             } else {
@@ -15029,7 +15048,7 @@ impl Connection {
                     }
                     _ => reprint.clone(),
                 };
-                cols[4] = Value::Text(updated);
+                cols[4] = Value::Text(updated.into());
                 true
             } else {
                 false
@@ -17548,7 +17567,7 @@ impl Connection {
                         Value::Integer(id),
                         Value::Integer(parent),
                         Value::Integer(0),
-                        Value::Text(detail),
+                        Value::Text(detail.into()),
                     ]
                 })
                 .collect(),
@@ -28884,7 +28903,7 @@ impl Connection {
                 // matching the two trailing hidden columns. `json` echoes the
                 // document argument as-is (a JSONB blob stays a blob); `root`
                 // is the path argument text (default `$`).
-                let root_val = Value::Text(root_path);
+                let root_val = Value::Text(root_path.into());
                 for (i, row) in rows.iter_mut().enumerate() {
                     row.push(doc.clone());
                     row.push(root_val.clone());
@@ -32608,10 +32627,10 @@ impl Connection {
                         };
                         rows.push(InputRow {
                             values: alloc::vec![
-                                Value::Text(name.clone()),
-                                Value::Text(alloc::format!("{path}{i:03x}+{iovfl:06x}")),
+                                Value::Text(name.clone().into()),
+                                Value::Text(alloc::format!("{path}{i:03x}+{iovfl:06x}").into()),
                                 Value::Integer(ovfl as i64),
-                                Value::Text(String::from("overflow")),
+                                Value::Text(String::from("overflow").into()),
                                 Value::Integer(0),
                                 Value::Integer(opayload),
                                 Value::Integer(ounused),
@@ -32643,10 +32662,10 @@ impl Connection {
 
                 rows.push(InputRow {
                     values: alloc::vec![
-                        Value::Text(name.clone()),
-                        Value::Text(path.clone()),
+                        Value::Text(name.clone().into()),
+                        Value::Text(path.clone().into()),
                         Value::Integer(pgno as i64),
-                        Value::Text(String::from(ptype)),
+                        Value::Text(String::from(ptype).into()),
                         Value::Integer(ncell as i64),
                         Value::Integer(payload),
                         Value::Integer(unused),
@@ -32736,7 +32755,7 @@ impl Connection {
         // (NULL/blob contribute no tokens).
         let to_text = |v: &Value| -> Option<String> {
             match v {
-                Value::Text(s) => Some(s.clone()),
+                Value::Text(s) => Some(s.as_str().to_string()),
                 Value::Integer(i) => Some(i.to_string()),
                 Value::Real(r) => Some(eval::format_real(*r)),
                 Value::Null | Value::Blob(_) => None,
@@ -32762,7 +32781,7 @@ impl Connection {
                 for (term, (ds, cnt)) in map {
                     rows.push(InputRow {
                         values: alloc::vec![
-                            Value::Text(term),
+                            Value::Text(term.into()),
                             Value::Integer(ds.len() as i64),
                             Value::Integer(cnt),
                         ],
@@ -32787,8 +32806,8 @@ impl Connection {
                 for ((term, ci), (ds, cnt)) in map {
                     rows.push(InputRow {
                         values: alloc::vec![
-                            Value::Text(term),
-                            Value::Text(ft_cols[ci].clone()),
+                            Value::Text(term.into()),
+                            Value::Text(ft_cols[ci].clone().into()),
                             Value::Integer(ds.len() as i64),
                             Value::Integer(cnt),
                         ],
@@ -32816,9 +32835,9 @@ impl Connection {
                 for (term, rowid, ci, off) in insts {
                     rows.push(InputRow {
                         values: alloc::vec![
-                            Value::Text(term),
+                            Value::Text(term.into()),
                             Value::Integer(rowid),
-                            Value::Text(ft_cols[ci].clone()),
+                            Value::Text(ft_cols[ci].clone().into()),
                             Value::Integer(off),
                         ],
                         rowid: None,
@@ -35931,7 +35950,7 @@ impl Connection {
             return Ok(if lname.starts_with("jsonb") {
                 Value::Blob(arr.to_jsonb())
             } else {
-                Value::Text(arr.serialize())
+                Value::Text(arr.serialize().into())
             });
         }
         if lname == "json_group_object" || lname == "jsonb_group_object" {
@@ -35946,7 +35965,7 @@ impl Connection {
             return Ok(if lname.starts_with("jsonb") {
                 Value::Blob(obj.to_jsonb())
             } else {
-                Value::Text(obj.serialize())
+                Value::Text(obj.serialize().into())
             });
         }
 
@@ -36071,7 +36090,7 @@ impl Connection {
                         ",".to_string()
                     };
                     let parts: Vec<String> = vals.iter().map(eval::to_text).collect();
-                    Value::Text(parts.join(&sep))
+                    Value::Text(parts.join(&sep).into())
                 }
             }
             _ => {
@@ -36913,7 +36932,7 @@ fn value_to_literal_expr(v: Value) -> Expr {
         Value::Null => Literal::Null,
         Value::Integer(i) => Literal::Integer(i),
         Value::Real(r) => Literal::Real(r),
-        Value::Text(s) => Literal::Str(s),
+        Value::Text(s) => Literal::Str(s.as_str().to_string()),
         Value::Blob(b) => Literal::Blob(b),
     })
 }
@@ -40334,12 +40353,12 @@ fn json_emit_node(
     rows.push(alloc::vec![
         key.unwrap_or(Value::Null),
         value,
-        Value::Text(String::from(node.type_name())),
+        Value::Text(String::from(node.type_name()).into()),
         atom,
         Value::Integer(id),
         parent.map(Value::Integer).unwrap_or(Value::Null),
-        Value::Text(String::from(fullkey)),
-        Value::Text(String::from(path)),
+        Value::Text(String::from(fullkey).into()),
+        Value::Text(String::from(path).into()),
     ]);
 }
 
@@ -40368,7 +40387,7 @@ fn json_each_children(
                 let fullkey = crate::exec::json::push_path_key_prov(root_path, k, kraw);
                 json_emit_node(
                     v,
-                    Some(Value::Text(k.clone())),
+                    Some(Value::Text(k.clone().into())),
                     &fullkey,
                     root_path,
                     key_off,
@@ -40500,7 +40519,7 @@ fn split_json_path(
         } else {
             rest
         };
-        Value::Text(String::from(name))
+        Value::Text(String::from(name).into())
     };
     (parent, Some(key))
 }
@@ -40539,7 +40558,7 @@ fn json_tree_walk(
                 let child = crate::exec::json::push_path_key_prov(fullkey, k, kraw);
                 json_tree_walk(
                     v,
-                    Some(Value::Text(k.clone())),
+                    Some(Value::Text(k.clone().into())),
                     &child,
                     fullkey,
                     JsonbPos {
@@ -40929,7 +40948,7 @@ fn window_aggregate(lname: &str, star: bool, frame: &[&Vec<Value>]) -> Result<Va
                     .map(eval::to_text)
                     .unwrap_or_else(|| String::from(","));
                 let parts: Vec<String> = vals.iter().map(eval::to_text).collect();
-                Value::Text(parts.join(&sep))
+                Value::Text(parts.join(&sep).into())
             }
         }
         _ => return Err(Error::Unsupported("window function")),
@@ -41604,7 +41623,7 @@ fn join_keys_of(v: &Value) -> Vec<JoinKey> {
             ]
         }
         Value::Text(s) => {
-            let mut keys = alloc::vec![JoinKey::Text(s.clone())];
+            let mut keys = alloc::vec![JoinKey::Text(s.as_str().to_string())];
             match eval::to_number(&Value::Text(s.clone())) {
                 Value::Integer(i) => keys.push(JoinKey::Num(num_bits(i as f64))),
                 Value::Real(r) => keys.push(JoinKey::Num(num_bits(r))),
@@ -42549,9 +42568,9 @@ fn collect_range_constraints(
                 && let Some((lo, hi)) = glob_prefix_range(&pat)
             {
                 let b = out.entry(ci).or_default();
-                apply_bound(b, BinaryOp::GtEq, Value::Text(lo));
+                apply_bound(b, BinaryOp::GtEq, Value::Text(lo.into()));
                 if let Some(hi) = hi {
-                    apply_bound(b, BinaryOp::Lt, Value::Text(hi));
+                    apply_bound(b, BinaryOp::Lt, Value::Text(hi.into()));
                 }
             }
         }
@@ -43678,7 +43697,7 @@ fn value_to_literal(v: Value) -> Literal {
         Value::Null => Literal::Null,
         Value::Integer(i) => Literal::Integer(i),
         Value::Real(r) => Literal::Real(r),
-        Value::Text(s) => Literal::Str(s),
+        Value::Text(s) => Literal::Str(s.as_str().to_string()),
         Value::Blob(b) => Literal::Blob(b),
     }
 }
@@ -47332,7 +47351,7 @@ mod fts5_index_route_tests {
             .rows
             .into_iter()
             .map(|r| match &r[0] {
-                Value::Text(s) => s.clone(),
+                Value::Text(s) => alloc::string::String::from(s.as_str()),
                 other => alloc::format!("{other:?}"),
             })
             .collect()

@@ -15,7 +15,7 @@ fn one(c: &Connection, sql: &str) -> Value {
 }
 fn text(c: &Connection, sql: &str) -> String {
     match one(c, sql) {
-        Value::Text(s) => s,
+        Value::Text(s) => String::from(s.as_str()),
         v => panic!("not text: {v:?}"),
     }
 }
@@ -161,7 +161,7 @@ fn json_tree_fullkey_uses_escaped_key_source() {
     let keys: Vec<String> = rows
         .iter()
         .map(|r| match &r[0] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             v => panic!("not text: {v:?}"),
         })
         .collect();

@@ -14,7 +14,7 @@ fn sqlite_version_matches_target() {
     );
     // Usable in expressions, and a `major.minor.patch` shape.
     let v = match &c.query("SELECT sqlite_version()").unwrap().rows[0][0] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         _ => panic!(),
     };
     assert_eq!(v.split('.').count(), 3);

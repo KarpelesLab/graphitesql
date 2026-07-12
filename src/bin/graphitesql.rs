@@ -947,7 +947,7 @@ impl Shell {
                     _ => return None,
                 };
                 let detail = match r.last() {
-                    Some(Value::Text(s)) => s.clone(),
+                    Some(Value::Text(s)) => String::from(s.as_str()),
                     _ => String::new(),
                 };
                 Some((id, parent, detail))
@@ -1731,7 +1731,7 @@ fn dump_database(conn: &Connection) {
                 .rows
                 .iter()
                 .filter_map(|row| match row.first() {
-                    Some(Value::Text(s)) => Some(s.clone()),
+                    Some(Value::Text(s)) => Some(String::from(s.as_str())),
                     _ => None,
                 })
                 .collect(),
@@ -1813,7 +1813,7 @@ fn collect_names(conn: &Connection, sql: &str) -> Vec<String> {
             .rows
             .iter()
             .filter_map(|row| match row.first() {
-                Some(Value::Text(s)) => Some(s.clone()),
+                Some(Value::Text(s)) => Some(String::from(s.as_str())),
                 _ => None,
             })
             .collect(),
@@ -1859,7 +1859,7 @@ fn view_columns(conn: &Connection, name: &str) -> String {
         r.rows
             .iter()
             .filter_map(|row| match row.first() {
-                Some(Value::Text(s)) => Some(s.clone()),
+                Some(Value::Text(s)) => Some(String::from(s.as_str())),
                 _ => None,
             })
             .collect::<Vec<_>>()

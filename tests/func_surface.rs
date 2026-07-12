@@ -28,7 +28,7 @@ fn render(v: &Value) -> String {
         Value::Null => String::new(),
         Value::Integer(i) => i.to_string(),
         Value::Real(r) => graphitesql::exec::eval::format_real(*r),
-        Value::Text(t) => t.clone(),
+        Value::Text(t) => String::from(t.as_str()),
         Value::Blob(b) => format!("BLOB{b:?}"),
     }
 }
@@ -274,7 +274,7 @@ fn fixed_divergences_pinned() {
         )
     };
     let text = |e: &str| match &c.query(&format!("SELECT {e}")).unwrap().rows[0][0] {
-        Value::Text(t) => t.clone(),
+        Value::Text(t) => String::from(t.as_str()),
         other => format!("{other:?}"),
     };
     let real = |e: &str| match c.query(&format!("SELECT {e}")).unwrap().rows[0][0] {

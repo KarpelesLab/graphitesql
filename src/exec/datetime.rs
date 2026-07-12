@@ -898,7 +898,7 @@ fn fmt_time(p: &mut DateTime) -> String {
 /// `date(...)` -> `YYYY-MM-DD`.
 pub fn date(args: &[Value]) -> Value {
     match is_date(args) {
-        Some(mut p) => Value::Text(fmt_date(&mut p)),
+        Some(mut p) => Value::Text(fmt_date(&mut p).into()),
         None => Value::Null,
     }
 }
@@ -906,7 +906,7 @@ pub fn date(args: &[Value]) -> Value {
 /// `time(...)` -> `HH:MM:SS`.
 pub fn time(args: &[Value]) -> Value {
     match is_date(args) {
-        Some(mut p) => Value::Text(fmt_time(&mut p)),
+        Some(mut p) => Value::Text(fmt_time(&mut p).into()),
         None => Value::Null,
     }
 }
@@ -914,7 +914,9 @@ pub fn time(args: &[Value]) -> Value {
 /// `datetime(...)` -> `YYYY-MM-DD HH:MM:SS`.
 pub fn datetime(args: &[Value]) -> Value {
     match is_date(args) {
-        Some(mut p) => Value::Text(alloc::format!("{} {}", fmt_date(&mut p), fmt_time(&mut p))),
+        Some(mut p) => {
+            Value::Text(alloc::format!("{} {}", fmt_date(&mut p), fmt_time(&mut p)).into())
+        }
         None => Value::Null,
     }
 }
@@ -1047,16 +1049,19 @@ pub fn timediff(a: &Value, b: &Value) -> Value {
     d1.valid_tz = false;
     d1.compute_ymd_hms();
 
-    Value::Text(alloc::format!(
-        "{}{:04}-{:02}-{:02} {:02}:{:02}:{:06.3}",
-        sign,
-        y,
-        m,
-        d1.d - 1,
-        d1.h,
-        d1.min,
-        d1.s
-    ))
+    Value::Text(
+        alloc::format!(
+            "{}{:04}-{:02}-{:02} {:02}:{:02}:{:06.3}",
+            sign,
+            y,
+            m,
+            d1.d - 1,
+            d1.h,
+            d1.min,
+            d1.s
+        )
+        .into(),
+    )
 }
 
 /// `strftime(format, timevalue, modifier, ...)`.
@@ -1077,7 +1082,7 @@ pub fn strftime(args: &[Value]) -> Value {
         return Value::Null;
     };
     match render_strftime(&fmt, &mut p) {
-        Some(s) => Value::Text(s),
+        Some(s) => Value::Text(s.into()),
         None => Value::Null,
     }
 }
@@ -1722,9 +1727,9 @@ pub fn printf(args: &[Value]) -> Value {
         }
     }
     if too_big {
-        return Value::Text(String::new());
+        return Value::Text(String::new().into());
     }
-    Value::Text(out)
+    Value::Text(out.into())
 }
 
 /// Fixed-point (`%f`) rendering of a finite `f` with `p` fractional digits,
@@ -2054,7 +2059,7 @@ mod tests {
     use alloc::vec;
 
     fn t(v: &str) -> Value {
-        Value::Text(String::from(v))
+        Value::Text(String::from(v).into())
     }
 
     #[test]

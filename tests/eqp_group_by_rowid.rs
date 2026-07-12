@@ -18,7 +18,7 @@ fn g_eqp(c: &Connection, q: &str) -> String {
         .rows
         .iter()
         .filter_map(|r| match r.last() {
-            Some(Value::Text(s)) => Some(s.clone()),
+            Some(Value::Text(s)) => Some(String::from(s.as_str())),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -35,7 +35,7 @@ fn g_rows(c: &Connection, q: &str) -> String {
                 .map(|v| match v {
                     Value::Integer(i) => i.to_string(),
                     Value::Real(f) => format!("{f}"),
-                    Value::Text(s) => s.clone(),
+                    Value::Text(s) => String::from(s.as_str()),
                     Value::Null => String::new(),
                     _ => "?".into(),
                 })

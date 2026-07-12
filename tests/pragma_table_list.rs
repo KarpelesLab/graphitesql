@@ -15,7 +15,7 @@ fn graphite_set(c: &Connection, sql: &str) -> Vec<String> {
         .iter()
         .map(|r| {
             let cell = |i: usize| match &r[i] {
-                Value::Text(s) => s.clone(),
+                Value::Text(s) => String::from(s.as_str()),
                 Value::Integer(n) => n.to_string(),
                 other => format!("{other:?}"),
             };
@@ -95,7 +95,7 @@ fn collation_list_reports_builtins() {
         .rows
         .into_iter()
         .map(|r| match &r[1] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             other => format!("{other:?}"),
         })
         .collect();

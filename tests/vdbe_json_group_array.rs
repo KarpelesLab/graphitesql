@@ -177,7 +177,7 @@ fn json_group_array_matches_sqlite3() {
                     .map(|v| match v {
                         Value::Null => String::new(),
                         Value::Integer(i) => i.to_string(),
-                        Value::Text(s) => s.clone(),
+                        Value::Text(s) => String::from(s.as_str()),
                         Value::Real(x) => x.to_string(),
                         Value::Blob(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
                     })

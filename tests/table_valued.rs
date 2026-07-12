@@ -13,7 +13,7 @@ fn render(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
         Value::Integer(i) => i.to_string(),
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         Value::Real(r) => graphitesql::exec::eval::format_real(*r),
         Value::Blob(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
     }
@@ -232,7 +232,7 @@ fn explain_query_plan_over_a_virtual_table() {
         .unwrap();
     let detail = |sql: &str| -> String {
         match c.query(sql).unwrap().rows.last().unwrap().last().unwrap() {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             o => panic!("not text: {o:?}"),
         }
     };

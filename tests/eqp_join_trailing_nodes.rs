@@ -69,7 +69,7 @@ fn g_eqp(c: &Connection, q: &str) -> String {
     let rows = c.query(&format!("EXPLAIN QUERY PLAN {q}")).unwrap().rows;
     rows.iter()
         .filter_map(|r| match r.last() {
-            Some(Value::Text(s)) => Some(s.clone()),
+            Some(Value::Text(s)) => Some(String::from(s.as_str())),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -91,7 +91,7 @@ fn render_rows(rows: &[Vec<Value>]) -> String {
                             s
                         }
                     }
-                    Value::Text(s) => s.clone(),
+                    Value::Text(s) => String::from(s.as_str()),
                     Value::Blob(_) => "<blob>".to_string(),
                 })
                 .collect::<Vec<_>>()

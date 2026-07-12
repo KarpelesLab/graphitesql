@@ -35,7 +35,7 @@ fn g_rows(q: &str) -> String {
                     graphitesql::Value::Null => "".to_string(),
                     graphitesql::Value::Integer(i) => i.to_string(),
                     graphitesql::Value::Real(f) => format!("{f}"),
-                    graphitesql::Value::Text(s) => s.clone(),
+                    graphitesql::Value::Text(s) => String::from(s.as_str()),
                     graphitesql::Value::Blob(_) => "<blob>".to_string(),
                 })
                 .collect::<Vec<_>>()

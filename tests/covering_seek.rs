@@ -16,7 +16,7 @@ fn plan(conn: &Connection, sql: &str) -> String {
         .expect("explain query plan");
     assert_eq!(r.rows.len(), 1, "expected one plan node for: {sql}");
     match &r.rows[0][3] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         other => panic!("plan detail not text: {other:?}"),
     }
 }

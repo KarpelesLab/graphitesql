@@ -86,7 +86,7 @@ fn dump_shadows_graphite(c: &Connection) -> String {
                 row.iter()
                     .map(|v| match v {
                         graphitesql::Value::Integer(i) => i.to_string(),
-                        graphitesql::Value::Text(t) => t.clone(),
+                        graphitesql::Value::Text(t) => String::from(t.as_str()),
                         graphitesql::Value::Null => String::new(),
                         other => format!("{other:?}"),
                     })

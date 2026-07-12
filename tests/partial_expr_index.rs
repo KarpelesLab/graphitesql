@@ -26,7 +26,7 @@ fn plan(c: &mut Connection, sql: &str) -> String {
     let r = c.query(sql).unwrap();
     let row = r.rows.last().expect("a query-plan row");
     match row.last().unwrap() {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         other => panic!("plan detail not text: {other:?}"),
     }
 }
@@ -122,7 +122,7 @@ fn expression_index_used_and_correct() {
         .rows
         .iter()
         .map(|row| match &row[0] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             other => panic!("not text: {other:?}"),
         })
         .collect();
@@ -183,7 +183,7 @@ fn partial_expression_index_combined() {
         .query("SELECT name FROM t WHERE lower(name)='bob' AND live=1")
         .unwrap();
     assert_eq!(r.rows.len(), 1);
-    assert_eq!(r.rows[0][0], Value::Text("BOB".to_string()));
+    assert_eq!(r.rows[0][0], Value::Text("BOB".into()));
 
     // Missing the partial predicate → must scan (and still be correct: 'BOB' and
     // 'bob' both match, regardless of `live`).

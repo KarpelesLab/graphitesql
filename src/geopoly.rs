@@ -325,17 +325,22 @@ fn point_beneath_line(x0: f64, y0: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> i
 /// Render a coordinate with SQLite's `%!g` (trim trailing zeros but keep one
 /// fractional digit), by reusing graphite's printf so it is byte-identical.
 fn fmt_bang_g(c: f32) -> String {
-    match crate::exec::datetime::printf(&[Value::Text(String::from("%!g")), Value::Real(c as f64)])
-    {
-        Value::Text(s) => s,
+    match crate::exec::datetime::printf(&[
+        Value::Text(String::from("%!g").into()),
+        Value::Real(c as f64),
+    ]) {
+        Value::Text(s) => String::from(s.as_str()),
         _ => String::new(),
     }
 }
 
 /// Render a coordinate with plain `%g` (used by SVG, no forced `.0`).
 fn fmt_g(c: f32) -> String {
-    match crate::exec::datetime::printf(&[Value::Text(String::from("%g")), Value::Real(c as f64)]) {
-        Value::Text(s) => s,
+    match crate::exec::datetime::printf(&[
+        Value::Text(String::from("%g").into()),
+        Value::Real(c as f64),
+    ]) {
+        Value::Text(s) => String::from(s.as_str()),
         _ => String::new(),
     }
 }

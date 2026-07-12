@@ -12,7 +12,7 @@ fn col(c: &Connection, sql: &str) -> Vec<String> {
         .rows
         .into_iter()
         .map(|mut r| match r.remove(0) {
-            Value::Text(s) => s,
+            Value::Text(s) => String::from(s.as_str()),
             Value::Integer(i) => i.to_string(),
             other => panic!("unexpected {other:?}"),
         })

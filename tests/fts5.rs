@@ -205,7 +205,7 @@ fn porter_tokenizer_stems_tokens() {
             .collect::<Vec<_>>()
     };
     let one = |sql: &str| match &c.query(sql).unwrap().rows[0][0] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         o => panic!("not text: {o:?}"),
     };
     // Every inflected form of "run" stems to the same root and matches row 1.
@@ -263,7 +263,7 @@ fn unindexed_columns_are_not_searched() {
             .collect::<Vec<_>>()
     };
     let one = |sql: &str| match &c.query(sql).unwrap().rows[0][0] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         o => panic!("not text: {o:?}"),
     };
     // `bird` only appears in the unindexed column → no match.
@@ -543,7 +543,7 @@ fn highlight_wraps_matched_terms() {
     c.execute("INSERT INTO t VALUES ('Hello World','the quick brown fox jumps over the lazy dog')")
         .unwrap();
     let one = |sql: &str| match &c.query(sql).unwrap().rows[0][0] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         o => panic!("not text: {o:?}"),
     };
     // A single matched token in the body, surrounding text preserved.
@@ -581,7 +581,7 @@ fn snippet_selects_best_window() {
         c.execute(&format!("INSERT INTO t(a,b) VALUES('{doc_a}','{doc_b}')"))
             .unwrap();
         match &c.query(sql).unwrap().rows[0][0] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             o => panic!("not text: {o:?}"),
         }
     };
@@ -688,7 +688,7 @@ fn explain_query_plan_reports_match_index() {
     c.execute("CREATE VIRTUAL TABLE f USING fts5(a, b, c)")
         .unwrap();
     let plan = |sql: &str| match c.query(sql).unwrap().rows.last().unwrap().last() {
-        Some(Value::Text(s)) => s.clone(),
+        Some(Value::Text(s)) => String::from(s.as_str()),
         o => panic!("not text: {o:?}"),
     };
     assert_eq!(

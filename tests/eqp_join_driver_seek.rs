@@ -55,7 +55,7 @@ fn graphite_eqp(c: &Connection, sql: &str) -> Vec<String> {
         .rows
         .iter()
         .map(|r| match r.last() {
-            Some(Value::Text(t)) => t.clone(),
+            Some(Value::Text(t)) => String::from(t.as_str()),
             other => format!("{other:?}"),
         })
         .collect()
@@ -165,7 +165,7 @@ fn secondary_index_driver_seek_rows_match_sqlite() {
         .map(|r| {
             r.iter()
                 .map(|v| match v {
-                    Value::Text(t) => t.clone(),
+                    Value::Text(t) => String::from(t.as_str()),
                     Value::Null => String::new(),
                     Value::Integer(i) => i.to_string(),
                     other => format!("{other:?}"),
@@ -203,7 +203,7 @@ fn driver_rowid_seek_rows_match_sqlite() {
         .map(|r| {
             r.iter()
                 .map(|v| match v {
-                    Value::Text(t) => t.clone(),
+                    Value::Text(t) => String::from(t.as_str()),
                     Value::Null => String::new(),
                     Value::Integer(i) => i.to_string(),
                     other => format!("{other:?}"),

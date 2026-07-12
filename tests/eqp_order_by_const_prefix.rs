@@ -58,7 +58,7 @@ fn graphite_eqp(c: &Connection, sql: &str) -> Vec<String> {
         .rows
         .iter()
         .map(|r| match r.last() {
-            Some(Value::Text(t)) => t.clone(),
+            Some(Value::Text(t)) => String::from(t.as_str()),
             other => format!("{other:?}"),
         })
         .collect()
@@ -394,7 +394,7 @@ fn full_unique_index_equality_matches_one_row_no_sort() {
         .rows
         .iter()
         .map(|r| match &r[0] {
-            Value::Text(t) => t.clone(),
+            Value::Text(t) => String::from(t.as_str()),
             v => format!("{v:?}"),
         })
         .collect();

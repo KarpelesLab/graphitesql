@@ -281,7 +281,7 @@ fn explain_query_plan_matches_sqlite_rtree_index() {
     c.execute("CREATE VIRTUAL TABLE r USING rtree(id, minX, maxX, minY, maxY)")
         .unwrap();
     let plan = |sql: &str| match c.query(sql).unwrap().rows.last().unwrap().last() {
-        Some(Value::Text(s)) => s.clone(),
+        Some(Value::Text(s)) => String::from(s.as_str()),
         o => panic!("not text: {o:?}"),
     };
     assert_eq!(
@@ -326,7 +326,7 @@ fn table_info_reports_rtree_column_types() {
         .unwrap();
     let r = c.query("PRAGMA table_info(r)").unwrap();
     let ty = |i: usize| match &r.rows[i][2] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         o => panic!("not text: {o:?}"),
     };
     assert_eq!(ty(0), "INT");
@@ -503,7 +503,7 @@ fn reads_sqlite_written_rtree_node_format() {
                         Value::Integer(i) => i.to_string(),
                         Value::Real(f) => graphitesql::exec::eval::format_real(*f),
                         Value::Null => String::new(),
-                        Value::Text(s) => s.clone(),
+                        Value::Text(s) => String::from(s.as_str()),
                         Value::Blob(_) => "b".into(),
                     })
                     .collect::<Vec<_>>()

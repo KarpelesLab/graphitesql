@@ -102,8 +102,8 @@ impl Json {
             Json::Bool(b) => Value::Integer(*b as i64),
             Json::Int(i, _) => Value::Integer(*i),
             Json::Real(r, _) => Value::Real(*r),
-            Json::Str(s, _) => Value::Text(s.clone()),
-            Json::Array(_) | Json::Object(_) => Value::Text(self.serialize()),
+            Json::Str(s, _) => Value::Text(s.clone().into()),
+            Json::Array(_) | Json::Object(_) => Value::Text(self.serialize().into()),
         }
     }
 
@@ -1519,7 +1519,7 @@ pub fn value_to_json(v: &Value) -> Json {
         Value::Null => Json::Null,
         Value::Integer(i) => Json::Int(*i, None),
         Value::Real(r) => Json::Real(*r, None),
-        Value::Text(s) => Json::Str(s.clone(), None),
+        Value::Text(s) => Json::Str(s.as_str().to_string(), None),
         Value::Blob(_) => Json::Str(String::new(), None),
     }
 }
@@ -1562,7 +1562,7 @@ pub fn arrow(doc: &Value, path_arg: &Value, as_text: bool) -> crate::Result<Valu
             if as_text {
                 node.to_sql()
             } else {
-                Value::Text(node.serialize())
+                Value::Text(node.serialize().into())
             }
         }
     })
@@ -1576,11 +1576,11 @@ fn arrow_path(v: &Value) -> String {
     match v {
         Value::Integer(i) if *i < 0 => alloc::format!("$[#-{}]", i.unsigned_abs()),
         Value::Integer(i) => alloc::format!("$[{i}]"),
-        Value::Text(s) if s.starts_with('$') => s.clone(),
+        Value::Text(s) if s.starts_with('$') => s.as_str().to_string(),
         // A bare key is a single object label, even when it contains `.`/`[`
         // (sqlite's `-> 'a.b'` is the literal key "a.b", not the nested path
         // `$.a.b`). Wrap it as a quoted label so the dots are taken literally.
-        Value::Text(s) => alloc::format!("$.\"{s}\""),
+        Value::Text(s) => alloc::format!("$.\"{}\"", s.as_str()),
         other => alloc::format!("$.\"{}\"", crate::exec::eval::to_text(other)),
     }
 }

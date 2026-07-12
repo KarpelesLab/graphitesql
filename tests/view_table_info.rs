@@ -15,11 +15,11 @@ fn info(c: &Connection, sql: &str) -> Vec<(String, String)> {
         .iter()
         .map(|r| {
             let name = match &r[1] {
-                Value::Text(s) => s.clone(),
+                Value::Text(s) => String::from(s.as_str()),
                 v => panic!("name not text: {v:?}"),
             };
             let ty = match &r[2] {
-                Value::Text(s) => s.clone(),
+                Value::Text(s) => String::from(s.as_str()),
                 v => panic!("type not text: {v:?}"),
             };
             (name, ty)

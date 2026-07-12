@@ -11,7 +11,7 @@ fn render(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
         Value::Integer(i) => i.to_string(),
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         // Use graphitesql's own canonical real formatting (matches sqlite's %.15g).
         Value::Real(r) => graphitesql::exec::eval::format_real(*r),
         Value::Blob(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
@@ -231,7 +231,7 @@ fn window_over_aggregate() {
                         Value::Null => String::new(),
                         Value::Integer(i) => i.to_string(),
                         Value::Real(r) => graphitesql::exec::eval::format_real(*r),
-                        Value::Text(s) => s.clone(),
+                        Value::Text(s) => String::from(s.as_str()),
                         Value::Blob(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
                     })
                     .collect::<Vec<_>>()

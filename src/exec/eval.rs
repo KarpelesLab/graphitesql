@@ -207,7 +207,7 @@ impl Affinity {
         match self {
             Affinity::Blob => v,
             Affinity::Text => match v {
-                Value::Integer(_) | Value::Real(_) => Value::Text(to_text(&v)),
+                Value::Integer(_) | Value::Real(_) => Value::Text(to_text(&v).into()),
                 other => other,
             },
             Affinity::Real => match v {
@@ -950,7 +950,7 @@ fn row_subquery_first(select: &Select, ctx: &EvalCtx) -> Result<Option<Vec<Expr>
                     Value::Null => Literal::Null,
                     Value::Integer(i) => Literal::Integer(i),
                     Value::Real(r) => Literal::Real(r),
-                    Value::Text(t) => Literal::Str(t),
+                    Value::Text(t) => Literal::Str(t.as_str().to_string()),
                     Value::Blob(b) => Literal::Blob(b),
                 })
             })
@@ -1201,7 +1201,7 @@ fn literal_value(lit: &Literal) -> Value {
         Literal::Null => Value::Null,
         Literal::Integer(i) => Value::Integer(*i),
         Literal::Real(r) => Value::Real(*r),
-        Literal::Str(s) => Value::Text(s.clone()),
+        Literal::Str(s) => Value::Text(s.clone().into()),
         Literal::Blob(b) => Value::Blob(b.clone()),
         Literal::Boolean(b) => Value::Integer(*b as i64),
     }
@@ -1408,7 +1408,7 @@ fn eval_binary(op: BinaryOp, l: Value, r: Value, case_sensitive_like: bool) -> R
                 let mut bytes = text_bytes(&l);
                 bytes.extend_from_slice(&text_bytes(&r));
                 match String::from_utf8(bytes) {
-                    Ok(s) => Value::Text(s),
+                    Ok(s) => Value::Text(s.into()),
                     Err(e) => Value::Blob(e.into_bytes()),
                 }
             }
@@ -1486,7 +1486,7 @@ pub fn concat_values(l: &Value, r: &Value) -> Value {
     let mut bytes = text_bytes(l);
     bytes.extend_from_slice(&text_bytes(r));
     match String::from_utf8(bytes) {
-        Ok(s) => Value::Text(s),
+        Ok(s) => Value::Text(s.into()),
         Err(e) => Value::Blob(e.into_bytes()),
     }
 }
@@ -1645,7 +1645,7 @@ pub fn cast(v: Value, type_name: &str) -> Value {
     // Casting a blob to a non-blob type first reinterprets its bytes as text, so
     // `CAST(x'3132' AS INTEGER)` reads "12" and yields 12 (not 0).
     let v = if matches!(v, Value::Blob(_)) && !aff.contains("BLOB") {
-        Value::Text(to_text(&v))
+        Value::Text(to_text(&v).into())
     } else {
         v
     };
@@ -1658,7 +1658,7 @@ pub fn cast(v: Value, type_name: &str) -> Value {
             _ => to_i64(&v),
         })
     } else if aff.contains("CHAR") || aff.contains("CLOB") || aff.contains("TEXT") {
-        Value::Text(to_text(&v))
+        Value::Text(to_text(&v).into())
     } else if aff.contains("REAL") || aff.contains("FLOA") || aff.contains("DOUB") {
         Value::Real(number_as_f64(&to_number(&v)))
     } else if aff.contains("BLOB") {
@@ -2081,7 +2081,7 @@ pub fn to_text(v: &Value) -> String {
         Value::Null => String::new(),
         Value::Integer(i) => i.to_string(),
         Value::Real(r) => format_real(*r),
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => s.as_str().to_string(),
         Value::Blob(b) => String::from_utf8_lossy(b).into_owned(),
     }
 }

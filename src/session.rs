@@ -782,7 +782,7 @@ impl<'a> Reader<'a> {
                 let bytes = self.take(n)?;
                 let s = core::str::from_utf8(bytes)
                     .map_err(|_| corrupt("non-UTF-8 text in changeset"))?;
-                Ok(Some(Value::Text(String::from(s))))
+                Ok(Some(Value::Text(String::from(s).into())))
             }
             T_BLOB => {
                 let n = self.varint()? as usize;

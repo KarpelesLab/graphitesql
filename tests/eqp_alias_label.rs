@@ -31,7 +31,7 @@ fn g_eqp(ddl: &str, q: &str) -> String {
     let mut lines = Vec::new();
     for r in &rows {
         if let Some(graphitesql::Value::Text(s)) = r.last() {
-            lines.push(s.clone());
+            lines.push(String::from(s.as_str()));
         }
     }
     lines.join(" | ")

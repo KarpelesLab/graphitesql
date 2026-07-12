@@ -59,7 +59,7 @@ fn unbound_parameters_match_sqlite3() {
                     .map(|v| match v {
                         Value::Null => String::new(),
                         Value::Integer(i) => i.to_string(),
-                        Value::Text(s) => s.clone(),
+                        Value::Text(s) => String::from(s.as_str()),
                         Value::Real(x) => graphitesql::exec::eval::format_real(*x),
                         Value::Blob(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
                     })

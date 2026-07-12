@@ -15,7 +15,7 @@ fn render(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
         Value::Integer(i) => i.to_string(),
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         Value::Real(r) => graphitesql::exec::eval::format_real(*r),
         Value::Blob(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
     }
@@ -167,7 +167,7 @@ fn ordered_group_concat_over_join_runs_on_vdbe() {
     assert_eq!(got, want, "VDBE vs tree-walker diverged on {q}");
     // Joined rows: (v=p,w=30),(p,10),(q,30),(q,10),(r,20). Ordered by w:
     // 10:p,10:q,20:r,30:p,30:q → "p,q,r,p,q".
-    assert_eq!(got, vec![vec![Value::Text("p,q,r,p,q".to_string())]]);
+    assert_eq!(got, vec![vec![Value::Text("p,q,r,p,q".into())]]);
 }
 
 /// `DISTINCT` + `ORDER BY` and an `ORDER BY` on a non-`group_concat` aggregate
@@ -186,5 +186,5 @@ fn distinct_ordered_and_non_concat_ordered_defer() {
     let r = c
         .query("SELECT group_concat(DISTINCT s ORDER BY s) FROM t")
         .unwrap();
-    assert_eq!(r.rows, vec![vec![Value::Text("a,b,c,d,y,z".to_string())]]);
+    assert_eq!(r.rows, vec![vec![Value::Text("a,b,c,d,y,z".into())]]);
 }

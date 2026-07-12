@@ -12,7 +12,7 @@ fn sqlite3_available() -> bool {
 
 fn graphite_check(c: &Connection) -> String {
     match &c.query("PRAGMA integrity_check").unwrap().rows[0][0] {
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         _ => "?".into(),
     }
 }

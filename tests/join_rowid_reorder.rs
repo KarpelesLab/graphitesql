@@ -49,7 +49,7 @@ fn fmt(v: &Value) -> String {
                 format!("{r}")
             }
         }
-        Value::Text(s) => s.clone(),
+        Value::Text(s) => String::from(s.as_str()),
         Value::Blob(b) => String::from_utf8_lossy(b).into_owned(),
     }
 }

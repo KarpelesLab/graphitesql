@@ -47,7 +47,7 @@ fn build_db(path: &str, n: i64) {
     for i in 1..=n {
         let row = encode_record(&[
             Value::Null,
-            Value::Text(format!("row-{i}")),
+            Value::Text(format!("row-{i}").into()),
             Value::Real(i as f64 + 0.5),
         ]);
         insert_table(&mut wp, root, i, &row).unwrap();

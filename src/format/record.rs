@@ -125,7 +125,7 @@ fn decode_value(serial: SerialType, body: &[u8], encoding: TextEncoding) -> Resu
         8 => Value::Integer(0),
         9 => Value::Integer(1),
         n if n >= 12 && n.is_multiple_of(2) => Value::Blob(Vec::from(body)),
-        _ => Value::Text(decode_text(body, encoding)?),
+        _ => Value::Text(decode_text(body, encoding)?.into()),
     })
 }
 
@@ -177,7 +177,7 @@ mod tests {
             Value::Integer(i64::MIN),
             Value::Integer(i64::MAX),
             Value::Real(2.5),
-            Value::Text(String::from("hello, graphite")),
+            Value::Text(String::from("hello, graphite").into()),
             Value::Blob(vec![0u8, 1, 2, 255, 254]),
         ];
         let bytes = encode_record(&values);

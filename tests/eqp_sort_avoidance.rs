@@ -26,7 +26,7 @@ fn graphite_eqp(sql: &str) -> Vec<String> {
         .rows
         .iter()
         .map(|r| match r.last() {
-            Some(graphitesql::Value::Text(t)) => t.clone(),
+            Some(graphitesql::Value::Text(t)) => String::from(t.as_str()),
             other => format!("{other:?}"),
         })
         .collect()
@@ -116,7 +116,7 @@ fn order_by_collate_uses_matching_collation_index() {
             .rows
             .iter()
             .map(|r| match r.last() {
-                Some(graphitesql::Value::Text(t)) => t.clone(),
+                Some(graphitesql::Value::Text(t)) => String::from(t.as_str()),
                 other => format!("{other:?}"),
             })
             .collect()
@@ -174,7 +174,7 @@ fn order_by_collate_uses_matching_collation_index() {
     let bs: Vec<String> = rows
         .iter()
         .map(|r| match &r[0] {
-            graphitesql::Value::Text(t) => t.clone(),
+            graphitesql::Value::Text(t) => String::from(t.as_str()),
             v => panic!("{v:?}"),
         })
         .collect();
@@ -221,7 +221,7 @@ fn single_open_range_prefers_order_index_over_seek() {
             .rows
             .iter()
             .map(|r| match r.last() {
-                Some(graphitesql::Value::Text(t)) => t.clone(),
+                Some(graphitesql::Value::Text(t)) => String::from(t.as_str()),
                 other => format!("{other:?}"),
             })
             .collect()
@@ -257,7 +257,7 @@ fn single_open_range_prefers_order_index_over_seek() {
         .rows
         .iter()
         .map(|r| match &r[0] {
-            graphitesql::Value::Text(t) => t.clone(),
+            graphitesql::Value::Text(t) => String::from(t.as_str()),
             v => panic!("{v:?}"),
         })
         .collect();

@@ -12,7 +12,7 @@ fn names(c: &Connection, sql: &str) -> Vec<String> {
         .rows
         .into_iter()
         .map(|r| match &r[0] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             other => panic!("expected text name, got {other:?}"),
         })
         .collect()

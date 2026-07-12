@@ -535,7 +535,7 @@ mod tests {
         let mut wp = wp();
         let root = new_table_root(&mut wp);
         for i in 1..=20i64 {
-            let rec = encode_record(&[Value::Null, Value::Text(alloc::format!("row{i}"))]);
+            let rec = encode_record(&[Value::Null, Value::Text(alloc::format!("row{i}").into())]);
             insert_table(&mut wp, root, i, &rec).unwrap();
         }
         // Scan back via the read cursor over the same WritePager.

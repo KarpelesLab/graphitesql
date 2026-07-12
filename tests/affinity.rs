@@ -103,7 +103,7 @@ fn cast_matches_sqlite3() {
             String::from_utf8_lossy(&o.stdout).trim_end().to_string()
         };
         let got = match &c.query(&q).unwrap().rows[0][0] {
-            graphitesql::Value::Text(s) => s.clone(),
+            graphitesql::Value::Text(s) => String::from(s.as_str()),
             graphitesql::Value::Null => String::new(),
             other => format!("{other:?}"),
         };
@@ -157,7 +157,7 @@ fn render_rows(result: &graphitesql::QueryResult) -> String {
                 .map(|v| match v {
                     graphitesql::Value::Null => String::new(),
                     graphitesql::Value::Integer(i) => i.to_string(),
-                    graphitesql::Value::Text(s) => s.clone(),
+                    graphitesql::Value::Text(s) => String::from(s.as_str()),
                     graphitesql::Value::Real(r) => graphitesql::exec::eval::format_real(*r),
                     graphitesql::Value::Blob(b) => b.iter().map(|x| format!("{x:02x}")).collect(),
                 })

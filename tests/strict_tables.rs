@@ -28,7 +28,7 @@ fn graphite_insert(col: &str, val: &str) -> Result<String, ()> {
         .query("SELECT typeof(a) || '=' || quote(a) FROM t")
         .unwrap();
     match &r.rows[0][0] {
-        Value::Text(t) => Ok(t.clone()),
+        Value::Text(t) => Ok(String::from(t.as_str())),
         _ => Ok(String::new()),
     }
 }

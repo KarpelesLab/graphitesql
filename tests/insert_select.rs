@@ -134,7 +134,7 @@ fn matches_sqlite_cli() {
         .rows
         .iter()
         .map(|r| match &r[0] {
-            Value::Text(t) => t.clone(),
+            Value::Text(t) => String::from(t.as_str()),
             _ => String::new(),
         })
         .collect();

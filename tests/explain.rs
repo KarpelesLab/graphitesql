@@ -15,7 +15,7 @@ fn detail(conn: &Connection, sql: &str) -> Vec<String> {
     r.rows
         .iter()
         .map(|row| match &row[3] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             other => panic!("detail not text: {other:?}"),
         })
         .collect()
@@ -316,7 +316,7 @@ fn order_by_secondary_index_returns_correct_order() {
         .rows
         .into_iter()
         .map(|r| match &r[0] {
-            Value::Text(s) => s.clone(),
+            Value::Text(s) => String::from(s.as_str()),
             _ => panic!(),
         })
         .collect();

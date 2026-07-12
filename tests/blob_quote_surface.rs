@@ -33,7 +33,7 @@ fn render(v: &Value) -> String {
         Value::Null => String::new(),
         Value::Integer(i) => i.to_string(),
         Value::Real(r) => graphitesql::exec::eval::format_real(*r),
-        Value::Text(t) => t.clone(),
+        Value::Text(t) => String::from(t.as_str()),
         Value::Blob(b) => format!("BLOB{b:?}"),
     }
 }
