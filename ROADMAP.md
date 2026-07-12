@@ -691,7 +691,19 @@ history / `CHANGELOG.md`. Remaining:
   - **D2e-1 — delete-crisis with a populated higher level** (needs tombstones
     carried into the merge).
   - **D2e-2 — incremental writes inside explicit `BEGIN`/`SAVEPOINT`** (autocommit
-    is incremental; explicit txns rebuild).
+    is incremental; explicit txns rebuild). *Not a small change (code-verified
+    2026-07-13):* the gate is `fts5_maybe_rebuild` (`src/exec/mod.rs` ~33370) —
+    autocommit appends one level-0 segment per INSERT; inside a txn it bulk-rebuilds
+    because SQLite instead accumulates the *whole* transaction's postings in an
+    in-memory hash (`Fts5Hash`), flushes them as **one** segment at COMMIT, *and
+    serves in-transaction `MATCH` reads from that hash*. graphite has no such hash,
+    so it rebuilds per statement — which keeps in-txn reads correct. A naive
+    "defer the segment flush to commit" would therefore **regress in-transaction
+    `MATCH` visibility** (a real correctness bug: `BEGIN; INSERT…; SELECT…MATCH`
+    would miss the just-inserted row). Matching SQLite's byte layout here requires
+    porting the `Fts5Hash` pending-postings subsystem (in-txn read overlay +
+    commit-time single-segment flush + rollback discard), not merely relaxing the
+    gate — and its byte-parity is verifiable only against the `sqlite3` oracle.
   - **D2e-3 — incremental path for prefix-index and spanning-dlidx segments.**
 - **D4-leftover — DONE 2026-07-11 (window UDFs + custom collations).**
   *Window UDFs:* a user-registered aggregate (`Connection::register_aggregate_function`
