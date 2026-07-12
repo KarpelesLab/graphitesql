@@ -1317,11 +1317,38 @@ fn strip_zeros_keep_one(s: &str) -> String {
     alloc::format!("{mant}{exp}")
 }
 
+/// Count the characters in `bytes` with SQLite's lenient `SKIP_UTF8` stepping
+/// (each byte that is not a UTF-8 continuation byte starts a character). For valid
+/// UTF-8 / ASCII this equals `str::chars().count()`; for a non-UTF-8 `%s` argument
+/// it counts leniently instead of going through a lossy decode.
+fn printf_char_count(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&b| (b & 0xc0) != 0x80).count()
+}
+
+/// Truncate `bytes` to at most `n` characters (lenient `SKIP_UTF8` units), for the
+/// precision of a `%s`/`%z` conversion over possibly-non-UTF-8 text.
+fn printf_truncate_chars(bytes: &[u8], n: usize) -> alloc::vec::Vec<u8> {
+    let mut count = 0;
+    let mut i = 0;
+    while i < bytes.len() && count < n {
+        i += 1;
+        while i < bytes.len() && (bytes[i] & 0xc0) == 0x80 {
+            i += 1;
+        }
+        count += 1;
+    }
+    bytes[..i].to_vec()
+}
+
 /// SQLite's `printf`/`format`, mirroring `sqlite3_str_vappendf`: the C
 /// conversions `%d %i %u %f %e %E %g %G %x %X %o %s %c %%` plus SQLite's
 /// extensions `%q %Q %w %z`, the flags `- + space 0 # ,` and `!`, numeric or
 /// `*` width and precision (including integer minimum-digit precision and the
 /// `#` alternate form).
+///
+/// The output is accumulated as bytes so a `%s`/`%z` argument whose text is not
+/// valid UTF-8 is emitted verbatim rather than through a lossy decode; every
+/// other conversion produces ASCII, so the valid-UTF-8 output is byte-identical.
 pub fn printf(args: &[Value]) -> Value {
     if args.is_empty() {
         return Value::Null;
@@ -1329,16 +1356,17 @@ pub fn printf(args: &[Value]) -> Value {
     let Value::Text(fmt) = &args[0] else {
         return Value::Null;
     };
-    let mut out = String::new();
+    let mut out: Vec<u8> = Vec::new();
     let mut arg_idx = 1usize;
     let bytes: Vec<char> = fmt.chars().collect();
     let mut i = 0;
     // Set on any width/precision overflow; SQLite returns the empty string.
     let mut too_big = false;
+    let mut cbuf = [0u8; 4];
     while i < bytes.len() {
         let c = bytes[i];
         if c != '%' {
-            out.push(c);
+            out.extend_from_slice(c.encode_utf8(&mut cbuf).as_bytes());
             i += 1;
             continue;
         }
@@ -1349,11 +1377,11 @@ pub fn printf(args: &[Value]) -> Value {
             // (`printf('%')` → "%", `printf('abc%')` → "abc%"). A `%` followed
             // by flags/width that then runs off the end (`%5`, `%-`) still
             // produces nothing, handled by the conversion path below.
-            out.push('%');
+            out.push(b'%');
             break;
         }
         if bytes[i] == '%' {
-            out.push('%');
+            out.push(b'%');
             i += 1;
             continue;
         }
@@ -1461,181 +1489,186 @@ pub fn printf(args: &[Value]) -> Value {
             conv,
             'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'f' | 'e' | 'E' | 'g' | 'G'
         );
-        let body = match conv {
-            'd' | 'i' => int_body(eval::to_int_value(&next(&mut arg_idx)), prec, plus, space),
-            'u' => int_unsigned(
-                eval::to_int_value(&next(&mut arg_idx)) as u64,
-                10,
-                false,
-                prec,
-                alt,
-            ),
-            'x' => int_unsigned(
-                eval::to_int_value(&next(&mut arg_idx)) as u64,
-                16,
-                false,
-                prec,
-                alt,
-            ),
-            'X' => int_unsigned(
-                eval::to_int_value(&next(&mut arg_idx)) as u64,
-                16,
-                true,
-                prec,
-                alt,
-            ),
-            'o' => int_unsigned(
-                eval::to_int_value(&next(&mut arg_idx)) as u64,
-                8,
-                false,
-                prec,
-                alt,
-            ),
-            'c' => {
-                // SQLite's %c emits the first character of the argument's text
-                // (e.g. 104 -> "104" -> '1'), not the code point. A NULL argument
-                // OR an empty-string argument yields a single NUL byte (matching
-                // SQLite's `et_charx`, whose `buf[0]` defaults to 0).
-                let v = next(&mut arg_idx);
-                let text = if matches!(v, Value::Null) {
-                    String::new()
-                } else {
-                    eval::to_text(&v)
-                };
-                let ch = text
-                    .chars()
-                    .next()
-                    .map(String::from)
-                    .unwrap_or_else(|| String::from('\0'));
-                // A precision repeats the character that many times (min once):
-                // `%.5c` of 'A' is "AAAAA", `%.0c` and a bare `%c` are one copy.
-                ch.repeat(prec.unwrap_or(1).max(1))
+        // The string conversions emit the argument's raw text bytes (verbatim for
+        // a non-UTF-8 value), truncated to `prec` characters; every other
+        // conversion produces ASCII, formatted as a `String` and turned to bytes.
+        let body: Vec<u8> = if matches!(conv, 's' | 'z') {
+            let v = next(&mut arg_idx);
+            let b = crate::exec::eval::text_bytes(&v);
+            match prec {
+                Some(pr) => printf_truncate_chars(&b, pr),
+                None => b,
             }
-            'f' => {
-                let f = eval::to_f64(&next(&mut arg_idx));
-                // SQLite renders a negative zero as positive (`%f` of -0.0 is
-                // `0.000000`, not `-0.000000`).
-                let f = if f == 0.0 { 0.0 } else { f };
-                if !f.is_finite() {
-                    nonfinite(f, plus, space)
-                } else if bang {
-                    // The `!` (alt-form-2) flag renders through the port of
-                    // SQLite's own `FpDecode` machinery (mxRound = 26), which
-                    // strips trailing zeros and honours `#` itself.
-                    let body = crate::util::fpdecode::format(
-                        f,
-                        prec.unwrap_or(6) as i32,
-                        crate::util::fpdecode::XType::Float,
-                        true,
-                        alt,
-                    );
-                    with_sign(body, plus, space)
-                } else {
-                    let p = prec.unwrap_or(6);
-                    let mut s = fixed(f, p, false);
-                    if alt && p == 0 && !s.contains('.') {
-                        s.push('.');
+        } else {
+            let s: String = match conv {
+                'd' | 'i' => int_body(eval::to_int_value(&next(&mut arg_idx)), prec, plus, space),
+                'u' => int_unsigned(
+                    eval::to_int_value(&next(&mut arg_idx)) as u64,
+                    10,
+                    false,
+                    prec,
+                    alt,
+                ),
+                'x' => int_unsigned(
+                    eval::to_int_value(&next(&mut arg_idx)) as u64,
+                    16,
+                    false,
+                    prec,
+                    alt,
+                ),
+                'X' => int_unsigned(
+                    eval::to_int_value(&next(&mut arg_idx)) as u64,
+                    16,
+                    true,
+                    prec,
+                    alt,
+                ),
+                'o' => int_unsigned(
+                    eval::to_int_value(&next(&mut arg_idx)) as u64,
+                    8,
+                    false,
+                    prec,
+                    alt,
+                ),
+                'c' => {
+                    // SQLite's %c emits the first character of the argument's text
+                    // (e.g. 104 -> "104" -> '1'), not the code point. A NULL argument
+                    // OR an empty-string argument yields a single NUL byte (matching
+                    // SQLite's `et_charx`, whose `buf[0]` defaults to 0).
+                    let v = next(&mut arg_idx);
+                    let text = if matches!(v, Value::Null) {
+                        String::new()
+                    } else {
+                        eval::to_text(&v)
+                    };
+                    let ch = text
+                        .chars()
+                        .next()
+                        .map(String::from)
+                        .unwrap_or_else(|| String::from('\0'));
+                    // A precision repeats the character that many times (min once):
+                    // `%.5c` of 'A' is "AAAAA", `%.0c` and a bare `%c` are one copy.
+                    ch.repeat(prec.unwrap_or(1).max(1))
+                }
+                'f' => {
+                    let f = eval::to_f64(&next(&mut arg_idx));
+                    // SQLite renders a negative zero as positive (`%f` of -0.0 is
+                    // `0.000000`, not `-0.000000`).
+                    let f = if f == 0.0 { 0.0 } else { f };
+                    if !f.is_finite() {
+                        nonfinite(f, plus, space)
+                    } else if bang {
+                        // The `!` (alt-form-2) flag renders through the port of
+                        // SQLite's own `FpDecode` machinery (mxRound = 26), which
+                        // strips trailing zeros and honours `#` itself.
+                        let body = crate::util::fpdecode::format(
+                            f,
+                            prec.unwrap_or(6) as i32,
+                            crate::util::fpdecode::XType::Float,
+                            true,
+                            alt,
+                        );
+                        with_sign(body, plus, space)
+                    } else {
+                        let p = prec.unwrap_or(6);
+                        let mut s = fixed(f, p, false);
+                        if alt && p == 0 && !s.contains('.') {
+                            s.push('.');
+                        }
+                        with_sign(s, plus, space)
                     }
-                    with_sign(s, plus, space)
                 }
-            }
-            'e' | 'E' => {
-                let f = eval::to_f64(&next(&mut arg_idx));
-                let f = if f == 0.0 { 0.0 } else { f };
-                if !f.is_finite() {
-                    nonfinite(f, plus, space)
-                } else if bang {
-                    let mut body = crate::util::fpdecode::format(
-                        f,
-                        prec.unwrap_or(6) as i32,
-                        crate::util::fpdecode::XType::Exp,
-                        true,
-                        alt,
-                    );
-                    if conv == 'E' {
-                        body = body.replace('e', "E");
+                'e' | 'E' => {
+                    let f = eval::to_f64(&next(&mut arg_idx));
+                    let f = if f == 0.0 { 0.0 } else { f };
+                    if !f.is_finite() {
+                        nonfinite(f, plus, space)
+                    } else if bang {
+                        let mut body = crate::util::fpdecode::format(
+                            f,
+                            prec.unwrap_or(6) as i32,
+                            crate::util::fpdecode::XType::Exp,
+                            true,
+                            alt,
+                        );
+                        if conv == 'E' {
+                            body = body.replace('e', "E");
+                        }
+                        with_sign(body, plus, space)
+                    } else {
+                        let mut s = fmt_exp(f, prec.unwrap_or(6), conv == 'E', false);
+                        // The `#` alt flag forces a decimal point even at precision 0
+                        // (`%#.0e` of 42 is "4.e+01"); `fmt_exp` omits it there.
+                        if alt
+                            && prec == Some(0)
+                            && !s.contains('.')
+                            && let Some(epos) = s.find(['e', 'E'])
+                        {
+                            s.insert(epos, '.');
+                        }
+                        with_sign(s, plus, space)
                     }
-                    with_sign(body, plus, space)
-                } else {
-                    let mut s = fmt_exp(f, prec.unwrap_or(6), conv == 'E', false);
-                    // The `#` alt flag forces a decimal point even at precision 0
-                    // (`%#.0e` of 42 is "4.e+01"); `fmt_exp` omits it there.
-                    if alt
-                        && prec == Some(0)
-                        && !s.contains('.')
-                        && let Some(epos) = s.find(['e', 'E'])
-                    {
-                        s.insert(epos, '.');
+                }
+                'g' | 'G' => {
+                    let f = eval::to_f64(&next(&mut arg_idx));
+                    if !f.is_finite() {
+                        nonfinite(f, plus, space)
+                    } else if bang {
+                        let mut body = crate::util::fpdecode::format(
+                            f,
+                            prec.unwrap_or(6) as i32,
+                            crate::util::fpdecode::XType::Generic,
+                            true,
+                            alt,
+                        );
+                        if conv == 'G' {
+                            body = body.replace('e', "E");
+                        }
+                        with_sign(body, plus, space)
+                    } else {
+                        with_sign(
+                            fmt_general(f, prec.unwrap_or(6), conv == 'G', alt, false),
+                            plus,
+                            space,
+                        )
                     }
-                    with_sign(s, plus, space)
                 }
-            }
-            'g' | 'G' => {
-                let f = eval::to_f64(&next(&mut arg_idx));
-                if !f.is_finite() {
-                    nonfinite(f, plus, space)
-                } else if bang {
-                    let mut body = crate::util::fpdecode::format(
-                        f,
-                        prec.unwrap_or(6) as i32,
-                        crate::util::fpdecode::XType::Generic,
-                        true,
-                        alt,
-                    );
-                    if conv == 'G' {
-                        body = body.replace('e', "E");
+                'q' => {
+                    // The precision limits the number of *input* characters consumed
+                    // (escaping is applied afterward, so each `'` still doubles), not
+                    // the escaped-output length: `%.3q` of `a'bc` is `a''b`.
+                    let v = next(&mut arg_idx);
+                    match v {
+                        Value::Null => String::from("(NULL)"),
+                        other => trunc_chars(eval::to_text(&other), prec).replace('\'', "''"),
                     }
-                    with_sign(body, plus, space)
-                } else {
-                    with_sign(
-                        fmt_general(f, prec.unwrap_or(6), conv == 'G', alt, false),
-                        plus,
-                        space,
-                    )
                 }
-            }
-            's' | 'z' => {
-                let v = next(&mut arg_idx);
-                let mut s = eval::to_text(&v);
-                if let Some(pr) = prec {
-                    s = s.chars().take(pr).collect();
+                'Q' => {
+                    // Like `%q`, precision limits input chars; the surrounding quotes
+                    // are always added and never counted (`%.0Q` of `hi` is `''`).
+                    let v = next(&mut arg_idx);
+                    match v {
+                        Value::Null => String::from("NULL"),
+                        other => alloc::format!(
+                            "'{}'",
+                            trunc_chars(eval::to_text(&other), prec).replace('\'', "''")
+                        ),
+                    }
                 }
-                s
-            }
-            'q' => {
-                // The precision limits the number of *input* characters consumed
-                // (escaping is applied afterward, so each `'` still doubles), not
-                // the escaped-output length: `%.3q` of `a'bc` is `a''b`.
-                let v = next(&mut arg_idx);
-                match v {
-                    Value::Null => String::from("(NULL)"),
-                    other => trunc_chars(eval::to_text(&other), prec).replace('\'', "''"),
+                'w' => {
+                    let v = next(&mut arg_idx);
+                    match v {
+                        Value::Null => String::from("(NULL)"),
+                        other => trunc_chars(eval::to_text(&other), prec).replace('"', "\"\""),
+                    }
                 }
-            }
-            'Q' => {
-                // Like `%q`, precision limits input chars; the surrounding quotes
-                // are always added and never counted (`%.0Q` of `hi` is `''`).
-                let v = next(&mut arg_idx);
-                match v {
-                    Value::Null => String::from("NULL"),
-                    other => alloc::format!(
-                        "'{}'",
-                        trunc_chars(eval::to_text(&other), prec).replace('\'', "''")
-                    ),
+                _ => {
+                    // Unknown conversion (e.g. `%y`): SQLite discards the directive
+                    // and stops formatting the rest of the string.
+                    break;
                 }
-            }
-            'w' => {
-                let v = next(&mut arg_idx);
-                match v {
-                    Value::Null => String::from("(NULL)"),
-                    other => trunc_chars(eval::to_text(&other), prec).replace('"', "\"\""),
-                }
-            }
-            _ => {
-                // Unknown conversion (e.g. `%y`): SQLite discards the directive
-                // and stops formatting the rest of the string.
-                break;
-            }
+            };
+            s.into_bytes()
         };
         // SQLite still honours the `0` flag for integers when a precision is
         // given (unlike C): `%05.3d` of 7 is `00007` — precision sets the minimum
@@ -1646,18 +1679,19 @@ pub fn printf(args: &[Value]) -> Value {
         // grouping is applied *after* the zero-fill to the field width (so the
         // commas fall between the pad zeros and the result may exceed `width`);
         // otherwise it groups first and then space-pads.
-        let body = if grouped && zero_pad && width > body.chars().count() {
-            // Zero-pad the magnitude (after any sign) up to the field width,
-            // then group the whole run.
-            let (sign, mag) = match body.strip_prefix(['+', '-', ' ']) {
-                Some(r) => (&body[..1], r),
-                None => ("", body.as_str()),
+        let body: Vec<u8> = if grouped && zero_pad && width > printf_char_count(&body) {
+            // Zero-pad the magnitude (after any sign) up to the field width, then
+            // group. `grouped` implies a numeric (ASCII) body, so read it as str.
+            let bs = core::str::from_utf8(&body).unwrap_or("");
+            let (sign, mag) = match bs.strip_prefix(['+', '-', ' ']) {
+                Some(r) => (&bs[..1], r),
+                None => ("", bs),
             };
-            let pad = width - body.chars().count();
+            let pad = width - printf_char_count(&body);
             let padded = alloc::format!("{sign}{}{mag}", "0".repeat(pad));
-            group_thousands(&padded)
+            group_thousands(&padded).into_bytes()
         } else if grouped {
-            group_thousands(&body)
+            group_thousands(core::str::from_utf8(&body).unwrap_or("")).into_bytes()
         } else {
             body
         };
@@ -1674,15 +1708,15 @@ pub fn printf(args: &[Value]) -> Value {
         // toward the field width (matching C/SQLite).
         let alt_prefix_len = if alt && zero_pad {
             match conv {
-                'x' | 'X' if body.starts_with("0x") || body.starts_with("0X") => 2,
-                'o' if body.starts_with('0') => 1,
+                'x' | 'X' if body.starts_with(b"0x") || body.starts_with(b"0X") => 2,
+                'o' if body.first() == Some(&b'0') => 1,
                 _ => 0,
             }
         } else {
             0
         };
         // apply width/justification
-        let len = body.chars().count();
+        let len = printf_char_count(&body);
         // Zero-pad reaches `width` digits *after* the alt prefix; space-pad
         // counts the whole body.
         let effective = if zero_wins { len - alt_prefix_len } else { len };
@@ -1693,33 +1727,28 @@ pub fn printf(args: &[Value]) -> Value {
             }
             let pad = width - effective;
             if zero_wins {
-                // zero-pad after any sign and the alternate-form prefix.
-                let rest = body.as_str();
-                let (sign, rest) = if let Some(r) = rest.strip_prefix(['-', '+', ' ']) {
-                    (&body[..1], r)
-                } else {
-                    ("", rest)
-                };
+                // zero-pad after any sign and the alternate-form prefix (numeric,
+                // so ASCII bytes).
+                let (sign, rest): (&[u8], &[u8]) =
+                    if matches!(body.first().copied(), Some(b'-' | b'+' | b' ')) {
+                        (&body[..1], &body[1..])
+                    } else {
+                        (&[], &body[..])
+                    };
                 let (prefix, rest) = rest.split_at(alt_prefix_len.min(rest.len()));
-                out.push_str(sign);
-                out.push_str(prefix);
-                for _ in 0..pad {
-                    out.push('0');
-                }
-                out.push_str(rest);
+                out.extend_from_slice(sign);
+                out.extend_from_slice(prefix);
+                out.resize(out.len() + pad, b'0');
+                out.extend_from_slice(rest);
             } else if left {
-                out.push_str(&body);
-                for _ in 0..pad {
-                    out.push(' ');
-                }
+                out.extend_from_slice(&body);
+                out.resize(out.len() + pad, b' ');
             } else {
-                for _ in 0..pad {
-                    out.push(' ');
-                }
-                out.push_str(&body);
+                out.resize(out.len() + pad, b' ');
+                out.extend_from_slice(&body);
             }
         } else {
-            out.push_str(&body);
+            out.extend_from_slice(&body);
         }
         if out.len() >= PRINTF_LIMIT {
             too_big = true;
@@ -1727,9 +1756,9 @@ pub fn printf(args: &[Value]) -> Value {
         }
     }
     if too_big {
-        return Value::Text(String::new().into());
+        return Value::Text(crate::value::Text::from_bytes(Vec::new()));
     }
-    Value::Text(out.into())
+    Value::Text(crate::value::Text::from_bytes(out))
 }
 
 /// Fixed-point (`%f`) rendering of a finite `f` with `p` fractional digits,

@@ -180,4 +180,22 @@ fn char_semantic_functions_on_non_utf8_match_sqlite3() {
             "SELECT concat_ws('-', 'a', NULL, 'c')", // valid: a-c
         ],
     );
+
+    // ---- printf()/format() %s: the argument's raw text bytes are emitted
+    // verbatim (a non-UTF-8 %s no longer collapses through a lossy decode).
+    // Cases use single-byte "characters" (each invalid byte is one lenient unit),
+    // so byte and character counts coincide and the assertions don't depend on
+    // whether SQLite's %s width/precision counts bytes or characters. Numeric
+    // conversions (ASCII) are unaffected, so valid output stays byte-identical.
+    assert_matches(
+        &mut g,
+        &[
+            "SELECT hex(printf('%s', x'ff' || 'a' || x'fe'))", // FF61FE
+            "SELECT hex(printf('%.2s', x'ff' || x'fe' || x'fd'))", // FFFE (2 units)
+            "SELECT hex(printf('[%4s]', x'ff' || 'a'))",       // 2020FF61 padded
+            "SELECT hex(printf('[%-4s]', x'ff' || 'a'))",      // FF612020 left
+            "SELECT printf('%s', 'héllo'), printf('%s|%s', 'a', 'b')", // valid
+            "SELECT printf('%d %05d %+d %#x', 42, 7, 3, 255)", // numeric unaffected
+        ],
+    );
 }
