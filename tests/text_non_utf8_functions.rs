@@ -147,4 +147,25 @@ fn char_semantic_functions_on_non_utf8_match_sqlite3() {
             "SELECT upper('abc'), lower('ABC')",         // ASCII unchanged
         ],
     );
+
+    // ---- replace()/instr()/trim() on non-UTF-8 text (byte-wise / char-index /
+    // char-set — none case-fold, so oracle-independent). replace works on raw
+    // bytes (a blob pattern matches by its bytes); instr is a 1-based char offset
+    // for text but a byte offset when both args are blobs; trim removes whole
+    // lenient-UTF-8 units found in the trim set.
+    assert_matches(
+        &mut g,
+        &[
+            "SELECT hex(replace(x'ff' || x'fe' || x'ff', x'fe', x'00'))", // FF00FF
+            "SELECT hex(replace(x'ff' || 'ab' || x'ff', 'ab', 'X'))",     // FF58FF
+            "SELECT replace('hello', 'l', 'L'), replace('aaa', 'a', 'bb')", // valid
+            "SELECT instr(x'ff' || x'fe' || x'fd', x'fd')",               // 3 (char offset)
+            "SELECT instr(x'ff' || 'x', 'x')",                            // 2 (char offset)
+            "SELECT instr(x'0102', x'02')",                               // 2 (both blob: byte)
+            "SELECT instr('héllo', 'llo'), instr('abc', '')",             // valid: 3, 1
+            "SELECT hex(trim(x'ff' || '  '))",                            // FF (trailing spaces)
+            "SELECT hex(ltrim(x'ff' || x'fe', x'ff'))",                   // FE (leading FF)
+            "SELECT trim('  hi  '), trim('xxhixx', 'x')",                 // valid: hi, hi
+        ],
+    );
 }

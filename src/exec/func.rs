@@ -1760,27 +1760,39 @@ fn trim_fn(v: &[Value], left: bool, right: bool) -> Value {
     if v.len() >= 2 && matches!(v[1], Value::Null) {
         return Value::Null;
     }
-    let s = c_text(&v[0]);
-    let trim_chars: Vec<char> = if v.len() >= 2 {
-        c_text(&v[1]).chars().collect()
+    // SQLite trims whole *characters* found in the trim set (default: a single
+    // space) from each end. Work over raw bytes split into lenient `SKIP_UTF8`
+    // character units, so a non-UTF-8 subject/trim-set is exact (byte-identical to
+    // the old char path for valid UTF-8) rather than collapsing through a lossy
+    // decode. A unit is trimmed when it byte-equals a unit of the trim set.
+    let s = eval::text_bytes(&v[0]);
+    let set = if v.len() >= 2 {
+        eval::text_bytes(&v[1])
     } else {
-        alloc::vec![' ']
+        alloc::vec![b' ']
     };
-    let is_trim = |c: char| trim_chars.contains(&c);
-    let chars: Vec<char> = s.chars().collect();
+    let s_bounds = utf8_unit_boundaries(&s);
+    let set_bounds = utf8_unit_boundaries(&set);
+    let set_units: Vec<&[u8]> = (0..set_bounds.len() - 1)
+        .map(|k| &set[set_bounds[k]..set_bounds[k + 1]])
+        .collect();
+    let is_trim = |unit: &[u8]| set_units.contains(&unit);
+    let n = s_bounds.len() - 1;
     let mut start = 0;
-    let mut end = chars.len();
+    let mut end = n;
     if left {
-        while start < end && is_trim(chars[start]) {
+        while start < end && is_trim(&s[s_bounds[start]..s_bounds[start + 1]]) {
             start += 1;
         }
     }
     if right {
-        while end > start && is_trim(chars[end - 1]) {
+        while end > start && is_trim(&s[s_bounds[end - 1]..s_bounds[end]]) {
             end -= 1;
         }
     }
-    Value::Text(chars[start..end].iter().collect::<String>().into())
+    Value::Text(crate::value::Text::from_bytes(
+        s[s_bounds[start]..s_bounds[end]].to_vec(),
+    ))
 }
 
 /// Decode the first UTF-8 character of `bytes` to its codepoint — a faithful port
@@ -1930,16 +1942,34 @@ fn instr(v: &[Value]) -> Result<Value> {
     if matches!(v[0], Value::Null) || matches!(v[1], Value::Null) {
         return Ok(Value::Null);
     }
-    let hay = eval::to_text(&v[0]);
-    let needle = eval::to_text(&v[1]);
-    // SQLite returns a 1-based character index, 0 if not found.
-    match hay.find(&needle) {
-        None => Ok(Value::Integer(0)),
-        Some(byte_idx) => {
-            let char_idx = hay[..byte_idx].chars().count();
-            Ok(Value::Integer(char_idx as i64 + 1))
+    // Faithful port of SQLite's `instrFunc`. When BOTH arguments are blobs the
+    // result is a 1-based BYTE offset; otherwise a 1-based CHARACTER offset into
+    // the text form (0 when not found). The search advances the haystack one unit
+    // at a time — a whole UTF-8 character for text (lenient `SKIP_UTF8` stepping,
+    // so a non-UTF-8 operand is exact and a needle can only match on a character
+    // boundary), a single byte for the both-blob case — and `memcmp`s at each
+    // position, counting units advanced.
+    let both_blob = matches!(v[0], Value::Blob(_)) && matches!(v[1], Value::Blob(_));
+    let hay = eval::text_bytes(&v[0]);
+    let needle = eval::text_bytes(&v[1]);
+    let mut n: i64 = 0;
+    let mut off = 0usize;
+    let found = loop {
+        if off + needle.len() <= hay.len() && hay[off..off + needle.len()] == needle[..] {
+            break true;
         }
-    }
+        if off >= hay.len() {
+            break false;
+        }
+        off += 1;
+        if !both_blob {
+            while off < hay.len() && (hay[off] & 0xc0) == 0x80 {
+                off += 1;
+            }
+        }
+        n += 1;
+    };
+    Ok(Value::Integer(if found { n + 1 } else { 0 }))
 }
 
 fn replace(v: &[Value]) -> Result<Value> {
@@ -1953,16 +1983,31 @@ fn replace(v: &[Value]) -> Result<Value> {
     if matches!(v[0], Value::Null) || matches!(v[1], Value::Null) {
         return Ok(Value::Null);
     }
-    let s = c_text(&v[0]);
-    let from = c_text(&v[1]);
+    // SQLite's `replace` works on the raw `value_text` bytes of each argument (a
+    // byte-wise substring replace) and always returns text, so operate on bytes —
+    // keeping a non-UTF-8 subject/pattern/replacement exact instead of collapsing
+    // through a lossy decode.
+    let s = eval::text_bytes(&v[0]);
+    let from = eval::text_bytes(&v[1]);
     if from.is_empty() {
-        return Ok(Value::Text(s.into()));
+        return Ok(Value::Text(crate::value::Text::from_bytes(s)));
     }
     if matches!(v[2], Value::Null) {
         return Ok(Value::Null);
     }
-    let to = c_text(&v[2]);
-    Ok(Value::Text(s.replace(&from, &to).into()))
+    let to = eval::text_bytes(&v[2]);
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if s[i..].starts_with(&from[..]) {
+            out.extend_from_slice(&to);
+            i += from.len();
+        } else {
+            out.push(s[i]);
+            i += 1;
+        }
+    }
+    Ok(Value::Text(crate::value::Text::from_bytes(out)))
 }
 
 fn round(v: &[Value]) -> Result<Value> {

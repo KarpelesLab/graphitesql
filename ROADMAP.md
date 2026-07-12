@@ -866,12 +866,15 @@ peripheral — the SQL engine, not the shell, is the project's purpose):**
   `sqlite3Utf8Read`), `substr` (slices on lenient `SKIP_UTF8` unit boundaries),
   `quote` (renders the literal over the raw bytes), `char` (ports `charFunc`'s
   encoder, so a surrogate arg yields raw WTF-8 like `char(0xD800)` = `ED A0 80`),
-  and `upper`/`lower` (fold ASCII letters byte-wise, preserving the invalid bytes
-  — Unicode folding is undefined over invalid bytes, so both feature modes match
-  stock sqlite there) all match SQLite instead of collapsing through a lossy
-  decode. Residual: `replace` / `instr` / `trim`-family on a *non-UTF-8* text
-  still route through lossy text (byte-wise substring / char-index / char-set
-  trimming over such input is deferred). Tests: `tests/text_non_utf8.rs`,
+  `upper`/`lower` (fold ASCII letters byte-wise, preserving the invalid bytes —
+  Unicode folding is undefined over invalid bytes, so both feature modes match
+  stock sqlite there), `replace` (byte-wise substring replace over raw
+  `value_text` bytes — a blob pattern matches by its bytes), `instr` (ports
+  `instrFunc`: a 1-based char offset for text advancing one `SKIP_UTF8` unit at a
+  time, a byte offset when both args are blobs), and `trim`/`ltrim`/`rtrim` (trim
+  whole lenient-UTF-8 units found in the set) all match SQLite instead of
+  collapsing through a lossy decode. No known residual. Tests:
+  `tests/text_non_utf8.rs`,
   `tests/text_non_utf8_functions.rs` (differential).
 - **Parser** stays hand-written (no build-time codegen, friendlier errors);
   `parse.y` remains the source of truth for precedence and accepted forms.

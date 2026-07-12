@@ -2068,7 +2068,7 @@ pub fn avg_value(vals: &[Value]) -> Option<f64> {
 /// contributes its bytes verbatim (no UTF-8 coercion); every other class
 /// contributes the bytes of its [`to_text`] form. Unlike `to_text(..).into_bytes()`
 /// this never mangles a non-UTF-8 blob through lossy decoding.
-fn text_bytes(v: &Value) -> Vec<u8> {
+pub(crate) fn text_bytes(v: &Value) -> Vec<u8> {
     match v {
         Value::Blob(b) => b.clone(),
         // A text value contributes its raw bytes verbatim (which may be non-UTF-8).
