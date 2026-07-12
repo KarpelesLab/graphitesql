@@ -115,4 +115,17 @@ fn char_semantic_functions_on_non_utf8_match_sqlite3() {
             "SELECT quote('A' || char(0) || 'B')",    // NUL truncates -> 'A'
         ],
     );
+
+    // ---- char(): a surrogate / out-of-range code point encodes to raw WTF-8 /
+    // U+FFFD exactly like SQLite's charFunc (checked as hex). Valid code points,
+    // including a 4-byte astral char, are unchanged.
+    assert_matches(
+        &mut g,
+        &[
+            "SELECT hex(char(0xD800)), hex(char(0xDFFF))", // ED A0 80 / ED BF BF
+            "SELECT hex(char(-1)), hex(char(0x110000))",   // out of range -> U+FFFD
+            "SELECT char(65, 66, 67)",                     // ABC
+            "SELECT hex(char(233)), hex(char(0x4E2D)), hex(char(0x1F600))",
+        ],
+    );
 }

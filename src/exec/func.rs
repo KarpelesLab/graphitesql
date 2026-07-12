@@ -2074,20 +2074,35 @@ fn nibble(n: u8) -> char {
 }
 
 fn char_fn(v: &[Value]) -> Value {
-    let mut s = String::new();
+    // Faithful port of SQLite's `charFunc` (src/func.c): each argument is a code
+    // point; an out-of-range value (negative or > U+10FFFF) becomes U+FFFD, then
+    // the low 21 bits are UTF-8-encoded *without* the surrogate check the Rust
+    // `char` type enforces — so `char(0xD800)` yields the raw 3-byte encoding
+    // `ED A0 80` exactly like SQLite, which the byte-backed TEXT can now hold.
+    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     for x in v {
-        // SQLite's `charFunc` reads each argument as a code point and substitutes
-        // U+FFFD for an out-of-range value (negative or > U+10FFFF) rather than
-        // dropping the character. Surrogates (U+D800..=U+DFFF) cannot be held in
-        // Rust's UTF-8 `String`, so they too fall back to U+FFFD (SQLite emits
-        // their raw 3-byte encoding — a faithful match would need invalid UTF-8,
-        // which this engine's TEXT representation forbids).
         let cp = eval::to_int_value(x);
-        let c = u32::try_from(cp)
-            .ok()
-            .and_then(char::from_u32)
-            .unwrap_or('\u{FFFD}');
-        s.push(c);
+        let cp = if (0..=0x10_ffff).contains(&cp) {
+            cp
+        } else {
+            0xfffd
+        };
+        let c = (cp as u32) & 0x1f_ffff;
+        if c < 0x80 {
+            out.push(c as u8);
+        } else if c < 0x800 {
+            out.push(0xc0 + ((c >> 6) & 0x1f) as u8);
+            out.push(0x80 + (c & 0x3f) as u8);
+        } else if c < 0x1_0000 {
+            out.push(0xe0 + ((c >> 12) & 0x0f) as u8);
+            out.push(0x80 + ((c >> 6) & 0x3f) as u8);
+            out.push(0x80 + (c & 0x3f) as u8);
+        } else {
+            out.push(0xf0 + ((c >> 18) & 0x07) as u8);
+            out.push(0x80 + ((c >> 12) & 0x3f) as u8);
+            out.push(0x80 + ((c >> 6) & 0x3f) as u8);
+            out.push(0x80 + (c & 0x3f) as u8);
+        }
     }
-    Value::Text(s.into())
+    Value::Text(crate::value::Text::from_bytes(out))
 }

@@ -863,10 +863,10 @@ peripheral — the SQL engine, not the shell, is the project's purpose):**
   blob, `||`, and the VDBE `Op::Func` literal round-trip) use `as_bytes()`. The
   char-semantic functions on a *non-UTF-8* text are byte-aware too — `length`
   (port of `lengthFunc`), `unicode` (port of `sqlite3Utf8Read`), `substr` (slices
-  on lenient `SKIP_UTF8` unit boundaries), and `quote` (renders the literal over
-  the raw bytes) all match SQLite instead of collapsing through a lossy decode.
-  Residual: `char()` with a surrogate / out-of-range code point still yields
-  U+FFFD rather than SQLite's raw WTF-8 bytes — a further-niche edge. Tests:
+  on lenient `SKIP_UTF8` unit boundaries), `quote` (renders the literal over the
+  raw bytes), and `char` (ports `charFunc`'s encoder, so a surrogate arg yields
+  raw WTF-8 like `char(0xD800)` = `ED A0 80`) all match SQLite instead of
+  collapsing through a lossy decode. No known residual. Tests:
   `tests/text_non_utf8.rs`, `tests/text_non_utf8_functions.rs` (differential).
 - **Parser** stays hand-written (no build-time codegen, friendlier errors);
   `parse.y` remains the source of truth for precedence and accepted forms.
