@@ -3586,11 +3586,6 @@ impl Connection {
             Ok(m) => m,
             Err(_) => return Ok(None),
         };
-        // A `WITHOUT ROWID` table has no rowid b-tree cursor of this shape; the
-        // materialized path handles it (and its `rowid` references defer further).
-        if meta.without_rowid {
-            return Ok(None);
-        }
         // The same per-column metadata `scan_one` derives for a base table.
         let col_names: Vec<String> = meta.columns.iter().map(|c| c.name.clone()).collect();
         let qualifier = tr.alias.clone().unwrap_or_else(|| tr.name.clone());
@@ -3599,8 +3594,12 @@ impl Connection {
         let col_coll: Vec<crate::value::Collation> =
             meta.columns.iter().map(|c| c.collation).collect();
         // A rowid table carries a hidden trailing rowid so `rowid`/`_rowid_`/`oid`
-        // resolves (compiled into the program via `has_rowid`).
-        let has_rowid = true;
+        // resolves (compiled into the program via `has_rowid`). A `WITHOUT ROWID`
+        // table has none — so `has_rowid` is false and any `rowid` reference makes
+        // `compile_table_select` bail (falling back to the materialized path, which
+        // errors identically); its rows are streamed in primary-key (b-tree) order,
+        // the same order the materialized scan and SQLite produce.
+        let has_rowid = !meta.without_rowid;
         // A `t.*` projection is only handled when its qualifier names this table;
         // any other qualifier defers so the tree-walker can resolve or reject it.
         for rc in &sel.columns {
@@ -3641,8 +3640,17 @@ impl Connection {
             columns: &meta.columns,
             rowid_index: has_rowid.then_some(meta.columns.len()),
         };
-        let mut src = LiveScanCursor::new(self, &meta, has_rowid);
-        let rows = vdbe::run_live_scan_with_subqueries(&prog, &mut src, &eval)?;
+        // A rowid table streams from a `TableCursor` (rowid b-tree); a WITHOUT
+        // ROWID table streams from an `IndexCursor` over its index-organized b-tree
+        // (primary-key order). Both implement `Cursor0Source`, so the same program
+        // and subquery callback run over either.
+        let rows = if meta.without_rowid {
+            let mut src = WithoutRowidLiveCursor::new(self, &meta);
+            vdbe::run_live_scan_with_subqueries(&prog, &mut src, &eval)?
+        } else {
+            let mut src = LiveScanCursor::new(self, &meta, has_rowid);
+            vdbe::run_live_scan_with_subqueries(&prog, &mut src, &eval)?
+        };
         Ok(Some(QueryResult {
             columns: prog.columns,
             rows,
@@ -36550,6 +36558,79 @@ impl vdbe::Cursor0Source for LiveScanCursor<'_> {
         } else {
             self.current = Vec::new();
             Ok(false)
+        }
+    }
+    fn column(&self, col: usize) -> Value {
+        self.current.get(col).cloned().unwrap_or(Value::Null)
+    }
+}
+
+/// A [`vdbe::Cursor0Source`] streaming a `WITHOUT ROWID` table's rows one at a
+/// time from its index-organized b-tree (primary-key order), the live-scan analog
+/// of [`Connection::scan_without_rowid`]'s materialized read (B5b-2). Each row is
+/// decoded, un-permuted back to declared column order, and has its generated
+/// columns computed — identical to the materialized path, so the streamed result
+/// (and its order) matches the tree-walker and SQLite. There is no hidden rowid
+/// slot: a `WITHOUT ROWID` table exposes no `rowid` (a reference to one makes the
+/// compiler bail to the materialized path, which errors the same way).
+struct WithoutRowidLiveCursor<'a> {
+    conn: &'a Connection,
+    meta: &'a TableMeta,
+    encoding: crate::format::TextEncoding,
+    cur: IndexCursor<'a>,
+    /// The current decoded row (empty before the first `Rewind` or past EOF).
+    current: Vec<Value>,
+}
+
+impl<'a> WithoutRowidLiveCursor<'a> {
+    fn new(conn: &'a Connection, meta: &'a TableMeta) -> WithoutRowidLiveCursor<'a> {
+        let encoding = conn.backend.source().header().text_encoding;
+        WithoutRowidLiveCursor {
+            conn,
+            meta,
+            encoding,
+            cur: IndexCursor::new(conn.backend.source(), meta.root),
+            current: Vec::new(),
+        }
+    }
+
+    /// Decode the record `payload` into the current row (un-permuted to declared
+    /// column order, with generated columns computed).
+    fn load(&mut self, payload: &[u8]) -> Result<()> {
+        let storage = decode_record(payload, self.encoding)?;
+        let mut row = unpermute_row(self.meta, storage);
+        self.conn
+            .compute_generated(self.meta, &mut row, &Params::default())?;
+        self.current = row;
+        Ok(())
+    }
+}
+
+impl vdbe::Cursor0Source for WithoutRowidLiveCursor<'_> {
+    fn rewind(&mut self) -> Result<bool> {
+        // The `IndexCursor` starts before the first entry, so the first `next`
+        // positions at (and yields) the first row.
+        match self.cur.next()? {
+            Some(payload) => {
+                self.load(&payload)?;
+                Ok(true)
+            }
+            None => {
+                self.current = Vec::new();
+                Ok(false)
+            }
+        }
+    }
+    fn advance(&mut self) -> Result<bool> {
+        match self.cur.next()? {
+            Some(payload) => {
+                self.load(&payload)?;
+                Ok(true)
+            }
+            None => {
+                self.current = Vec::new();
+                Ok(false)
+            }
         }
     }
     fn column(&self, col: usize) -> Value {

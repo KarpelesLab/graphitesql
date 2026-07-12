@@ -369,7 +369,13 @@ result or declines to it — never a wrong answer), so this track is
   VDBE now streams rows from a live `TableCursor` in the interpreter via a
   `Cursor0Source` trait (`rewind`/`advance`/`column`) instead of materializing —
   additive, result-identical to the tree-walker + sqlite, falls back for
-  WITHOUT ROWID / subquery / view / join / hinted sources. Remaining: the
+  subquery / view / join / hinted sources. *WITHOUT ROWID live scan done
+  (2026-07-13):* a `WITHOUT ROWID` single-table `SELECT` now streams from a
+  `WithoutRowidLiveCursor` over the index-organized b-tree (primary-key order)
+  instead of materializing the whole table — the same compiled program and B5c-2
+  correlated-subquery callback run over it (`has_rowid=false`, so a `rowid`
+  reference bails to the materialized path, erroring identically); row order and
+  values match sqlite (`tests/vdbe_without_rowid_scan.rs`). Remaining: the
   in-*interpreter* `OpenRead`/`SeekRowid` opcodes over B5b-1's multi-cursor
   foundation (move the *seek* into bytecode — an internal refactor, no behavior
   change); and seek by a **secondary index** / `WITHOUT ROWID` PK, which is
