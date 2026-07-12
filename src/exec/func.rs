@@ -423,6 +423,14 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             // (`CAFÉ` → `café`), like a sqlite3 built with the ICU extension.
             // `str::to_lowercase` provides it in core+alloc, so no dependency is
             // needed. Default (feature off) stays byte-for-byte stock-sqlite3.
+            // A *non-UTF-8* text always folds byte-wise ASCII (its invalid bytes
+            // preserved) — Unicode case-folding is undefined over invalid bytes, so
+            // both feature modes match stock sqlite's byte-wise `tolower` there.
+            if let Value::Text(s) = &v[0]
+                && core::str::from_utf8(s.as_bytes()).is_err()
+            {
+                return Ok(byte_map_text(&v[0], u8::to_ascii_lowercase));
+            }
             #[cfg(feature = "unicode")]
             {
                 str_map(&v[0], |s| s.to_lowercase())
@@ -434,6 +442,11 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         "upper" => {
             arity(&lname, args, 1)?;
+            if let Value::Text(s) = &v[0]
+                && core::str::from_utf8(s.as_bytes()).is_err()
+            {
+                return Ok(byte_map_text(&v[0], u8::to_ascii_uppercase));
+            }
             #[cfg(feature = "unicode")]
             {
                 str_map(&v[0], |s| s.to_uppercase())
@@ -1504,6 +1517,19 @@ fn str_map(v: &Value, f: impl Fn(&str) -> String) -> Value {
     match v {
         Value::Null => Value::Null,
         other => Value::Text(f(&c_text(other)).into()),
+    }
+}
+
+/// Map a non-UTF-8 text value byte-by-byte (used by `upper`/`lower` for the
+/// invalid-UTF-8 case, which SQLite folds with a byte-wise `toupper`/`tolower`).
+/// The raw bytes are transformed in place so the invalid bytes are preserved and
+/// only ASCII letters fold, instead of collapsing through a lossy decode.
+fn byte_map_text(v: &Value, f: impl Fn(&u8) -> u8) -> Value {
+    match v {
+        Value::Text(s) => Value::Text(crate::value::Text::from_bytes(
+            s.as_bytes().iter().map(f).collect(),
+        )),
+        _ => v.clone(),
     }
 }
 

@@ -132,4 +132,19 @@ fn char_semantic_functions_on_non_utf8_match_sqlite3() {
             "SELECT hex(char(233)), hex(char(0x4E2D)), hex(char(0x1F600))",
         ],
     );
+
+    // ---- upper()/lower() on a *non-UTF-8* text: fold ASCII letters byte-wise and
+    // preserve the invalid bytes (SQLite's byte-wise toupper/tolower). Only the
+    // non-UTF-8 path is asserted — it is byte-wise in both an ASCII-only and an
+    // ICU sqlite build (Unicode folding is undefined over invalid bytes), so this
+    // is oracle-independent, unlike *valid* non-ASCII folding (café → CAFÉ/CAFé).
+    assert_matches(
+        &mut g,
+        &[
+            "SELECT hex(upper(x'ff' || 'a' || x'fe'))",  // FF41FE
+            "SELECT hex(lower(x'ff' || 'A' || x'fe'))",  // FF61FE
+            "SELECT hex(upper(x'ff' || 'hi' || x'00'))", // FF4849 00 kept
+            "SELECT upper('abc'), lower('ABC')",         // ASCII unchanged
+        ],
+    );
 }
