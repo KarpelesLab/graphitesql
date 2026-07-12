@@ -1506,9 +1506,9 @@ pub fn printf(args: &[Value]) -> Value {
         // The string conversions emit the argument's raw text bytes (verbatim for
         // a non-UTF-8 value): %s/%z as-is, %q/%Q/%w SQL-escaped by doubling the
         // relevant quote byte over the raw bytes (SQLite's byte-oriented
-        // et_SQLESCAPE). Every other conversion produces ASCII, formatted as a
-        // `String` and turned to bytes.
-        let body: Vec<u8> = if matches!(conv, 's' | 'z' | 'q' | 'Q' | 'w') {
+        // et_SQLESCAPE), %c the first byte repeated. Every other conversion
+        // produces ASCII, formatted as a `String` and turned to bytes.
+        let body: Vec<u8> = if matches!(conv, 's' | 'z' | 'q' | 'Q' | 'w' | 'c') {
             let v = next(&mut arg_idx);
             match conv {
                 's' | 'z' => {
@@ -1517,6 +1517,20 @@ pub fn printf(args: &[Value]) -> Value {
                         Some(pr) => printf_truncate_chars(&b, pr),
                         None => b,
                     }
+                }
+                'c' => {
+                    // SQLite's %c emits the *first byte* of the argument's text
+                    // (`c = z[0]` in et_CHARX), repeated `precision` times (min one);
+                    // an empty/NULL argument yields a NUL byte. Reading the first
+                    // byte (not the first character) matches SQLite for a multi-byte
+                    // or non-UTF-8 leading character.
+                    let b = if matches!(v, Value::Null) {
+                        alloc::vec::Vec::new()
+                    } else {
+                        crate::exec::eval::text_bytes(&v)
+                    };
+                    let first = b.first().copied().unwrap_or(0);
+                    alloc::vec![first; prec.unwrap_or(1).max(1)]
                 }
                 // The precision limits the number of *input* characters consumed;
                 // escaping is applied afterward so each quote still doubles.
@@ -1582,26 +1596,6 @@ pub fn printf(args: &[Value]) -> Value {
                     prec,
                     alt,
                 ),
-                'c' => {
-                    // SQLite's %c emits the first character of the argument's text
-                    // (e.g. 104 -> "104" -> '1'), not the code point. A NULL argument
-                    // OR an empty-string argument yields a single NUL byte (matching
-                    // SQLite's `et_charx`, whose `buf[0]` defaults to 0).
-                    let v = next(&mut arg_idx);
-                    let text = if matches!(v, Value::Null) {
-                        String::new()
-                    } else {
-                        eval::to_text(&v)
-                    };
-                    let ch = text
-                        .chars()
-                        .next()
-                        .map(String::from)
-                        .unwrap_or_else(|| String::from('\0'));
-                    // A precision repeats the character that many times (min once):
-                    // `%.5c` of 'A' is "AAAAA", `%.0c` and a bare `%c` are one copy.
-                    ch.repeat(prec.unwrap_or(1).max(1))
-                }
                 'f' => {
                     let f = eval::to_f64(&next(&mut arg_idx));
                     // SQLite renders a negative zero as positive (`%f` of -0.0 is
