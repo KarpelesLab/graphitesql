@@ -1652,7 +1652,12 @@ pub fn cast(v: Value, type_name: &str) -> Value {
             _ => to_i64(&v),
         })
     } else if aff.contains("CHAR") || aff.contains("CLOB") || aff.contains("TEXT") {
-        Value::Text(to_text(&v).into())
+        match v {
+            // Already text (an existing text, or a blob reinterpreted above) — keep
+            // its exact bytes; re-rendering via `to_text` would drop non-UTF-8.
+            Value::Text(_) => v,
+            other => Value::Text(to_text(&other).into()),
+        }
     } else if aff.contains("REAL") || aff.contains("FLOA") || aff.contains("DOUB") {
         Value::Real(number_as_f64(&to_number(&v)))
     } else if aff.contains("BLOB") {
