@@ -1506,8 +1506,8 @@ pub fn printf(args: &[Value]) -> Value {
         // The string conversions emit the argument's raw text bytes (verbatim for
         // a non-UTF-8 value): %s/%z as-is, %q/%Q/%w SQL-escaped by doubling the
         // relevant quote byte over the raw bytes (SQLite's byte-oriented
-        // et_SQLESCAPE), %c the first byte repeated. Every other conversion
-        // produces ASCII, formatted as a `String` and turned to bytes.
+        // et_SQLESCAPE), %c the first *character*'s bytes repeated. Every other
+        // conversion produces ASCII, formatted as a `String` and turned to bytes.
         let body: Vec<u8> = if matches!(conv, 's' | 'z' | 'q' | 'Q' | 'w' | 'c') {
             let v = next(&mut arg_idx);
             match conv {
@@ -1519,18 +1519,22 @@ pub fn printf(args: &[Value]) -> Value {
                     }
                 }
                 'c' => {
-                    // SQLite's %c emits the *first byte* of the argument's text
-                    // (`c = z[0]` in et_CHARX), repeated `precision` times (min one);
-                    // an empty/NULL argument yields a NUL byte. Reading the first
-                    // byte (not the first character) matches SQLite for a multi-byte
-                    // or non-UTF-8 leading character.
+                    // SQLite's %c emits the first *character* of the argument's text
+                    // (e.g. 104 -> "104" -> '1'; for `'é'` the two bytes `C3 A9`),
+                    // repeated `precision` times (min one); an empty/NULL argument
+                    // yields a NUL byte. Take the first lenient UTF-8 unit's raw
+                    // bytes so a multi-byte leading character is emitted whole.
                     let b = if matches!(v, Value::Null) {
                         alloc::vec::Vec::new()
                     } else {
                         crate::exec::eval::text_bytes(&v)
                     };
-                    let first = b.first().copied().unwrap_or(0);
-                    alloc::vec![first; prec.unwrap_or(1).max(1)]
+                    let first = if b.is_empty() {
+                        alloc::vec![0u8]
+                    } else {
+                        printf_truncate_chars(&b, 1)
+                    };
+                    first.repeat(prec.unwrap_or(1).max(1))
                 }
                 // The precision limits the number of *input* characters consumed;
                 // escaping is applied afterward so each quote still doubles.

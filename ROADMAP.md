@@ -879,12 +879,13 @@ peripheral — the SQL engine, not the shell, is the project's purpose):**
   byte-identical), `GLOB`/`LIKE` (both operands decoded with the lenient
   `sqlite3Utf8Read` the way SQLite's `patternCompare` does, so two distinct
   invalid lead bytes both read as U+FFFD and compare equal, exactly like SQLite),
-  the `printf` SQL-escape conversions `%q`/`%Q`/`%w` (double the quote byte over
-  the raw bytes), and `printf` `%c` (emits the first *byte* `z[0]` of the
-  argument, matching SQLite — which also corrected the multi-byte case) all match
-  SQLite instead of collapsing through a lossy decode. **No known residual** — the
-  non-UTF-8 text surface is byte-exact end to end.
-  Tests: `tests/text_non_utf8.rs`, `tests/text_non_utf8_functions.rs`
+  and the `printf` SQL-escape conversions `%q`/`%Q`/`%w` (double the quote byte
+  over the raw bytes) all match SQLite instead of collapsing through a lossy
+  decode. `printf` `%c` emits the first *character* whole (a multi-byte leading
+  character is byte-correct); the one remaining gap is `%c` of a *non-UTF-8*
+  leading byte, whose SQLite encoding is ill-defined (`printf('%c',x'ff'||…)` — a
+  vanishingly-rare edge). Tests: `tests/text_non_utf8.rs`,
+  `tests/text_non_utf8_functions.rs`
   (differential).
 - **Parser** stays hand-written (no build-time codegen, friendlier errors);
   `parse.y` remains the source of truth for precedence and accepted forms.
