@@ -375,7 +375,11 @@ result or declines to it — never a wrong answer), so this track is
   instead of materializing the whole table — the same compiled program and B5c-2
   correlated-subquery callback run over it (`has_rowid=false`, so a `rowid`
   reference bails to the materialized path, erroring identically); row order and
-  values match sqlite (`tests/vdbe_without_rowid_scan.rs`). Remaining: the
+  values match sqlite (`tests/vdbe_without_rowid_scan.rs`). *`NOT INDEXED` on the
+  VDBE (2026-07-13):* a `NOT INDEXED` source forces a full scan — exactly what the
+  VDBE does — so it now runs on the VDBE instead of deferring; `INDEXED BY name`
+  still defers (it must be honoured or rejected). Test:
+  `tests/vdbe_not_indexed.rs`. Remaining: the
   in-*interpreter* `OpenRead`/`SeekRowid` opcodes over B5b-1's multi-cursor
   foundation (move the *seek* into bytecode — an internal refactor, no behavior
   change); and seek by a **secondary index** / `WITHOUT ROWID` PK, which is

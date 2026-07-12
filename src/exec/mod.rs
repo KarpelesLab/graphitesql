@@ -2355,11 +2355,13 @@ impl Connection {
                     .collect();
                 return Ok((columns, tables, affinities, collations, result.rows, None));
             }
-            // The VDBE always full-scans and does not model `INDEXED BY`/`NOT
-            // INDEXED` (and an invalid `INDEXED BY` must error); defer to the
-            // tree-walker so the hint is honoured or rejected.
-            if tr.index_hint.is_some() {
-                return Err(Error::Unsupported("VDBE: index hint"));
+            // `NOT INDEXED` forces a full table scan — exactly what the VDBE does,
+            // yielding the same rows in the same (rowid) order — so it runs here.
+            // `INDEXED BY name` must be honoured or rejected (an unusable/missing
+            // index errors), which the VDBE cannot model, so it still defers to the
+            // tree-walker.
+            if matches!(tr.index_hint, Some(IndexHint::IndexedBy(_))) {
+                return Err(Error::Unsupported("VDBE: INDEXED BY hint"));
             }
             // A view `FROM` source: materialize it exactly as the tree-walker does
             // (running its stored body), then expose the view's output columns — their
@@ -3560,12 +3562,14 @@ impl Connection {
     fn try_live_single_scan(&self, sel: &Select, from: &FromClause) -> Result<Option<QueryResult>> {
         let tr = &from.first;
         // Only a plain named base table qualifies. A subquery / TVF / in-scope CTE
-        // / view / schema-qualified / index-hinted source takes the materialized
-        // path (which resolves each of those); mirror `scan_one`'s guards.
+        // / view / schema-qualified source takes the materialized path (which
+        // resolves each of those); mirror `scan_one`'s guards. A `NOT INDEXED`
+        // hint is fine — the live scan is a full scan — but `INDEXED BY name` must
+        // be honoured or rejected by the tree-walker, so it defers.
         if tr.subquery.is_some()
             || tr.tvf_args.is_some()
             || tr.schema.is_some()
-            || tr.index_hint.is_some()
+            || matches!(tr.index_hint, Some(IndexHint::IndexedBy(_)))
             || self.is_bare_tvf(tr)
         {
             return Ok(None);
