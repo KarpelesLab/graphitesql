@@ -1660,6 +1660,7 @@ pub fn cast(v: Value, type_name: &str) -> Value {
         // (an existing blob is unchanged). Matches SQLite, e.g. `65` -> X'3635'.
         match v {
             Value::Blob(_) => v,
+            Value::Text(s) => Value::Blob(s.as_bytes().to_vec()),
             other => Value::Blob(to_text(&other).into_bytes()),
         }
     } else if aff.is_empty() {
@@ -2065,6 +2066,8 @@ pub fn avg_value(vals: &[Value]) -> Option<f64> {
 fn text_bytes(v: &Value) -> Vec<u8> {
     match v {
         Value::Blob(b) => b.clone(),
+        // A text value contributes its raw bytes verbatim (which may be non-UTF-8).
+        Value::Text(s) => s.as_bytes().to_vec(),
         other => to_text(other).into_bytes(),
     }
 }

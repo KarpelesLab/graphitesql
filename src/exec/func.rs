@@ -1950,6 +1950,7 @@ fn scalar_min_max(v: &[Value], want_min: bool) -> Result<Value> {
 fn hex_encode(v: &Value) -> String {
     let bytes = match v {
         Value::Blob(b) => b.clone(),
+        Value::Text(s) => s.as_bytes().to_vec(),
         other => eval::to_text(other).into_bytes(),
     };
     let mut s = String::with_capacity(bytes.len() * 2);

@@ -34625,10 +34625,12 @@ impl Connection {
             let col = eval::to_i64(&row[1]) as usize;
             let term = match &row[2] {
                 Value::Blob(b) => b.clone(),
+                Value::Text(s) => s.as_bytes().to_vec(),
                 v => eval::to_text(v).into_bytes(),
             };
             let posbytes = match &row[3] {
                 Value::Blob(b) => b.clone(),
+                Value::Text(s) => s.as_bytes().to_vec(),
                 v => eval::to_text(v).into_bytes(),
             };
             if col >= ncols {
