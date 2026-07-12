@@ -168,4 +168,16 @@ fn char_semantic_functions_on_non_utf8_match_sqlite3() {
             "SELECT trim('  hi  '), trim('xxhixx', 'x')",                 // valid: hi, hi
         ],
     );
+
+    // ---- concat()/concat_ws(): concatenate the raw text bytes of each argument
+    // (like `||`), so a non-UTF-8 argument or separator is preserved.
+    assert_matches(
+        &mut g,
+        &[
+            "SELECT hex(concat(x'ff', 'a', x'fe'))", // FF61FE
+            "SELECT hex(concat_ws('-', x'ff' || 'a', x'fe' || 'b'))", // FF612DFE62
+            "SELECT concat('a', 'b', 'c'), concat(1, 2, NULL, 3)", // valid: abc, 123
+            "SELECT concat_ws('-', 'a', NULL, 'c')", // valid: a-c
+        ],
+    );
 }

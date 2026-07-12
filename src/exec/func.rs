@@ -650,33 +650,43 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         "concat" => {
             // SQLite 3.44+: concatenate all args, treating NULL as empty.
-            // At least one argument is required.
+            // At least one argument is required. Concatenate the raw text bytes
+            // (like the `||` operator) so a non-UTF-8 argument is preserved.
             if v.is_empty() {
                 return Err(wrong_arg_count("concat"));
             }
-            let mut s = String::new();
+            let mut out: Vec<u8> = Vec::new();
             for x in &v {
                 if !matches!(x, Value::Null) {
-                    s.push_str(&eval::to_text(x));
+                    out.extend_from_slice(&eval::text_bytes(x));
                 }
             }
-            Value::Text(s.into())
+            Value::Text(crate::value::Text::from_bytes(out))
         }
         "concat_ws" => {
-            // A separator plus at least one value argument are required.
+            // A separator plus at least one value argument are required. Join the
+            // non-NULL arguments' raw text bytes with the separator's bytes, so a
+            // non-UTF-8 separator or value is preserved.
             if v.len() < 2 {
                 return Err(wrong_arg_count("concat_ws"));
             }
             if matches!(v[0], Value::Null) {
                 Value::Null
             } else {
-                let sep = eval::to_text(&v[0]);
-                let parts: alloc::vec::Vec<String> = v[1..]
-                    .iter()
-                    .filter(|x| !matches!(x, Value::Null))
-                    .map(eval::to_text)
-                    .collect();
-                Value::Text(parts.join(&sep).into())
+                let sep = eval::text_bytes(&v[0]);
+                let mut out: Vec<u8> = Vec::new();
+                let mut first = true;
+                for x in &v[1..] {
+                    if matches!(x, Value::Null) {
+                        continue;
+                    }
+                    if !first {
+                        out.extend_from_slice(&sep);
+                    }
+                    out.extend_from_slice(&eval::text_bytes(x));
+                    first = false;
+                }
+                Value::Text(crate::value::Text::from_bytes(out))
             }
         }
         "like" => {

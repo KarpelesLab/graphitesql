@@ -872,9 +872,12 @@ peripheral — the SQL engine, not the shell, is the project's purpose):**
   `value_text` bytes — a blob pattern matches by its bytes), `instr` (ports
   `instrFunc`: a 1-based char offset for text advancing one `SKIP_UTF8` unit at a
   time, a byte offset when both args are blobs), and `trim`/`ltrim`/`rtrim` (trim
-  whole lenient-UTF-8 units found in the set) all match SQLite instead of
-  collapsing through a lossy decode. No known residual. Tests:
-  `tests/text_non_utf8.rs`,
+  whole lenient-UTF-8 units found in the set), and `concat`/`concat_ws`
+  (concatenate raw text bytes like `||`) all match SQLite instead of collapsing
+  through a lossy decode. Residual: `printf`/`format` `%s` (a `String`-based
+  formatter — a non-UTF-8 `%s` argument is still lossy) and `GLOB`/`LIKE` pattern
+  matching over non-UTF-8 text remain; both are larger rewrites for a niche gain.
+  Tests: `tests/text_non_utf8.rs`,
   `tests/text_non_utf8_functions.rs` (differential).
 - **Parser** stays hand-written (no build-time codegen, friendlier errors);
   `parse.y` remains the source of truth for precedence and accepted forms.
