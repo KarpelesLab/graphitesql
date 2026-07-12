@@ -998,18 +998,29 @@ independently shippable. Recommended next order:
    or a break reachable only through a `DELETE`/`VALUES`/`WHEN` expression subquery)
    is still accepted (a sound false-accept). Needs partial-rewrite propagation or a
    scope-aware per-subquery probe; low priority (same residual class as DROP COLUMN).
-3. **B5b-2 — live storage cursors on the VDBE** *(in progress)*. The largest VDBE
-   piece; next sub-steps are the in-interpreter `OpenRead`/`SeekRowid` opcodes and
-   the affinity-blocked secondary-index / `WITHOUT ROWID` seeks. Parity-gated, low
-   risk. Then **B5c-2** correlated subqueries (compile-time-validated), which also
-   unblocks bare `generate_series` (A-tvf-bare-series).
+3. **B5b-2 — live storage cursors on the VDBE** *(substantially advanced)*. The
+   VDBE now runs every common shape correctly (any unrouted shape falls through to
+   another correct VDBE path or the tree-walker — never a wrong result). Landed
+   2026-07-13: WITHOUT ROWID live-scan, `NOT INDEXED` routing, `main.`-qualified
+   sources, bare-aggregate `HAVING`, constant `GROUP BY`, and scan+inner-join
+   `DISTINCT` with explicit `COLLATE`. **B5c-2** correlated subqueries is DONE. The
+   remaining piece is the in-interpreter `OpenRead`/`SeekRowid` opcodes — a
+   no-behavior-change refactor (the seek already runs live and correctly in the
+   tree-walker), plus narrow perf-only nested-loop refinements with correct
+   fallbacks.
 4. **Cost model (Track B)** — B9h index-choice sub-items, then B9b window EQP
-   (blocked on B9h); B1b selectivity-driven join order.
-5. **D2e FTS5 tails** (D2e-1/2/3) and **D6 wasm** (pending the D6-0 architecture
-   decision).
+   (blocked on B9h); B1b selectivity-driven join order. Plan/`EXPLAIN`-text only —
+   the executed rows already match SQLite everywhere.
+5. **D2e FTS5 tails** (D2e-1/2/3) — incremental-write refinements; all fall back to
+   the *correct* bulk rebuild, so results are already byte-identical.
 
-**Blocked by project constraints** (not effort): **D7** C-API shim (needs `unsafe`;
-a sibling crate that opts out); **dbpage-2 INSERT-grow** (would write a deliberately
-malformed file, breaking the pager consistency invariant); **B9j** collation-aware
-index selection and **B1c** RIGHT/FULL inner seeks (correct via materialization —
-plan/perf only); the Track E unqualified cross-db name residual.
+**DONE via sibling crates** (opting out of `forbid-unsafe`/zero-dep, so the core
+stays pure): **D6 wasm** (`graphitesql-wasm` — `Database` + OPFS `Vfs`) and **D7
+C-API** (`graphitesql-capi` — 186 `libsqlite3`-compatible `sqlite3_*` symbols incl.
+prepared statements, bind/column, UDFs + window functions, custom collations,
+incremental BLOB I/O, UTF-16 entry points, `update_hook`, `sqlite3_complete`).
+
+**Blocked by project constraints** (not effort): **dbpage-2 INSERT-grow** (would
+write a deliberately malformed file, breaking the pager consistency invariant);
+**B9j** collation-aware index selection and **B1c** RIGHT/FULL inner seeks (correct
+via materialization — plan/perf only); the Track E unqualified cross-db name residual.
