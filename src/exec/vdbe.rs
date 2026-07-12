@@ -1167,12 +1167,7 @@ fn compile_aggregate_select(
     collations: &[Collation],
     projections: &[(Expr, String)],
 ) -> Result<Program> {
-    if !sel.order_by.is_empty()
-        || sel.limit.is_some()
-        || sel.offset.is_some()
-        || sel.distinct
-        || sel.having.is_some()
-    {
+    if !sel.order_by.is_empty() || sel.limit.is_some() || sel.offset.is_some() || sel.distinct {
         return Err(Error::Unsupported("VDBE: bare aggregate only"));
     }
     // The aggregate min/max reduction and DISTINCT dedup now fold under the
@@ -1267,6 +1262,36 @@ fn compile_aggregate_select(
             slot,
             kind: *kind,
             dest: slot,
+        });
+    }
+    // A `HAVING` on a non-grouped aggregate query filters the single output row.
+    // The projection aggregates are already finalized into registers 0..count, so
+    // bind each aggregate's source expression to its register; `compile_expr` on
+    // the HAVING predicate then resolves an aggregate call that also appears in the
+    // projection to that register. A HAVING aggregate NOT in the projection is
+    // unbound, so `compile_expr` raises "misuse of aggregate" (Err) and the whole
+    // query defers to the tree-walker — never a wrong result.
+    if let Some(having) = &sel.having {
+        for (i, (e, _)) in projections.iter().enumerate() {
+            c.bindings.push((e.clone(), i));
+        }
+        let hreg = c.compile_expr(having)?;
+        let gate = c.ops.len();
+        c.ops.push(Op::IfFalse {
+            reg: hreg,
+            target: 0,
+        });
+        c.ops.push(Op::ResultRow { start: 0, count });
+        let halt = c.ops.len();
+        c.ops.push(Op::Halt);
+        if let Op::IfFalse { target, .. } = &mut c.ops[gate] {
+            *target = halt;
+        }
+        return Ok(Program {
+            ops: c.ops,
+            subqueries: core::mem::take(&mut c.subqueries),
+            n_registers: c.next_reg,
+            columns: projections.iter().map(|(_, l)| l.clone()).collect(),
         });
     }
     c.ops.push(Op::ResultRow { start: 0, count });
