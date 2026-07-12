@@ -1265,16 +1265,6 @@ const PRINTF_LIMIT: usize = 1_000_000_000;
 /// stops it from trying to materialize a billion digits (which hangs).
 const PRINTF_FLOAT_PRECISION_LIMIT: usize = 100_000_000;
 
-/// Truncate `s` to its first `prec` characters when a precision is given (used by
-/// the `%q`/`%Q`/`%w` SQL-escape conversions, whose precision counts *input*
-/// characters — the escaping that follows may then expand them).
-fn trunc_chars(s: String, prec: Option<usize>) -> String {
-    match prec {
-        Some(p) => s.chars().take(p).collect(),
-        None => s,
-    }
-}
-
 /// Insert `,` thousands separators into the integer part of a formatted number,
 /// preserving a leading sign (`+`/`-`/space) and any fractional `.xxx` tail.
 fn group_thousands(s: &str) -> String {
@@ -1338,6 +1328,30 @@ fn printf_truncate_chars(bytes: &[u8], n: usize) -> alloc::vec::Vec<u8> {
         count += 1;
     }
     bytes[..i].to_vec()
+}
+
+/// Apply an optional character-precision to `bytes` (for the `%q`/`%Q`/`%w`
+/// conversions, whose precision limits the number of *input* characters consumed
+/// before escaping).
+fn printf_prec_bytes(bytes: &[u8], prec: Option<usize>) -> alloc::vec::Vec<u8> {
+    match prec {
+        Some(p) => printf_truncate_chars(bytes, p),
+        None => bytes.to_vec(),
+    }
+}
+
+/// SQL-escape `bytes` by doubling every occurrence of `q` (SQLite's byte-oriented
+/// `et_SQLESCAPE` — `%q`/`%Q` double `'`, `%w` doubles `"`). Operating on raw
+/// bytes keeps a non-UTF-8 argument exact.
+fn printf_escape_byte(bytes: &[u8], q: u8) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::with_capacity(bytes.len());
+    for &b in bytes {
+        if b == q {
+            out.push(q);
+        }
+        out.push(b);
+    }
+    out
 }
 
 /// SQLite's `printf`/`format`, mirroring `sqlite3_str_vappendf`: the C
@@ -1490,14 +1504,52 @@ pub fn printf(args: &[Value]) -> Value {
             'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'f' | 'e' | 'E' | 'g' | 'G'
         );
         // The string conversions emit the argument's raw text bytes (verbatim for
-        // a non-UTF-8 value), truncated to `prec` characters; every other
-        // conversion produces ASCII, formatted as a `String` and turned to bytes.
-        let body: Vec<u8> = if matches!(conv, 's' | 'z') {
+        // a non-UTF-8 value): %s/%z as-is, %q/%Q/%w SQL-escaped by doubling the
+        // relevant quote byte over the raw bytes (SQLite's byte-oriented
+        // et_SQLESCAPE). Every other conversion produces ASCII, formatted as a
+        // `String` and turned to bytes.
+        let body: Vec<u8> = if matches!(conv, 's' | 'z' | 'q' | 'Q' | 'w') {
             let v = next(&mut arg_idx);
-            let b = crate::exec::eval::text_bytes(&v);
-            match prec {
-                Some(pr) => printf_truncate_chars(&b, pr),
-                None => b,
+            match conv {
+                's' | 'z' => {
+                    let b = crate::exec::eval::text_bytes(&v);
+                    match prec {
+                        Some(pr) => printf_truncate_chars(&b, pr),
+                        None => b,
+                    }
+                }
+                // The precision limits the number of *input* characters consumed;
+                // escaping is applied afterward so each quote still doubles.
+                'q' => match v {
+                    Value::Null => b"(NULL)".to_vec(),
+                    other => printf_escape_byte(
+                        &printf_prec_bytes(&crate::exec::eval::text_bytes(&other), prec),
+                        b'\'',
+                    ),
+                },
+                'Q' => match v {
+                    // Like %q but always wrapped in single quotes (never counted).
+                    Value::Null => b"NULL".to_vec(),
+                    other => {
+                        let esc = printf_escape_byte(
+                            &printf_prec_bytes(&crate::exec::eval::text_bytes(&other), prec),
+                            b'\'',
+                        );
+                        let mut out = alloc::vec::Vec::with_capacity(esc.len() + 2);
+                        out.push(b'\'');
+                        out.extend_from_slice(&esc);
+                        out.push(b'\'');
+                        out
+                    }
+                },
+                'w' => match v {
+                    Value::Null => b"(NULL)".to_vec(),
+                    other => printf_escape_byte(
+                        &printf_prec_bytes(&crate::exec::eval::text_bytes(&other), prec),
+                        b'"',
+                    ),
+                },
+                _ => unreachable!(),
             }
         } else {
             let s: String = match conv {
@@ -1633,35 +1685,7 @@ pub fn printf(args: &[Value]) -> Value {
                         )
                     }
                 }
-                'q' => {
-                    // The precision limits the number of *input* characters consumed
-                    // (escaping is applied afterward, so each `'` still doubles), not
-                    // the escaped-output length: `%.3q` of `a'bc` is `a''b`.
-                    let v = next(&mut arg_idx);
-                    match v {
-                        Value::Null => String::from("(NULL)"),
-                        other => trunc_chars(eval::to_text(&other), prec).replace('\'', "''"),
-                    }
-                }
-                'Q' => {
-                    // Like `%q`, precision limits input chars; the surrounding quotes
-                    // are always added and never counted (`%.0Q` of `hi` is `''`).
-                    let v = next(&mut arg_idx);
-                    match v {
-                        Value::Null => String::from("NULL"),
-                        other => alloc::format!(
-                            "'{}'",
-                            trunc_chars(eval::to_text(&other), prec).replace('\'', "''")
-                        ),
-                    }
-                }
-                'w' => {
-                    let v = next(&mut arg_idx);
-                    match v {
-                        Value::Null => String::from("(NULL)"),
-                        other => trunc_chars(eval::to_text(&other), prec).replace('"', "\"\""),
-                    }
-                }
+                // `%q`/`%Q`/`%w` are handled in the byte branch above.
                 _ => {
                     // Unknown conversion (e.g. `%y`): SQLite discards the directive
                     // and stops formatting the rest of the string.

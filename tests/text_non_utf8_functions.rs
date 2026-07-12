@@ -196,6 +196,11 @@ fn char_semantic_functions_on_non_utf8_match_sqlite3() {
             "SELECT hex(printf('[%-4s]', x'ff' || 'a'))",      // FF612020 left
             "SELECT printf('%s', 'héllo'), printf('%s|%s', 'a', 'b')", // valid
             "SELECT printf('%d %05d %+d %#x', 42, 7, 3, 255)", // numeric unaffected
+            // %q/%Q/%w SQL-escape the raw bytes (double the quote byte).
+            "SELECT hex(printf('%q', x'ff' || x'27' || 'z'))", // FF27277A ('' doubled)
+            "SELECT hex(printf('%Q', x'ff' || x'fe'))",        // 27FFFE27 wrapped
+            "SELECT hex(printf('%w', x'ff' || x'22' || 'z'))", // FF22227A ("" doubled)
+            "SELECT printf('%q', 'a''b'), printf('%Q', NULL), printf('%q', NULL)", // valid
         ],
     );
 

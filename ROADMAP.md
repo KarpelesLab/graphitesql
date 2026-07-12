@@ -876,13 +876,15 @@ peripheral — the SQL engine, not the shell, is the project's purpose):**
   raw text bytes like `||`), `printf`/`format` `%s`/`%z` (the formatter
   accumulates bytes, emitting a non-UTF-8 argument verbatim, width/precision in
   lenient characters — every other conversion is ASCII so valid output is
-  byte-identical), and `GLOB`/`LIKE` (both operands decoded with the lenient
+  byte-identical), `GLOB`/`LIKE` (both operands decoded with the lenient
   `sqlite3Utf8Read` the way SQLite's `patternCompare` does, so two distinct
-  invalid lead bytes both read as U+FFFD and compare equal, exactly like SQLite)
-  all match SQLite instead of collapsing through a lossy decode. The only
-  remaining non-UTF-8 gap is the niche `printf` string conversions `%q`/`%Q`/`%w`/
-  `%c` (still String-based). Tests: `tests/text_non_utf8.rs`,
-  `tests/text_non_utf8_functions.rs` (differential).
+  invalid lead bytes both read as U+FFFD and compare equal, exactly like SQLite),
+  and the `printf` SQL-escape conversions `%q`/`%Q`/`%w` (double the quote byte
+  over the raw bytes) all match SQLite instead of collapsing through a lossy
+  decode. The only remaining non-UTF-8 gap is `printf` `%c` (its first-character
+  semantics over invalid bytes are ill-defined, so it is left String-based).
+  Tests: `tests/text_non_utf8.rs`, `tests/text_non_utf8_functions.rs`
+  (differential).
 - **Parser** stays hand-written (no build-time codegen, friendlier errors);
   `parse.y` remains the source of truth for precedence and accepted forms.
 - **Performance** is deliberately secondary to correctness until the VDBE + planner
