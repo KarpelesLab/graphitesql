@@ -2706,10 +2706,14 @@ pub fn compile_table_select_opts(
     }
     // Expand the projection list to concrete expressions/labels (supporting `*`).
     let projections = expand_projections(sel, columns, tables)?;
-    // A row-level DISTINCT dedups under each output column's collation; the VDBE's
-    // DistinctCheck compares under BINARY, so an explicit `COLLATE` on a projection
-    // (`SELECT DISTINCT a COLLATE NOCASE`) must defer to the tree-walker.
-    if sel.distinct && projections_have_explicit_collation(&projections) {
+    // A row-level DISTINCT dedups under each output column's collation. The plain
+    // single-table scan resolves an explicit projection `COLLATE` into its
+    // `DistinctCheck` (below), so `SELECT DISTINCT a COLLATE NOCASE FROM t` runs on
+    // the VDBE. The grouped / aggregate DISTINCT paths still dedup under BINARY, so
+    // an explicit `COLLATE` there defers to the tree-walker.
+    let grouped_or_aggregate =
+        !sel.group_by.is_empty() || projections.iter().any(|(e, _)| is_aggregate_expr(e));
+    if sel.distinct && grouped_or_aggregate && projections_have_explicit_collation(&projections) {
         return Err(Error::Unsupported("VDBE: explicit COLLATE with DISTINCT"));
     }
     // A constant `LIMIT 0` yields no rows for any query shape: emit a program

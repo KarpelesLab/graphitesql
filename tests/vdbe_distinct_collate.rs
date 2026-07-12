@@ -22,19 +22,21 @@ fn conn() -> Connection {
 }
 
 #[test]
-fn distinct_with_explicit_collate_defers_but_is_correct() {
+fn distinct_with_explicit_collate_runs_on_vdbe() {
     let c = conn();
-    // Explicit non-BINARY collation in the projection: the VDBE must defer.
+    // An explicit non-BINARY projection collation on a plain-scan DISTINCT now runs
+    // on the VDBE — the scan's `DistinctCheck` resolves the explicit `COLLATE`, so
+    // it no longer defers to the tree-walker.
     for q in [
         "SELECT DISTINCT a COLLATE NOCASE FROM t",
         "SELECT DISTINCT a COLLATE NOCASE, b FROM t",
         "SELECT DISTINCT (a COLLATE NOCASE) FROM t",
     ] {
-        assert!(c.query_vdbe(q).is_err(), "expected VDBE to defer on {q}");
+        assert!(c.query_vdbe(q).is_ok(), "expected VDBE to run {q}");
     }
-    // The default path (tree-walker fallback) collapses 'x'=='X' under NOCASE.
+    // The VDBE dedups 'x'=='X' under NOCASE, keeping the first-scanned 'x'.
     assert_eq!(
-        c.query("SELECT DISTINCT a COLLATE NOCASE FROM t ORDER BY 1")
+        c.query_vdbe("SELECT DISTINCT a COLLATE NOCASE FROM t ORDER BY 1")
             .unwrap()
             .rows,
         vec![vec![Value::Text("x".into())], vec![Value::Text("y".into())]],
