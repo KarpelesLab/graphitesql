@@ -1159,6 +1159,24 @@ fn const_sep_text(expr: &Expr) -> Option<String> {
 /// values. Returns `Unsupported` for shapes outside this grammar (so the caller
 /// falls back); `ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT` on an aggregate query are
 /// left to the tree-walker.
+/// Whether `e` is constant with respect to the scanned rows — it references no
+/// column (nor any per-row state), so it evaluates to the same value for every
+/// row. A constant `GROUP BY` key thus forms a single group. Deliberately
+/// conservative: only literals and constant compositions of them are recognized;
+/// an unrecognized shape (a column, function, subquery, …) returns `false`, so
+/// the query simply falls back rather than risking a mis-grouped result.
+fn is_row_constant(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(_) => true,
+        Expr::Paren(x)
+        | Expr::Cast { expr: x, .. }
+        | Expr::Collate { expr: x, .. }
+        | Expr::Unary { expr: x, .. } => is_row_constant(x),
+        Expr::Binary { left, right, .. } => is_row_constant(left) && is_row_constant(right),
+        _ => false,
+    }
+}
+
 fn compile_aggregate_select(
     sel: &Select,
     columns: &[String],
@@ -1166,6 +1184,12 @@ fn compile_aggregate_select(
     affinities: &[Affinity],
     collations: &[Collation],
     projections: &[(Expr, String)],
+    // `gate_nonempty` is set when this compiles a constant-`GROUP BY` query
+    // (`GROUP BY <constant>`), which yields one group over a *non-empty* table but
+    // NO rows over an empty one (unlike a bare aggregate, which always emits one
+    // row). A hidden `count(*)` slot then gates the output row on at least one
+    // scanned row.
+    gate_nonempty: bool,
 ) -> Result<Program> {
     if !sel.order_by.is_empty() || sel.limit.is_some() || sel.offset.is_some() || sel.distinct {
         return Err(Error::Unsupported("VDBE: bare aggregate only"));
@@ -1185,9 +1209,25 @@ fn compile_aggregate_select(
         }
     }
     let count = projections.len();
+    // The hidden non-empty gate is a `count(*)` folded over the same scan; its
+    // finalized value lands in register `count` (the slot after the projections).
+    let gate_reg = if gate_nonempty {
+        slots.push((
+            AggKind::CountStar,
+            None,
+            false,
+            None,
+            Vec::new(),
+            None,
+            None,
+        ));
+        Some(count)
+    } else {
+        None
+    };
     let mut c = Compiler {
         ops: Vec::new(),
-        next_reg: count,
+        next_reg: slots.len(),
         columns: columns.to_vec(),
         tables: tables.to_vec(),
         affinities: affinities.to_vec(),
@@ -1264,38 +1304,39 @@ fn compile_aggregate_select(
             dest: slot,
         });
     }
-    // A `HAVING` on a non-grouped aggregate query filters the single output row.
-    // The projection aggregates are already finalized into registers 0..count, so
-    // bind each aggregate's source expression to its register; `compile_expr` on
-    // the HAVING predicate then resolves an aggregate call that also appears in the
-    // projection to that register. A HAVING aggregate NOT in the projection is
-    // unbound, so `compile_expr` raises "misuse of aggregate" (Err) and the whole
-    // query defers to the tree-walker — never a wrong result.
+    // The single output row is gated by zero or more `IfFalse` checks (each
+    // backpatched to jump past `ResultRow` to the final `Halt`):
+    //   * the hidden non-empty gate: a constant-`GROUP BY` emits no row over an
+    //     empty table, so skip when the row count (register `gate_reg`) is 0;
+    //   * a `HAVING`: bind each projection aggregate's source expression to its
+    //     finalized register, then compile the predicate (a HAVING aggregate that
+    //     also appears in the projection resolves to its slot; one that does not is
+    //     unbound, so `compile_expr` raises "misuse of aggregate" (Err) and the
+    //     whole query defers to the tree-walker — never a wrong result).
+    let mut gates: Vec<usize> = Vec::new();
+    if let Some(reg) = gate_reg {
+        gates.push(c.ops.len());
+        c.ops.push(Op::IfFalse { reg, target: 0 });
+    }
     if let Some(having) = &sel.having {
         for (i, (e, _)) in projections.iter().enumerate() {
             c.bindings.push((e.clone(), i));
         }
         let hreg = c.compile_expr(having)?;
-        let gate = c.ops.len();
+        gates.push(c.ops.len());
         c.ops.push(Op::IfFalse {
             reg: hreg,
             target: 0,
         });
-        c.ops.push(Op::ResultRow { start: 0, count });
-        let halt = c.ops.len();
-        c.ops.push(Op::Halt);
-        if let Op::IfFalse { target, .. } = &mut c.ops[gate] {
-            *target = halt;
-        }
-        return Ok(Program {
-            ops: c.ops,
-            subqueries: core::mem::take(&mut c.subqueries),
-            n_registers: c.next_reg,
-            columns: projections.iter().map(|(_, l)| l.clone()).collect(),
-        });
     }
     c.ops.push(Op::ResultRow { start: 0, count });
+    let halt = c.ops.len();
     c.ops.push(Op::Halt);
+    for g in gates {
+        if let Op::IfFalse { target, .. } = &mut c.ops[g] {
+            *target = halt;
+        }
+    }
     Ok(Program {
         ops: c.ops,
         subqueries: core::mem::take(&mut c.subqueries),
@@ -2683,6 +2724,28 @@ pub fn compile_table_select_opts(
     }
     // GROUP BY folds the scan into one row per group.
     if !sel.group_by.is_empty() {
+        // A `GROUP BY <constant>` (every key a non-positional row-constant, e.g.
+        // `GROUP BY 1+1` / `'x'` / `NULL`) forms a single group over a non-empty
+        // table and no rows over an empty one. With an all-aggregate projection
+        // that is a bare aggregate gated on a non-empty scan, so route it there.
+        // (A bare positional integer `GROUP BY 1` is excluded — it groups by an
+        // output column — as is a non-aggregate projection.)
+        if sel
+            .group_by
+            .iter()
+            .all(|e| super::positional_int(e).is_none() && is_row_constant(e))
+            && projections.iter().all(|(e, _)| is_aggregate_expr(e))
+        {
+            return compile_aggregate_select(
+                sel,
+                columns,
+                tables,
+                affinities,
+                collations,
+                &projections,
+                true,
+            );
+        }
         return compile_group_select(
             sel,
             columns,
@@ -2703,6 +2766,7 @@ pub fn compile_table_select_opts(
             affinities,
             collations,
             &projections,
+            false,
         );
     }
     // A `HAVING` on a non-grouped, non-aggregate query is either an aggregate
