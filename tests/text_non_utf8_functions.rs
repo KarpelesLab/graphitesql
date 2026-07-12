@@ -1,6 +1,6 @@
 //! Differential testing of the char-semantic scalar functions — `length`,
-//! `unicode`, `substr` — applied to *non-UTF-8* text against the real `sqlite3`
-//! CLI (the 3.50.4 oracle on PATH).
+//! `octet_length`, `unicode`, `substr`, `quote`, `char` — applied to *non-UTF-8*
+//! text against the real `sqlite3` CLI (the 3.50.4 oracle on PATH).
 //!
 //! Since `Value::Text` became byte-backed, text whose bytes are not valid UTF-8
 //! (`x'ff' || x'fe'`, `CAST(<blob> AS TEXT)`) keeps its `text` storage class, so
@@ -74,6 +74,10 @@ fn char_semantic_functions_on_non_utf8_match_sqlite3() {
             "SELECT length(CAST(x'ff' AS TEXT))",     // 1
             "SELECT length('héllo'), length('abc')",  // valid utf8 unchanged
             "SELECT length('A' || char(0) || 'B')",   // NUL truncation, = 1
+            // octet_length(): full byte length, NOT NUL-truncated.
+            "SELECT octet_length(x'ff' || x'fe')",        // 2
+            "SELECT octet_length('A' || char(0) || 'B')", // 3, unlike length()
+            "SELECT octet_length('héllo')",               // 6 bytes
         ],
     );
 

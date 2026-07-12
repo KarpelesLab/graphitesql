@@ -394,11 +394,15 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         "octet_length" => {
             arity(&lname, args, 1)?;
-            // Number of bytes in the value's encoding: blobs as-is, everything
+            // Number of bytes in the value's encoding (SQLite's `sqlite3_value_bytes`
+            // — the full stored length, *not* NUL-truncated): blobs as-is, a
+            // byte-backed text by its raw byte length (so a non-UTF-8 text counts
+            // its bytes rather than collapsing through a lossy decode), everything
             // else as the UTF-8 length of its text representation.
             match &v[0] {
                 Value::Null => Value::Null,
                 Value::Blob(b) => Value::Integer(b.len() as i64),
+                Value::Text(s) => Value::Integer(s.byte_len() as i64),
                 other => Value::Integer(eval::to_text(other).len() as i64),
             }
         }
