@@ -67,13 +67,13 @@ fn without_rowid_live_scan_matches_sqlite3() {
     }
 
     let queries = [
-        "SELECT k, v, g FROM wr",                       // full scan, PK order
-        "SELECT v, k FROM wr WHERE v >= 2",             // projection + WHERE
-        "SELECT k FROM wr ORDER BY v DESC, k",          // ORDER BY (tie on v)
-        "SELECT k FROM wr LIMIT 2 OFFSET 1",            // LIMIT/OFFSET over PK order
+        "SELECT k, v, g FROM wr",                          // full scan, PK order
+        "SELECT v, k FROM wr WHERE v >= 2",                // projection + WHERE
+        "SELECT k FROM wr ORDER BY v DESC, k",             // ORDER BY (tie on v)
+        "SELECT k FROM wr LIMIT 2 OFFSET 1",               // LIMIT/OFFSET over PK order
         "SELECT count(*), sum(v), min(k), max(k) FROM wr", // aggregates
-        "SELECT DISTINCT v FROM wr ORDER BY 1",         // DISTINCT
-        "SELECT k || ':' || g FROM wr",                 // expression projection
+        "SELECT DISTINCT v FROM wr ORDER BY 1",            // DISTINCT
+        "SELECT k || ':' || g FROM wr",                    // expression projection
         // correlated subquery over the WITHOUT ROWID scan (B5c-2 on the new source)
         "SELECT k, (SELECT count(*) FROM wr b WHERE b.v < wr.v) FROM wr",
         "SELECT k FROM wr WHERE v = (SELECT max(v) FROM wr)",
