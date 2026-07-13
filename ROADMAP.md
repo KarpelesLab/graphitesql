@@ -714,7 +714,13 @@ history / `CHANGELOG.md`. Remaining:
     `prefix_index_incremental_multisegment_is_byte_identical`). Remaining: a
     **spanning (dlidx) segment** — an over-long doclist that needs a doclist-index
     page — still falls back to the correct bulk rebuild (guarded by the `1<<36`
-    dlidx-bit check), for prefix and main indexes alike.
+    dlidx-bit check), for prefix and main indexes alike. *(A probe of the simple
+    two-segment span — one small segment then a >8000-doc spanning segment — showed
+    the incremental append is already byte-identical to sqlite with a clean
+    integrity_check; the bail is retained because the shape needs ~8000+ docs per
+    transaction to arise and the crisis-merge-with-dlidx interaction is costly to
+    verify exhaustively without heavy corpora. A future slice can lift it with a
+    focused large-corpus differential test.)*
 - **D4-leftover — DONE 2026-07-11 (window UDFs + custom collations).**
   *Window UDFs:* a user-registered aggregate (`Connection::register_aggregate_function`
   / C-API `sqlite3_create_function` or `sqlite3_create_window_function`) is now usable

@@ -33969,9 +33969,10 @@ impl Connection {
         let (terms, _new_totals, new_doc_sizes) = self.fts5_tokenize_docs(&new_docs, ncols, tok);
         let block = fts5_index::build_segment_block(&terms, &new_doc_sizes, 4050, segid, &prefixes);
         // A segment with a doclist-index (spanning) page — `%_data` rowid with the
-        // dlidx bit (1<<36) set — is a rarer shape whose multi-segment `%_idx`
-        // flag interaction is out of this slice; fall back so we never write a
-        // subtly wrong index. (Bare single-doc inserts never span.)
+        // dlidx bit (1<<36) set — falls back to the bulk rebuild. A probe showed the
+        // append itself is byte-identical to sqlite for the simple two-segment span,
+        // but the shape needs ~8000+ docs in one transaction to arise and the crisis
+        // interaction is costly to verify exhaustively; kept as the correct fallback.
         if block.data.iter().any(|(id, _)| (*id & (1 << 36)) != 0) {
             return Ok(false);
         }
