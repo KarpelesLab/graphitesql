@@ -33896,13 +33896,13 @@ impl Connection {
         let (_module, args, schema) = self.vtab_meta(name)?;
         let ncols = schema.columns.len();
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        // Prefix indexes complicate the merged term stream across segments; the
-        // read path handles multi-segment prefix unions, but keep the WRITE path
-        // to the well-characterized main-index case and let prefix tables rebuild.
+        // Prefix indexes append a prefix-aware level-0 segment per write just like
+        // the main index: `build_segment_block` and the crisis merge both take the
+        // `prefixes` list, and the read path already unions the prefix doclists
+        // across segments. Verified byte-identical to sqlite (single, multi-segment,
+        // and crisis-merge shapes). A *spanning* (dlidx) segment is still guarded
+        // below, so an over-long prefix doclist falls back rather than mis-writing.
         let prefixes = crate::vtab::fts5_prefix_lengths(&arg_refs);
-        if !prefixes.is_empty() {
-            return Ok(false);
-        }
         let tok = crate::vtab::fts5_tok_config(&arg_refs);
 
         // Current live documents (content) and the set already in the index

@@ -199,6 +199,109 @@ fn prefix_index_is_byte_identical() {
     }
 }
 
+/// Build a prefix-index corpus as SEPARATE autocommit INSERT statements — each is
+/// its own transaction, so both engines append one level-0 segment per insert (the
+/// INCREMENTAL multi-segment path, not a single bulk rebuild). Once 16 segments
+/// accumulate on a level, both crisis-merge. Asserts graphite's `%_data`/`%_idx`
+/// stay byte-identical to sqlite across the whole segmented structure, integrity is
+/// clean, and a prefix `MATCH` agrees.
+fn build_pair_incremental(g: &str, s: &str, prefix_opt: &str, docs: &[&str]) {
+    {
+        let mut c = Connection::create(g).unwrap();
+        c.execute(&format!(
+            "CREATE VIRTUAL TABLE ft USING fts5(body, prefix='{prefix_opt}')"
+        ))
+        .unwrap();
+        for (i, d) in docs.iter().enumerate() {
+            // No BEGIN/COMMIT: each INSERT autocommits => one appended segment.
+            c.execute(&format!(
+                "INSERT INTO ft(rowid,body) VALUES({},'{d}')",
+                i + 1
+            ))
+            .unwrap();
+        }
+    }
+    let mut sql = format!("CREATE VIRTUAL TABLE ft USING fts5(body, prefix='{prefix_opt}');\n");
+    for (i, d) in docs.iter().enumerate() {
+        sql.push_str(&format!(
+            "INSERT INTO ft(rowid,body) VALUES({},'{d}');\n",
+            i + 1
+        ));
+    }
+    sqlite_stdin(s, &sql);
+}
+
+/// Incremental prefix-index writes (one appended segment per autocommit INSERT,
+/// including the crisis merge at 16+) are byte-identical to sqlite. Before the fix
+/// graphite bulk-rebuilt a single compacted segment for any `prefix=` table, so its
+/// segment structure diverged from sqlite's per-transaction appends.
+#[test]
+fn prefix_index_incremental_multisegment_is_byte_identical() {
+    if !have_fts5_sqlite() {
+        eprintln!("sqlite3 with FTS5 not found; skipping");
+        return;
+    }
+    // Distinct docs with long shared stems so the length-2/3 prefix groups are
+    // exercised. Counts span below-crisis (2, 3), exactly-crisis (16), and past a
+    // crisis with further appends (20).
+    let stems = ["app", "ban", "cat", "dog", "elk", "fox"];
+    let make = |n: usize| -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                format!(
+                    "{}{:04} {}{:04} common",
+                    stems[i % 6],
+                    i,
+                    stems[(i + 3) % 6],
+                    i * 2
+                )
+            })
+            .collect()
+    };
+    for (pfx, n, min_leaves) in [
+        ("2", 2usize, 2usize),
+        ("2 3", 3, 3),
+        ("2 3", 16, 1),
+        ("2", 20, 1),
+    ] {
+        let owned = make(n);
+        let docs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let g = tmp_path("inc-g");
+        let s = tmp_path("inc-s");
+        build_pair_incremental(&g, &s, pfx, &docs);
+        assert!(
+            sqlite_integrity_ok(&g),
+            "sqlite integrity-check rejected graphite's incremental prefix file (n={n})"
+        );
+        assert_eq!(sqlite_raw(&g, "PRAGMA integrity_check;"), "ok");
+        let n_leaves: usize = sqlite_raw(&g, "SELECT count(*) FROM ft_data WHERE id>10;")
+            .parse()
+            .unwrap();
+        assert!(n_leaves >= min_leaves, "n={n}: only {n_leaves} leaves");
+        let data = "SELECT id||':'||quote(block) FROM ft_data ORDER BY id;";
+        assert_eq!(
+            sqlite_raw(&g, data),
+            sqlite_raw(&s, data),
+            "incremental %_data diverges (pfx={pfx}, n={n})"
+        );
+        let idx =
+            "SELECT segid||':'||quote(term)||':'||pgno FROM ft_idx ORDER BY segid, term, pgno;";
+        assert_eq!(
+            sqlite_raw(&g, idx),
+            sqlite_raw(&s, idx),
+            "incremental %_idx diverges (pfx={pfx}, n={n})"
+        );
+        let m = "SELECT count(*) FROM ft WHERE ft MATCH 'app* OR ban*';";
+        assert_eq!(
+            sqlite_raw(&g, m),
+            sqlite_raw(&s, m),
+            "prefix MATCH diverges (n={n})"
+        );
+        let _ = std::fs::remove_file(&g);
+        let _ = std::fs::remove_file(&s);
+    }
+}
+
 /// Small hand-checked corpus: two docs where two full terms share a 2-char
 /// prefix in the SAME document, so the prefix term's doclist merges their
 /// positions. Pins the merge (not just pagination).

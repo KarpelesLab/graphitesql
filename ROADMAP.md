@@ -704,7 +704,17 @@ history / `CHANGELOG.md`. Remaining:
     porting the `Fts5Hash` pending-postings subsystem (in-txn read overlay +
     commit-time single-segment flush + rollback discard), not merely relaxing the
     gate — and its byte-parity is verifiable only against the `sqlite3` oracle.
-  - **D2e-3 — incremental path for prefix-index and spanning-dlidx segments.**
+  - **D2e-3 — incremental path for spanning-dlidx segments.** *(Prefix-index half
+    DONE 2026-07-14.)* `fts5_incremental_write`/`fts5_crisis_merge` already thread
+    the `prefixes` list through `build_segment_block`, and the read path unions
+    prefix doclists across segments, so the early prefix bail was over-conservative:
+    removed it, and incremental per-transaction prefix-index appends (single,
+    multi-segment, and the 16+ crisis merge) are now byte-identical to sqlite with a
+    clean `integrity_check` (verified vs the 3.50.4 oracle; `tests/fts5_prefix_index.rs`
+    `prefix_index_incremental_multisegment_is_byte_identical`). Remaining: a
+    **spanning (dlidx) segment** — an over-long doclist that needs a doclist-index
+    page — still falls back to the correct bulk rebuild (guarded by the `1<<36`
+    dlidx-bit check), for prefix and main indexes alike.
 - **D4-leftover — DONE 2026-07-11 (window UDFs + custom collations).**
   *Window UDFs:* a user-registered aggregate (`Connection::register_aggregate_function`
   / C-API `sqlite3_create_function` or `sqlite3_create_window_function`) is now usable
