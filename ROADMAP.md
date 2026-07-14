@@ -1066,11 +1066,22 @@ independently shippable. Recommended next order:
    that path doesn't already eliminate and yields byte-identical rows (see the
    B5b-2 note in §4). Plus narrow perf-only nested-loop refinements with correct
    fallbacks.
-4. **Cost model (Track B)** — B9h index-choice sub-items, then B9b window EQP
-   (blocked on B9h); B1b selectivity-driven join order. Plan/`EXPLAIN`-text only —
-   the executed rows already match SQLite everywhere.
-5. **D2e FTS5 tails** (D2e-1/2/3) — incremental-write refinements; all fall back to
-   the *correct* bulk rebuild, so results are already byte-identical.
+4. **Cost model (Track B)** — the *bounded* structural sub-items are being picked
+   off (the min/max one-end-seek-vs-covering-scan szEst distinction landed
+   2026-07-14, `3b4ecfe`). What remains — B1b selectivity-driven join order, the
+   non-covering multi-index tiebreak, ORDER-BY-influences-choice, B9b window EQP —
+   all need the full `whereLoopAddBtree`/`wherePathSolver` LogEst row-cost port,
+   which was attempted and came out net-neutral (introduces new divergences); not a
+   bounded increment. Plan/`EXPLAIN`-text only — the executed rows already match
+   SQLite everywhere.
+5. **D2e FTS5 tails** — the **prefix-index incremental** half of D2e-3 landed
+   2026-07-14 (`f6fb60b`, byte-identical per-transaction prefix segments). Remaining:
+   D2e-3 spanning-dlidx (append verified byte-identical for the simple span, kept
+   behind the dlidx bail pending cheaper large-corpus verification), D2e-1
+   delete-crisis with a populated higher level (needs the tombstone-*carrying* merge,
+   a real algorithm port), and D2e-2 in-transaction incremental (needs an `Fts5Hash`
+   pending-postings subsystem to keep in-txn `MATCH` correct). All fall back to the
+   *correct* bulk rebuild, so results are already byte-identical.
 
 **DONE via sibling crates** (opting out of `forbid-unsafe`/zero-dep, so the core
 stays pure): **D6 wasm** (`graphitesql-wasm` — `Database` + OPFS `Vfs`) and **D7
