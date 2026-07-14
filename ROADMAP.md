@@ -849,6 +849,20 @@ history / `CHANGELOG.md`. Remaining:
   malformed file for an operation that only ever produces one; parked as an
   architectural boundary, not a blocker. (The read-side `WHERE schema='aux'`
   redirect is likewise still open.)
+  *CONFIRMED via oracle + source 2026-07-14 (the earlier uncertainty is resolved).*
+  Stock `sqlite3` blocks all dbpage writes under `SQLITE_Defensive` (the CLI's
+  default) — `.dbconfig defensive off` unlocks them. With it off,
+  `INSERT INTO sqlite_dbpage(pgno,data) VALUES(count+1, zeroblob(pgsz))` grows the
+  file to `count+1` pages while `PRAGMA page_count` stays `count` (verified: 2→file
+  3 pages, header still 2, `integrity_check` ok). The source (`dbpageUpdate`,
+  sqlite3.c ~228000) confirms the insert branch is just `sqlite3PagerGet` +
+  `sqlite3PagerWrite` + `memcpy` — it NEVER updates the header page count. So sqlite
+  deliberately writes size > header page_count; graphite's `WritePager` stamps the
+  header from `page_count` and `file.truncate(page_count*page_size)` at commit
+  (`src/pager/write.rs` ~1539/1557), so it cannot produce that file without a
+  special no-truncate path — a real pager change of very low value (raw page INSERT
+  past EOF), NOT integrity-violating (sqlite's own result is integrity-clean). The
+  ROADMAP framing was correct; this closes the open question.
 
 - **D7 — C-API shim — DONE 2026-07-11.** Shipped as the **`graphitesql-capi`**
   sibling crate (its own workspace; opts out of zero-dep + `#![forbid(unsafe_code)]`
