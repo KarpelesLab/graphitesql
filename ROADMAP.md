@@ -744,7 +744,15 @@ history / `CHANGELOG.md`. Remaining:
     per write). This supersedes BOTH the "tombstone-carrying merge" and "populated
     higher level" framings. The real (deep) port is the incremental automerge
     scheduler with `nMerge` tracking; pure-insert corpora pass today only because
-    their sizes don't trigger an automerge divergence.
+    their sizes don't trigger an automerge divergence. *TRIGGER PINPOINTED: the
+    first divergence is the 24th delete = the **64th total write** (40 ins + 24
+    del), and that structure's write counter is exactly `0x40 = 64` = SQLite's
+    `FTS5_WORK_UNIT`. So `fts5IndexAutomerge` runs one work-unit of merging each time
+    the write counter crosses a multiple of 64 (`(nWrite/64) != ((nWrite-nLeaf)/64)`
+    → `fts5IndexMerge(…, nAutomerge)`), picking the level already merging or the one
+    with the most segments ≥ `automerge`. graphite tracks the same write counter
+    (`SegStructure.write_counter`) already — the port is the merge scheduling on top
+    of it. Implementation start point for a focused session.*
   - **D2e-2 — incremental writes inside explicit `BEGIN`/`SAVEPOINT`** (autocommit
     is incremental; explicit txns rebuild). *Not a small change (code-verified
     2026-07-13):* the gate is `fts5_maybe_rebuild` (`src/exec/mod.rs` ~33370) —
