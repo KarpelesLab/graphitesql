@@ -154,6 +154,52 @@ fn minmax_over_composite_index() {
 }
 
 #[test]
+fn minmax_covering_scan_requires_a_narrower_index() {
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        return;
+    }
+    // sqlite uses a covering index for a min/max WITHOUT a one-end seek (a
+    // non-leading column, or an expression/constant argument) only when scanning
+    // that index is cheaper than scanning the table — i.e. the index is NARROWER
+    // than the table (fewer columns → smaller szEst). An index that covers every
+    // table column (as wide as the table) is not cheaper, so sqlite scans the table
+    // (a bare `SEARCH t`). A *leading*-column min/max is a one-end seek and uses the
+    // index regardless of width.
+    //
+    // An index covering EVERY column of the table (same width) → bare SEARCH for a
+    // non-leading / expression / constant argument, but still a COVERING seek for
+    // the leading column.
+    let full = "CREATE TABLE t(a, b, c); CREATE INDEX i ON t(a, b, c); \
+                INSERT INTO t VALUES(5,1,3),(2,2,6),(8,3,9);";
+    for q in [
+        "SELECT max(a) FROM t",   // leading → COVERING seek (width-independent)
+        "SELECT max(b) FROM t",   // non-leading, same-width index → bare SEARCH t
+        "SELECT max(c) FROM t",   // non-leading, same-width index → bare SEARCH t
+        "SELECT max(c+1) FROM t", // expression, same-width index → bare SEARCH t
+        "SELECT min(1) FROM t",   // constant, same-width index → bare SEARCH t
+    ] {
+        check(full, q);
+    }
+    // A narrower covering index (fewer columns than the table) IS used for the
+    // non-seek shapes.
+    let narrow = "CREATE TABLE t(a, b, c, d); CREATE INDEX iab ON t(a, b); \
+                  INSERT INTO t VALUES(5,1,1,1),(2,2,2,2),(8,3,3,3);";
+    for q in [
+        "SELECT min(b) FROM t",   // non-leading but iab narrower → COVERING iab
+        "SELECT min(b+1) FROM t", // expression over a narrower covering index
+        "SELECT max(c) FROM t",   // c not covered → bare SEARCH t
+    ] {
+        check(narrow, q);
+    }
+    // Same-width 2-column index in a 2-column table: leading seek covers, but a
+    // non-leading min/max scans the table.
+    let two = "CREATE TABLE t(a, b); CREATE INDEX iab ON t(a, b); \
+               INSERT INTO t VALUES(5,1),(2,2),(8,3);";
+    check(two, "SELECT min(a) FROM t"); // leading → COVERING
+    check(two, "SELECT min(b) FROM t"); // non-leading, same width → bare SEARCH t
+}
+
+#[test]
 fn non_minmax_aggregates_stay_scan() {
     if Command::new("sqlite3").arg("--version").output().is_err() {
         return;

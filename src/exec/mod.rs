@@ -23868,12 +23868,17 @@ impl Connection {
         let idxs = self.indexes_of(&t.name).ok()?;
 
         // A full (non-partial, non-expression) index that covers *every* referenced
-        // column lets sqlite read the one end without touching the table. Exactly
-        // one covering index → unambiguous; two or more → sqlite's cost model picks
-        // one, which we do not replicate, so leave it `None`.
-        let mut covering = idxs
-            .iter()
-            .filter(|i| usable(i) && self.query_cols_covered(sel, meta, &i.cols));
+        // column AND is NARROWER than the table (fewer columns → smaller szEst) lets
+        // sqlite full-scan the index in place of the table for a min/max with no
+        // one-end seek. An index as wide as the table (it carries every column) is
+        // not cheaper than the table itself, so sqlite scans the table — this is the
+        // szEst cost distinction, approximated here by column count. Exactly one such
+        // index → unambiguous; two or more → sqlite's cost model picks one, which we
+        // do not replicate, so leave it `None`.
+        let table_ncols = meta.columns.len();
+        let mut covering = idxs.iter().filter(|i| {
+            usable(i) && i.cols.len() < table_ncols && self.query_cols_covered(sel, meta, &i.cols)
+        });
         let covering_name = covering
             .next()
             .filter(|_| covering.next().is_none())
@@ -23913,20 +23918,20 @@ impl Connection {
             return None;
         }
 
-        if let Some(name) = covering_name {
-            return Some(alloc::format!("SEARCH {label} USING COVERING INDEX {name}"));
-        }
-
         // A `WITHOUT ROWID` table *is* its own clustered primary-key b-tree: it
-        // carries every column, so any non-covering one-end seek runs over the
-        // primary key rather than a secondary index.
+        // carries every column, so any one-end seek runs over the primary key (or a
+        // covering secondary index). Preserved exactly.
         if meta.without_rowid {
+            if let Some(name) = covering_name {
+                return Some(alloc::format!("SEARCH {label} USING COVERING INDEX {name}"));
+            }
             return Some(alloc::format!("SEARCH {label} USING PRIMARY KEY"));
         }
 
-        // Otherwise a bare-column min/max seeks one end of the sole ordinary index
-        // that *leads* with that column, reading the other referenced columns from
-        // the table by rowid (`SEARCH t USING INDEX <name>`, non-covering).
+        // A rowid table: a bare min/max argument that *leads* an index enables a
+        // one-end SEEK — cheap regardless of the index width — labelled `COVERING`
+        // iff that index covers every referenced column, else a plain non-covering
+        // `USING INDEX`.
         if let Some(col) = seek_col {
             let mut leading = idxs
                 .iter()
@@ -23934,12 +23939,22 @@ impl Connection {
             if let Some(i) = leading.next()
                 && leading.next().is_none()
             {
-                return Some(alloc::format!("SEARCH {label} USING INDEX {}", i.name));
+                return Some(if self.query_cols_covered(sel, meta, &i.cols) {
+                    alloc::format!("SEARCH {label} USING COVERING INDEX {}", i.name)
+                } else {
+                    alloc::format!("SEARCH {label} USING INDEX {}", i.name)
+                });
             }
         }
 
-        // No usable index — `min`/`max` still seeks one end of the (rowid-ordered)
-        // table, so the access is a bare `SEARCH <table>`.
+        // No one-end seek (a non-leading column, or an expression/constant argument):
+        // sqlite full-scans the cheaper of {a covering index narrower than the table,
+        // the table}. A narrower covering index wins (`covering_name` is already
+        // restricted to `cols.len() < table_ncols`); otherwise it scans the table —
+        // a bare one-end `SEARCH t`, NOT an as-wide-as-the-table covering index.
+        if let Some(name) = covering_name {
+            return Some(alloc::format!("SEARCH {label} USING COVERING INDEX {name}"));
+        }
         Some(alloc::format!("SEARCH {label}"))
     }
 

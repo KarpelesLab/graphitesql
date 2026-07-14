@@ -555,9 +555,19 @@ result or declines to it — never a wrong answer), so this track is
   sort-avoidance cost *term*, beyond the no-seek and single-open-range cases); the tiebreak among several non-covering indexes sharing an equality
   prefix (SQLite's full LogEst row-cost, not reducible to narrower/newest); a
   *partial-prefix* covering index for a multi-column ORDER BY (unify
-  `order_index_scan`/`covering_scan`); `min`/`max` over a non-leading covered
-  column (one-end-seek-vs-full-covering-scan distinction). These are structural; a
+  `order_index_scan`/`covering_scan`). These are structural; a
   stat4 oracle is only needed for genuinely data-driven choices (B4).
+  **`min`/`max` one-end-seek-vs-full-covering-scan — DONE 2026-07-14.** A min/max
+  whose argument *leads* an index is a one-end SEEK (`SEARCH … USING [COVERING]
+  INDEX`, cheap regardless of index width); a min/max with no such seek (a
+  non-leading column, or an expression/constant argument) full-scans the *cheaper*
+  of {a covering index narrower than the table, the table}. `minmax_search_detail`
+  now restricts the covering-scan branch to an index with fewer columns than the
+  table (the szEst cost, approximated by column count), so an index that covers
+  every table column — as wide as the table — is no longer preferred over a bare
+  `SEARCH t`, matching sqlite. Verified across a leading/non-leading/expression/
+  constant × same-width/narrower matrix (`tests/eqp_minmax_search.rs`
+  `minmax_covering_scan_requires_a_narrower_index`).
 - **B1b — cost-based join reordering.** The structural slices are done (rowid- and
   index-inner swaps, N-table greedy connected-cheapest order, covering-index join
   scans, trailing-node EQP parity). Still open: **selectivity-driven** ordering (a
