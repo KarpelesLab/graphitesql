@@ -730,6 +730,21 @@ history / `CHANGELOG.md`. Remaining:
     (leaf-packing / second-crisis-cascade dependent). A deep crisis+promote cascade
     interaction in the `bOldest` merge, not a bounded structural fix — a genuine
     multi-session byte-parity investigation on already-correct, MATCH-correct output.*
+    **ROOT CAUSE FOUND 2026-07-14 — it is AUTOMERGE, not tombstones.** Step-by-step
+    structure-evolution diff localized the first divergence to the 24th delete, and
+    the decisive experiment: rerun the repro in sqlite with `INSERT INTO
+    f(f,rank) VALUES('automerge',16)` (automerge off) → sqlite produces **10
+    segments with byte-identical `%_data` and identical segment ids to graphite**
+    (the sole delta is the structure *cookie*, bumped by the config command itself).
+    Default automerge gives 7. So graphite already matches sqlite exactly WHEN
+    AUTOMERGE IS OFF; the whole delete-heavy/scale divergence is that graphite
+    **does not implement `automerge`** — sqlite's incremental sub-crisis merge
+    scheduling (`fts5IndexAutomerge`/the per-level `nMerge` progress counter that
+    merges a level once it reaches the `automerge` threshold, default 4, a few pages
+    per write). This supersedes BOTH the "tombstone-carrying merge" and "populated
+    higher level" framings. The real (deep) port is the incremental automerge
+    scheduler with `nMerge` tracking; pure-insert corpora pass today only because
+    their sizes don't trigger an automerge divergence.
   - **D2e-2 — incremental writes inside explicit `BEGIN`/`SAVEPOINT`** (autocommit
     is incremental; explicit txns rebuild). *Not a small change (code-verified
     2026-07-13):* the gate is `fts5_maybe_rebuild` (`src/exec/mod.rs` ~33370) —
