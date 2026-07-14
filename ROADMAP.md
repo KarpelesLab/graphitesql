@@ -724,7 +724,12 @@ history / `CHANGELOG.md`. Remaining:
     identify which merge actually diverges (dump `structure.levels` after every
     insert AND delete vs sqlite's `%_data` structure record), rather than trusting
     the "populated higher level" framing. The reader/merge infra was sound; it just
-    targets a case this repro doesn't exercise.
+    targets a case this repro doesn't exercise. *Bounded characterization: the
+    divergence is DATA-SENSITIVE — `40 ins / 30 del` diverges (7 vs 10 segs) but
+    `30/20`, `24/16`, `16/16` match, and it disappears with shorter terms
+    (leaf-packing / second-crisis-cascade dependent). A deep crisis+promote cascade
+    interaction in the `bOldest` merge, not a bounded structural fix — a genuine
+    multi-session byte-parity investigation on already-correct, MATCH-correct output.*
   - **D2e-2 — incremental writes inside explicit `BEGIN`/`SAVEPOINT`** (autocommit
     is incremental; explicit txns rebuild). *Not a small change (code-verified
     2026-07-13):* the gate is `fts5_maybe_rebuild` (`src/exec/mod.rs` ~33370) —
