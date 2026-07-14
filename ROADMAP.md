@@ -699,7 +699,19 @@ history / `CHANGELOG.md`. Remaining:
   **Remaining (thin tails — all fall back to the *correct* bulk rebuild, never
   wrong, just not incremental):**
   - **D2e-1 — delete-crisis with a populated higher level** (needs tombstones
-    carried into the merge).
+    carried into the merge). *Target pinned (2026-07-14):* reproduce with an FTS5
+    table, 40 single-row autocommit INSERTs then 30 single-row DELETEs — sqlite
+    settles to **7** `%_data` segments, graphite to **10** (graphite stays
+    integrity-clean and `MATCH`-correct — byte-structure only). graphite's delete
+    path (`fts5_incremental_delete`, `src/exec/mod.rs` ~34315) bails when
+    `level0_at_crisis && higher_populated` and reaccumulates, where sqlite runs a
+    tombstone-*carrying* `fts5IndexMergeLevel` (merge the level's segments into one,
+    keeping the DELETE markers so they still shadow postings in the untouched higher
+    levels — annihilation only on the `bOldest` merge, which graphite already
+    handles via rebuild-from-live). No reusable primitive exists: the read-path
+    `merge_segments` (`src/fts5_index.rs` ~1649) *bails* on any tombstone, so this
+    needs a new write-path term-iterating segment merge (~300 byte-parity-critical
+    lines). A real port, best done with the trace-oracle build.
   - **D2e-2 — incremental writes inside explicit `BEGIN`/`SAVEPOINT`** (autocommit
     is incremental; explicit txns rebuild). *Not a small change (code-verified
     2026-07-13):* the gate is `fts5_maybe_rebuild` (`src/exec/mod.rs` ~33370) —
