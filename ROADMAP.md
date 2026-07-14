@@ -712,6 +712,19 @@ history / `CHANGELOG.md`. Remaining:
     `merge_segments` (`src/fts5_index.rs` ~1649) *bails* on any tombstone, so this
     needs a new write-path term-iterating segment merge (~300 byte-parity-critical
     lines). A real port, best done with the trace-oracle build.
+    *ATTEMPTED & REVERTED 2026-07-14 — the stated cause is WRONG for this repro.*
+    Built the tombstone-preserving reader (`decode_poslist_keepdel` /
+    `read_segment_postings` / `merge_level_postings`, unit-tested and passing) and a
+    `fts5_delete_crisis_merge` wired at the bail, but instrumentation showed the
+    40-ins/30-del reproduction **never hits `higher_populated`** — level 1 stays
+    empty (`[2,0]…[16,0]`), so the delete-crisis takes the `bOldest`
+    (`fts5_crisis_merge`, rebuild-from-live) path, and the 10-vs-7 divergence arises
+    THERE (the `bOldest` merge / final promote), not in a tombstone-carrying merge.
+    So the next attempt must FIRST instrument the full structure evolution to
+    identify which merge actually diverges (dump `structure.levels` after every
+    insert AND delete vs sqlite's `%_data` structure record), rather than trusting
+    the "populated higher level" framing. The reader/merge infra was sound; it just
+    targets a case this repro doesn't exercise.
   - **D2e-2 — incremental writes inside explicit `BEGIN`/`SAVEPOINT`** (autocommit
     is incremental; explicit txns rebuild). *Not a small change (code-verified
     2026-07-13):* the gate is `fts5_maybe_rebuild` (`src/exec/mod.rs` ~33370) —
