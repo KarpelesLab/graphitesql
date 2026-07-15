@@ -710,8 +710,18 @@ history / `CHANGELOG.md`. Remaining:
     correct bulk rebuild (never wrong bytes); prefix-index automerge past 64 leaves
     keeps prior behavior. Implemented via a worktree agent + independent oracle
     verification. *Investigation history below is SUPERSEDED (kept for context):*
-  - **NEW BUG — delete-heavy FTS5 `%_content` file is sqlite-malformed (found
-    2026-07-14, PRE-EXISTING on master, orthogonal to automerge).** For some
+  - **FIXED 2026-07-14 (`369d8bf`) — delete-heavy FTS5 `%_content` file was
+    sqlite-malformed (pre-existing, orthogonal to automerge).** Root cause: a
+    store-backed vtab (FTS5) DELETE removed rows via `ExecVTabStore` without running
+    the page-merge-on-delete compaction the ordinary DELETE path uses, leaving an
+    empty NON-ROOT leaf — which sqlite rejects as malformed while graphite's own
+    `integrity_check` wrongly said `ok`. Fix: `with_vtab_store` now runs
+    `compact_table` after a store batch; and `integrity_check` now walks table/index
+    b-tree structure (`check_btree_structure`: out-of-range child / cycle /
+    unreadable page / empty non-root leaf), closing the detection gap. Verified
+    `sqlite3 quick_check`=ok on many delete-heavy shapes; `%_data` bytes unchanged;
+    FTS5 + rtree/writable_vtab/geopoly corpus green; `tests/fts5_delete_valid_file.rs`.
+    *(original finding below)* For some
     delete-heavy corpora (e.g. 150 ins / 100 del, 175/120) graphite writes a file
     whose fts5 index bytes are byte-identical to sqlite but whose OVERALL b-tree is
     malformed per sqlite (`PRAGMA quick_check` → "database disk image is malformed")
