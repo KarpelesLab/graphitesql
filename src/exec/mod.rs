@@ -22,8 +22,8 @@ pub mod vdbe;
 mod window;
 
 use crate::btree::{
-    IndexCursor, TableCursor, clear_index, clear_table, create_index_root, create_table_root,
-    delete_table, free_tree, insert_index, insert_table, table_has_empty_leaf,
+    BtreePage, IndexCursor, PageType, TableCursor, clear_index, clear_table, create_index_root,
+    create_table_root, delete_table, free_tree, insert_index, insert_table, table_has_empty_leaf,
 };
 use crate::error::{Error, Result};
 use crate::format::record::{decode_record, encode_record};
@@ -5217,8 +5217,15 @@ impl Connection {
             .collect();
 
         let mut problems = Vec::new();
+        let src = self.backend.source();
         for table in &tables {
             let meta = self.table_meta(table, None)?;
+            // Structurally walk the table b-tree: every child page must be in
+            // range, reachable once, and a non-root leaf must never be empty.
+            // (An empty non-root leaf — the shape a delete leaves if the tree is
+            // not compacted — is a malformed sqlite b-tree; without this walk the
+            // count-based checks below would miss it.)
+            check_btree_structure(src, meta.root, table, &mut problems);
             // The rows that physically exist, and how many each index should hold.
             let rows: Vec<Vec<Value>> = if meta.without_rowid {
                 self.scan_without_rowid(&meta)?
@@ -5230,6 +5237,7 @@ impl Connection {
             };
             let no_params = Params::default();
             for idx in self.indexes_of(table)? {
+                check_btree_structure(src, idx.root, &idx.name, &mut problems);
                 let expected = rows
                     .iter()
                     .filter_map(|r| self.row_in_index(&idx, &meta, r, None, &no_params).ok())
@@ -12303,6 +12311,18 @@ impl Connection {
             f(&*module, &mut store, &arg_refs)
         };
         self.vtab_registry.register(module_name, module)?;
+        // The store services deletes/updates by removing rows from the backing
+        // b-tree one at a time (`ExecVTabStore::delete`/`put` → `delete_table`),
+        // which can leave an emptied leaf page in place. A non-root leaf with
+        // zero cells is a *malformed* sqlite b-tree (sqlite's `integrity_check`
+        // rejects it), so reclaim any such slack now — the same
+        // page-merge-on-delete compaction the ordinary DELETE path performs —
+        // keeping the backing `_content`/`_data` file a valid sqlite database.
+        if result.is_ok()
+            && let Ok(meta) = self.table_meta(&backing, None)
+        {
+            self.compact_table(&meta)?;
+        }
         result
     }
 
@@ -41597,6 +41617,94 @@ impl VTabStore for ExecVTabStore<'_> {
         crate::btree::delete_table(w, root, rowid)?;
         Ok(())
     }
+}
+
+/// Structurally validate a b-tree rooted at `root`, pushing a human-readable
+/// message onto `problems` for each defect found. Backs `PRAGMA integrity_check`.
+///
+/// Detects the malformations the count-based checks cannot see: a child page
+/// number out of the `1..=page_count` range (a dangling reference), the same
+/// page reached twice (a cycle / shared subtree), an unreadable or wrong-kind
+/// page, and — the shape a non-compacting delete leaves behind — an empty leaf
+/// page below an interior page (sqlite requires every non-root leaf to hold at
+/// least one cell). `label` names the table or index in the message.
+fn check_btree_structure(src: &dyn PageSource, root: u32, label: &str, problems: &mut Vec<String>) {
+    fn walk(
+        src: &dyn PageSource,
+        page_no: u32,
+        is_root: bool,
+        page_count: u32,
+        label: &str,
+        visited: &mut alloc::collections::BTreeSet<u32>,
+        problems: &mut Vec<String>,
+    ) {
+        if page_no < 1 || page_no > page_count {
+            problems.push(alloc::format!(
+                "{label}: child page {page_no} out of range (page_count {page_count})"
+            ));
+            return;
+        }
+        if !visited.insert(page_no) {
+            problems.push(alloc::format!(
+                "{label}: page {page_no} referenced more than once"
+            ));
+            return;
+        }
+        let page = match src.page(page_no) {
+            Ok(p) => p,
+            Err(_) => {
+                problems.push(alloc::format!("{label}: unable to read page {page_no}"));
+                return;
+            }
+        };
+        let bt = match BtreePage::parse(page) {
+            Ok(b) => b,
+            Err(_) => {
+                problems.push(alloc::format!(
+                    "{label}: page {page_no} is not a valid b-tree page"
+                ));
+                return;
+            }
+        };
+        match bt.page_type() {
+            PageType::LeafTable | PageType::LeafIndex => {
+                if !is_root && bt.num_cells() == 0 {
+                    problems.push(alloc::format!(
+                        "{label}: empty non-root leaf page {page_no}"
+                    ));
+                }
+            }
+            PageType::InteriorTable | PageType::InteriorIndex => {
+                for i in 0..bt.num_cells() {
+                    match bt.child_pointer(i) {
+                        Ok(child) => walk(src, child, false, page_count, label, visited, problems),
+                        Err(_) => problems.push(alloc::format!(
+                            "{label}: unreadable child pointer on page {page_no}"
+                        )),
+                    }
+                }
+                walk(
+                    src,
+                    bt.right_pointer(),
+                    false,
+                    page_count,
+                    label,
+                    visited,
+                    problems,
+                );
+            }
+        }
+    }
+    let mut visited = alloc::collections::BTreeSet::new();
+    walk(
+        src,
+        root,
+        true,
+        src.page_count(),
+        label,
+        &mut visited,
+        problems,
+    );
 }
 
 /// Flip a comparison operator for a swapped operand order: `a < b` ⇔ `b > a`.
