@@ -35088,16 +35088,19 @@ impl Connection {
         // shape this slice targets; if the merged level would still be in crisis,
         // fall back to the bulk rebuild to stay correct.
         let merged_segid = structure.allocate_segid();
-        let (terms, _totals, doc_sizes) = self.fts5_tokenize_docs(docs, ncols, tok);
+        // A merge does not touch `%_docsize` (per-doc sizes are unchanged), so the
+        // tokenizer's `doc_sizes` output is discarded here.
+        let (terms, _totals, _doc_sizes) = self.fts5_tokenize_docs(docs, ncols, tok);
         // A crisis merge is a `fts5IndexMergeLevel`, so its output uses the
         // INCREMENTAL-MERGE writer (byte-exact vs sqlite for multi-leaf outputs).
-        // Prefix tables still take the bulk writer — the merge writer services the
-        // main index only, and prefix crises produce single-leaf outputs where the
-        // two writers agree byte-for-byte.
+        // Prefix tables derive the prefix (`'1'`/`'2'`…) streams from the same
+        // re-tokenized main terms but ALSO go through the merge writer, so a
+        // spanning main OR prefix term's doclist splits across leaves exactly as
+        // sqlite does (the two writers agree only for single-leaf outputs).
         let block = if prefixes.is_empty() {
             fts5_index::build_merged_segment_block(&terms, 4050, merged_segid)
         } else {
-            fts5_index::build_segment_block(&terms, &doc_sizes, 4050, merged_segid, prefixes)
+            fts5_index::build_merged_segment_block_prefixed(&terms, 4050, merged_segid, prefixes)
         };
 
         // Mutate a COPY of the structure and only commit it on success, so a bail
