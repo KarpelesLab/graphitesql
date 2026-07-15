@@ -5341,6 +5341,12 @@ impl Connection {
             }
         }
 
+        // FTS5 self-content tables: verify the inverted index still matches the
+        // documents in `%_content` (sqlite's `xIntegrity` → "malformed inverted
+        // index for FTS5 table …"). A no-op without the fts5 feature.
+        #[cfg(feature = "fts5")]
+        self.fts5_integrity_check(&mut problems)?;
+
         if problems.is_empty() {
             Ok(single(Value::Text("ok".into())))
         } else {
@@ -5352,6 +5358,129 @@ impl Connection {
                     .collect(),
             })
         }
+    }
+
+    /// The FTS5 arm of [`pragma_integrity_check`]: for every SELF-CONTENT `fts5`
+    /// virtual table, re-tokenize its `%_content` documents into the expected
+    /// `(term, rowid, per-column positions)` multiset and diff it against the
+    /// multiset DECODED from the on-disk inverted index. A mismatch — a stale or
+    /// wrong index that no longer matches the documents — or a structurally
+    /// impossible index (the structure record referencing an absent leaf page)
+    /// pushes `malformed inverted index for FTS5 table main.<name>`, matching
+    /// sqlite's `fts5IntegrityMethod`.
+    ///
+    /// Deliberately CONSERVATIVE (zero false positives): index shapes the read-only
+    /// decoder cannot resolve with certainty — tombstone/update history, a term
+    /// spanning onto a doclist-index page, an external-content or contentless table
+    /// (no local documents to re-derive from) — are SKIPPED rather than reported.
+    /// See [`crate::fts5_index::scan_main_index`].
+    #[cfg(feature = "fts5")]
+    fn fts5_integrity_check(&self, problems: &mut Vec<String>) -> Result<()> {
+        use crate::fts5_index::{self, MainIndexScan, Posting};
+        use crate::schema::ObjectType;
+        use alloc::collections::BTreeMap;
+
+        // Canonicalize `(term -> postings)` into a multiset keyed by
+        // `(term, rowid) -> {non-empty column -> ascending positions}`. Dropping
+        // empty columns makes the index decode (which omits empty trailing columns)
+        // and the re-tokenization (which pads every posting to `ncols`) compare
+        // equal on the columns that actually carry the term.
+        fn canonical(
+            terms: &[(Vec<u8>, Vec<Posting>)],
+        ) -> BTreeMap<(Vec<u8>, i64), BTreeMap<usize, Vec<u32>>> {
+            let mut m: BTreeMap<(Vec<u8>, i64), BTreeMap<usize, Vec<u32>>> = BTreeMap::new();
+            for (term, postings) in terms {
+                for p in postings {
+                    let mut cols: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
+                    for (c, positions) in p.cols.iter().enumerate() {
+                        if !positions.is_empty() {
+                            cols.insert(c, positions.clone());
+                        }
+                    }
+                    m.insert((term.clone(), p.rowid), cols);
+                }
+            }
+            m
+        }
+
+        let names: Vec<String> = self
+            .schema
+            .objects()
+            .iter()
+            .filter(|o| o.obj_type == ObjectType::Table)
+            .filter_map(|o| match o.sql.as_deref().map(sql::parse_one) {
+                Some(Ok(Statement::CreateVirtualTable(cvt)))
+                    if cvt.module.eq_ignore_ascii_case("fts5") =>
+                {
+                    Some(o.name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+
+        for name in &names {
+            let (module, args, schema) = match self.vtab_meta(name) {
+                Ok(v) => v,
+                Err(_) => continue, // module not registered / connect failed: not ours
+            };
+            if !module.eq_ignore_ascii_case("fts5") {
+                continue;
+            }
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            // Only self-content tables carry a local `%_content` copy to re-derive
+            // the expected index from. External-content / contentless: skip.
+            if crate::vtab::fts5_external_content(&arg_refs).is_some()
+                || crate::vtab::fts5_is_contentless(&arg_refs)
+            {
+                continue;
+            }
+
+            let data: Vec<(i64, Vec<u8>)> = match self.query(&format!(
+                "SELECT id, block FROM {}",
+                sql::print::ident(&format!("{name}_data"))
+            )) {
+                Ok(qr) => qr
+                    .rows
+                    .into_iter()
+                    .filter_map(|r| {
+                        let mut it = r.into_iter();
+                        let id = eval::to_i64(&it.next()?);
+                        let blk = match it.next() {
+                            Some(Value::Blob(b)) => b,
+                            Some(Value::Null) => Vec::new(),
+                            _ => return None,
+                        };
+                        Some((id, blk))
+                    })
+                    .collect(),
+                Err(_) => continue, // no `%_data` backing table: nothing to check
+            };
+
+            match fts5_index::scan_main_index(&data) {
+                MainIndexScan::Skip => continue,
+                MainIndexScan::Malformed => {
+                    problems.push(format!(
+                        "malformed inverted index for FTS5 table main.{name}"
+                    ));
+                }
+                MainIndexScan::Clean(index_terms) => {
+                    let ncols = schema.columns.len();
+                    let tok = crate::vtab::fts5_tok_config(&arg_refs);
+                    let docs = match self.fts5_load_documents(name, &schema.columns, &arg_refs) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+                    let (content_terms, _totals, _sizes) =
+                        self.fts5_tokenize_docs(&docs, ncols, tok);
+                    if canonical(&index_terms) != canonical(&content_terms) {
+                        problems.push(format!(
+                            "malformed inverted index for FTS5 table main.{name}"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Execute a single non-`SELECT` statement, returning the number of rows

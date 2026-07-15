@@ -1925,6 +1925,166 @@ pub(crate) fn merge_segments_keepdel(
     Some(merge_level_postings(&segs, b_oldest))
 }
 
+// ---------------------------------------------------------------------------
+// integrity_check: decode the whole MAIN inverted index into a comparable
+// (term, rowid, per-column positions) multiset so `PRAGMA integrity_check` can
+// diff it against a re-tokenization of the `%_content` documents (sqlite's
+// `sqlite3Fts5IntegrityCheck`). This is a READ-ONLY path — it never writes.
+// ---------------------------------------------------------------------------
+
+/// Like [`read_segment_postings`] but for the integrity checker: it reads only
+/// the MAIN-index terms (`FTS5_MAIN_PREFIX` = `'0'`) and simply SKIPS any
+/// prefix-index term (key byte `'1'`, `'2'`, …) rather than bailing, so a
+/// prefix-configured table's main index can still be checked. `None` (bail) on a
+/// genuinely unparseable leaf (an interior/doclist-index page) or a malformed key.
+fn read_main_segment_postings(leaves: &[&[u8]]) -> Option<Vec<(Vec<u8>, Vec<Posting>)>> {
+    let mut views: Vec<LeafView> = Vec::with_capacity(leaves.len());
+    for leaf in leaves {
+        views.push(parse_leaf(leaf)?);
+    }
+    let mut out: Vec<(Vec<u8>, Vec<Posting>)> = Vec::new();
+    for (li, view) in views.iter().enumerate() {
+        for (ti, rec) in view.terms.iter().enumerate() {
+            match rec.key.first() {
+                Some(&MAIN_PREFIX) => {}
+                // A prefix-index term ('1'…): not part of the main index — skip it.
+                Some(_) => continue,
+                None => return None, // empty key: unexpected, bail
+            }
+            let term = rec.key.get(1..)?.to_vec();
+            let runs = gather_doclist_runs(leaves, li, ti, rec.doclist_start, &views)?;
+            let postings = decode_doclist_keepdel(&runs)?;
+            out.push((term, postings));
+        }
+    }
+    Some(out)
+}
+
+/// The outcome of decoding an FTS5 table's whole main inverted index for the
+/// integrity checker ([`scan_main_index`]).
+pub(crate) enum MainIndexScan {
+    /// The live main-index postings (term ascending, each term's postings
+    /// rowid-ascending), decoded from a PURE-INSERT index — one with no DELETE
+    /// tombstones and no docid shared across segments. This is directly comparable
+    /// to a fresh re-tokenization of the `%_content` documents.
+    Clean(Vec<(Vec<u8>, Vec<Posting>)>),
+    /// A VALID FTS5 shape this read-only checker does not fully/safely decode: an
+    /// index carrying tombstones or updated docids (delete-precedence layering), a
+    /// term spanning onto an unparseable (interior/doclist-index) leaf, or a
+    /// structure record we cannot parse. The caller SKIPS the term comparison
+    /// (reports the table `ok`) rather than risk a false positive.
+    Skip,
+    /// The structure record references a height-0 leaf page that is ABSENT from
+    /// `%_data` — impossible for a valid file. The caller reports the table
+    /// malformed.
+    Malformed,
+}
+
+/// Decode the MAIN inverted index of a self-content FTS5 table from its `%_data`
+/// rows into a [`MainIndexScan`]. Conservative by construction: it returns
+/// [`MainIndexScan::Clean`] only when the whole index is a pure-insert history it
+/// can decode with certainty, [`MainIndexScan::Malformed`] only for a structurally
+/// impossible file (a referenced leaf missing), and [`MainIndexScan::Skip`] for
+/// every valid-but-not-fully-decodable shape — so a mismatch reported against a
+/// `Clean` result is real.
+pub(crate) fn scan_main_index(data: &[(i64, Vec<u8>)]) -> MainIndexScan {
+    use alloc::collections::BTreeMap;
+    let Some(structure) = data
+        .iter()
+        .find(|(id, _)| *id == STRUCTURE_ROWID)
+        .map(|(_, b)| b.as_slice())
+    else {
+        return MainIndexScan::Skip; // no structure record: nothing safe to check
+    };
+    // Parse the structure record into per-level segment locations, keeping EMPTY
+    // (nothing indexed) distinct from a real segment list.
+    let mut pos = 4usize; // skip the 4-byte config cookie
+    let (Some(n_level), Some(n_segment), Some(_wc)) = (
+        read_varint(structure, &mut pos),
+        read_varint(structure, &mut pos),
+        read_varint(structure, &mut pos),
+    ) else {
+        return MainIndexScan::Skip;
+    };
+    if n_level == 0 || n_segment == 0 {
+        return MainIndexScan::Clean(Vec::new()); // empty index (no documents)
+    }
+    let mut locs: Vec<SegmentLoc> = Vec::new();
+    for _ in 0..n_level {
+        let (Some(_n_merge), Some(n_seg)) = (
+            read_varint(structure, &mut pos),
+            read_varint(structure, &mut pos),
+        ) else {
+            return MainIndexScan::Skip;
+        };
+        for _ in 0..n_seg {
+            let (Some(segid), Some(pgno_first), Some(pgno_last)) = (
+                read_varint(structure, &mut pos),
+                read_varint(structure, &mut pos),
+                read_varint(structure, &mut pos),
+            ) else {
+                return MainIndexScan::Skip;
+            };
+            let (segid, pgno_first, pgno_last) =
+                (segid as i64, pgno_first as i64, pgno_last as i64);
+            if segid <= 0 || pgno_first < 1 || pgno_last < pgno_first {
+                return MainIndexScan::Skip;
+            }
+            locs.push(SegmentLoc {
+                segid,
+                pgno_first,
+                pgno_last,
+            });
+        }
+    }
+    if locs.len() as u64 != n_segment {
+        return MainIndexScan::Skip;
+    }
+
+    // Read each segment. A referenced leaf that is MISSING from %_data is
+    // malformed; an unparseable-but-plausible leaf (interior/dlidx page) is a
+    // valid shape we skip; a tombstone or a cross-segment docid means update
+    // history whose precedence we do not resolve → skip.
+    let mut per_term: BTreeMap<Vec<u8>, Vec<Posting>> = BTreeMap::new();
+    let mut seen: Vec<(Vec<u8>, i64, usize)> = Vec::new(); // (term, rowid, seg idx)
+    for (si, loc) in locs.iter().enumerate() {
+        let mut leaves: Vec<&[u8]> = Vec::new();
+        for pgno in loc.pgno_first..=loc.pgno_last {
+            let rid = segment_leaf_rowid(loc.segid, pgno);
+            match data.iter().find(|(id, _)| *id == rid) {
+                Some((_, b)) => leaves.push(b.as_slice()),
+                None => return MainIndexScan::Malformed, // structure references a gone leaf
+            }
+        }
+        let Some(terms) = read_main_segment_postings(&leaves) else {
+            return MainIndexScan::Skip; // interior/doclist-index/unparseable leaf
+        };
+        for (term, postings) in terms {
+            for p in &postings {
+                if p.del {
+                    return MainIndexScan::Skip; // tombstone: delete/update history
+                }
+                seen.push((term.clone(), p.rowid, si));
+            }
+            per_term.entry(term).or_default().extend(postings);
+        }
+    }
+    // A (term, rowid) present in more than one segment is an update's shadowing
+    // write — precedence we do not resolve here, so skip.
+    seen.sort();
+    for w in seen.windows(2) {
+        if w[0].0 == w[1].0 && w[0].1 == w[1].1 && w[0].2 != w[1].2 {
+            return MainIndexScan::Skip;
+        }
+    }
+    let mut out: Vec<(Vec<u8>, Vec<Posting>)> = Vec::with_capacity(per_term.len());
+    for (term, mut ps) in per_term {
+        ps.sort_by_key(|p| p.rowid);
+        out.push((term, ps));
+    }
+    MainIndexScan::Clean(out)
+}
+
 /// Look up `term` in an FTS5 index given its `%_data` rows, returning the rowids
 /// of the documents that contain the term (ascending), or `None` if the index
 /// shape is one the leaf reader cannot serve.
