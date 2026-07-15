@@ -98,6 +98,15 @@ pub struct WritePager {
     file: Box<dyn File>,
     journal: Option<Box<dyn File>>,
     header: DatabaseHeader,
+    /// The header as it stands in the **last committed** database. `header` is
+    /// mutated in place throughout a transaction (freelist trunk/count,
+    /// `largest_root_page`, `user_version`, …), so on ROLLBACK it must be
+    /// restored to the committed state — otherwise a stale freelist pointer left
+    /// by the rolled-back transaction sends the next allocation reading a page
+    /// that only ever existed in the discarded, grown file. Refreshed on every
+    /// successful commit (and on the VACUUM image replace), restored by
+    /// [`rollback`](Self::rollback).
+    committed_header: DatabaseHeader,
     page_size: usize,
     /// Pages currently on disk (the durable page count).
     disk_pages: u32,
@@ -277,6 +286,7 @@ impl WritePager {
         Ok(WritePager {
             file,
             journal,
+            committed_header: header.clone(),
             header,
             page_size,
             disk_pages: pages,
@@ -365,6 +375,7 @@ impl WritePager {
         let mut wp = WritePager {
             file,
             journal,
+            committed_header: header.clone(),
             header,
             page_size: page_size as usize,
             disk_pages: 0,
@@ -1455,6 +1466,12 @@ impl WritePager {
     /// Discard all staged changes (ROLLBACK).
     pub fn rollback(&mut self) {
         self.overlay.clear();
+        // `header` was mutated in place during the transaction (freelist
+        // trunk/count, `largest_root_page`, `user_version`, …); restore it to the
+        // last committed state. Skipping this leaves a stale freelist pointer that
+        // sends the next allocation reading a page that only existed in the
+        // discarded, grown file (a spurious "page N out of range").
+        self.header = self.committed_header.clone();
         // The durable page count is the last WAL commit's in WAL mode, else the
         // main file's.
         self.page_count = match &self.wal {
@@ -1564,6 +1581,9 @@ impl WritePager {
         }
 
         self.disk_pages = self.page_count;
+        // The header just became durable: it is now the committed state a later
+        // ROLLBACK must restore to.
+        self.committed_header = self.header.clone();
         self.overlay.clear();
         // The main file's contents just changed under the clean read cache; drop
         // it so subsequent reads re-fetch the committed bytes.
@@ -1754,6 +1774,9 @@ impl WritePager {
         });
         wal.snapshot.set(snapshot);
         wal.db_size.set(new_count);
+        // The header just became durable in the WAL: it is now the committed
+        // state a later ROLLBACK must restore to.
+        self.committed_header = self.header.clone();
         self.overlay.clear();
         self.savepoints.clear();
         // WAL writers serialize via the write-intent lock taken in write_page;
@@ -1878,6 +1901,8 @@ impl WritePager {
                 salt,
             });
         }
+        // The rebuilt image is now the committed state a later ROLLBACK restores.
+        self.committed_header = self.header.clone();
         Ok(())
     }
 
