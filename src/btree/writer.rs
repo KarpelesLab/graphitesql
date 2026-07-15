@@ -59,8 +59,12 @@ pub fn create_table_root(wp: &mut WritePager) -> Result<u32> {
 /// Insert (or replace) a row `(rowid, payload)` into the table b-tree at `root`.
 pub fn insert_table(wp: &mut WritePager, root: u32, rowid: i64, payload: &[u8]) -> Result<()> {
     let cell = build_leaf_cell(wp, rowid, payload)?;
-    if let Some(split) = insert_rec(wp, root, rowid, cell)? {
-        grow_root(wp, root, split)?;
+    match insert_rec(wp, root, rowid, cell)? {
+        Up::Fit => {}
+        Up::Split(split) => grow_root(wp, root, split)?,
+        // The root itself is a leaf that overflowed: deepen the tree (SQLite's
+        // `balance_deeper`) and redistribute its cells across the new children.
+        Up::LeafOverfull(cells) => deepen_leaf_root(wp, root, cells)?,
     }
     Ok(())
 }
@@ -231,12 +235,19 @@ pub(crate) fn write_overflow_chain(wp: &mut WritePager, data: &[u8]) -> Result<u
     Ok(pages[0])
 }
 
-fn insert_rec(
-    wp: &mut WritePager,
-    page_no: u32,
-    rowid: i64,
-    cell: Vec<u8>,
-) -> Result<Option<Split>> {
+/// What a level of the recursion reports to its caller.
+enum Up {
+    /// The page absorbed the insert (and was written); nothing to do above.
+    Fit,
+    /// A leaf overflowed. The full, still-sorted cell list is handed up so the
+    /// parent can rebalance this leaf together with its siblings (SQLite's
+    /// `balance_nonroot`); the overflowing leaf has **not** been written.
+    LeafOverfull(Vec<LeafCell>),
+    /// An interior page split (rare, deep trees) and bubbled a separator up.
+    Split(Split),
+}
+
+fn insert_rec(wp: &mut WritePager, page_no: u32, rowid: i64, cell: Vec<u8>) -> Result<Up> {
     let page = wp.page(page_no)?;
     let body = page.body_offset();
     let bt = BtreePage::parse(page)?;
@@ -250,139 +261,251 @@ fn insert_rec(
                 Ok(pos) => cells[pos] = (rowid, cell), // replace existing rowid
                 Err(pos) => cells.insert(pos, (rowid, cell)),
             }
-            let header_prefix = page_one_prefix(page_no, &bt);
             if leaf_fits(&cells, body, page_size) {
+                let header_prefix = page_one_prefix(page_no, &bt);
                 let buf = serialize_leaf(page_size, body, &cells, header_prefix.as_deref())?;
                 wp.write_page(page_no, buf)?;
-                Ok(None)
+                Ok(Up::Fit)
             } else {
-                // Repack the over-full cell list into as many consecutive parts as
-                // are needed for each part to individually fit its page (a robust
-                // multi-way split — a single fixed halving is not enough when one
-                // near-page-sized cell skews the byte total). Part 0 reuses this
-                // page; the rest become fresh right-sibling pages.
-                let ranges = pack_leaf_ranges(&cells, body, page_size);
-                if ranges.len() == 1 {
-                    // A single cell that will not fit this page's body offset. For
-                    // a body-0 page this is impossible (one leaf cell always fits a
-                    // body-0 page); it can only be a page-1 leaf (the schema table)
-                    // holding an oversized single row. Write it back defensively —
-                    // `serialize_leaf` returns `Corrupt` rather than panicking if it
-                    // truly cannot fit.
-                    let buf = serialize_leaf(page_size, body, &cells, header_prefix.as_deref())?;
-                    wp.write_page(page_no, buf)?;
-                    return Ok(None);
-                }
-                let r0 = ranges[0].clone();
-                let first_key = cells[r0.end - 1].0;
-                let left_buf =
-                    serialize_leaf(page_size, body, &cells[r0], header_prefix.as_deref())?;
-                wp.write_page(page_no, left_buf)?;
-                let mut siblings = Vec::with_capacity(ranges.len() - 1);
-                for r in &ranges[1..] {
-                    let sep = cells[r.end - 1].0;
-                    let pg = wp.allocate_page()?;
-                    let buf = serialize_leaf(page_size, 0, &cells[r.clone()], None)?;
-                    wp.write_page(pg, buf)?;
-                    siblings.push((sep, pg));
-                }
-                Ok(Some(Split {
-                    first_key,
-                    siblings,
-                }))
+                // Hand the overflow up: the parent pools this leaf with its
+                // siblings and redistributes so the tree stays compact.
+                Ok(Up::LeafOverfull(cells))
             }
         }
         PageType::InteriorTable => {
             let n = bt.num_cells();
-            let mut cells: Vec<(u32, i64)> = Vec::with_capacity(n);
+            let mut children: Vec<u32> = Vec::with_capacity(n + 1);
+            let mut dividers: Vec<i64> = Vec::with_capacity(n);
             for i in 0..n {
-                cells.push((bt.child_pointer(i)?, bt.table_interior_key(i)?));
+                children.push(bt.child_pointer(i)?);
+                dividers.push(bt.table_interior_key(i)?);
             }
-            let mut right = bt.right_pointer();
+            children.push(bt.right_pointer());
+            let prefix = page_one_prefix(page_no, &bt);
+            drop(bt);
 
-            // Descend at the first cell whose key >= rowid, else the right child.
+            // Descend at the first divider whose key >= rowid, else the right child.
             let mut p = n;
-            let mut child = right;
-            for (i, c) in cells.iter().enumerate() {
-                if rowid <= c.1 {
+            for (i, d) in dividers.iter().enumerate() {
+                if rowid <= *d {
                     p = i;
-                    child = c.0;
                     break;
                 }
             }
 
-            if let Some(s) = insert_rec(wp, child, rowid, cell)? {
-                // The child split into its (reused) page plus one or more new
-                // siblings; adopt them all. The reused child keeps its page number
-                // but takes a new separator (`first_key`); each new sibling is
-                // inserted after it with its own separator.
-                let mut sibs = s.siblings;
-                if p < n {
-                    let old_key = cells[p].1;
-                    cells[p].1 = s.first_key;
-                    // The last sibling covers the old separator's upper bound.
-                    if let Some(last) = sibs.last_mut() {
-                        last.0 = old_key;
-                    }
-                    for (off, (k, pg)) in sibs.into_iter().enumerate() {
-                        cells.insert(p + 1 + off, (pg, k));
-                    }
-                } else {
-                    // Descended into the right-most child: it keeps its page as a
-                    // now-non-right cell; the last new sibling becomes the new
-                    // right-most pointer.
-                    cells.push((child, s.first_key));
-                    let last = sibs.pop().expect("split always has a sibling");
-                    for (k, pg) in sibs {
-                        cells.push((pg, k));
-                    }
-                    right = last.1;
+            match insert_rec(wp, children[p], rowid, cell)? {
+                Up::Fit => return Ok(Up::Fit), // this page is unchanged
+                Up::LeafOverfull(child_cells) => {
+                    balance_leaf_into(wp, &mut children, &mut dividers, p, child_cells)?;
                 }
+                Up::Split(s) => adopt_split(&mut children, &mut dividers, p, s),
             }
 
-            let header_prefix = page_one_prefix(page_no, &bt);
-            if interior_fits(&cells, body, page_size) {
-                let buf =
-                    serialize_interior(page_size, body, &cells, right, header_prefix.as_deref())?;
-                wp.write_page(page_no, buf)?;
-                Ok(None)
-            } else {
-                // Robust multi-way interior split: partition the children into
-                // groups that each fit, promoting one separator key between groups.
-                let (parts, seps) = pack_interior(&cells, right, body, page_size);
-                if parts.len() == 1 {
-                    // Interior cells are tiny, so a single un-splittable part is
-                    // unreachable in practice; write back defensively.
-                    let (pc, pr) = &parts[0];
-                    let buf =
-                        serialize_interior(page_size, body, pc, *pr, header_prefix.as_deref())?;
-                    wp.write_page(page_no, buf)?;
-                    return Ok(None);
-                }
-                let first_key = seps[0];
-                let (p0c, p0r) = &parts[0];
-                let left_buf =
-                    serialize_interior(page_size, body, p0c, *p0r, header_prefix.as_deref())?;
-                wp.write_page(page_no, left_buf)?;
-                let mut siblings = Vec::with_capacity(parts.len() - 1);
-                for k in 1..parts.len() {
-                    let (pc, pr) = &parts[k];
-                    let pg = wp.allocate_page()?;
-                    let buf = serialize_interior(page_size, 0, pc, *pr, None)?;
-                    wp.write_page(pg, buf)?;
-                    // Separator following this part; the last part has no promoted
-                    // key (the parent supplies the upper bound).
-                    let key = if k < seps.len() { seps[k] } else { i64::MAX };
-                    siblings.push((key, pg));
-                }
-                Ok(Some(Split {
-                    first_key,
-                    siblings,
-                }))
-            }
+            finish_interior(wp, page_no, body, page_size, &children, &dividers, prefix)
         }
         _ => Err(Error::Corrupt("insert into a non-table b-tree".into())),
     }
+}
+
+/// Adopt an interior-child split into the parent's `children`/`dividers` lists.
+/// The reused child keeps its slot but gets a new upper separator (`first_key`);
+/// each fresh sibling is spliced in after it with its own separator.
+fn adopt_split(children: &mut Vec<u32>, dividers: &mut Vec<i64>, p: usize, s: Split) {
+    let mut sibs = s.siblings;
+    if p < dividers.len() {
+        // Descended into a non-right child: replace divider[p] with the reused
+        // child's new separator, then the new siblings' separators, then the old
+        // separator (which bounds the last new sibling).
+        let old_div = dividers[p];
+        let mut new_divs = Vec::with_capacity(sibs.len() + 1);
+        new_divs.push(s.first_key);
+        for (k, _) in &sibs[..sibs.len() - 1] {
+            new_divs.push(*k);
+        }
+        new_divs.push(old_div);
+        let new_children: Vec<u32> = sibs.iter().map(|(_, pg)| *pg).collect();
+        children.splice(p + 1..p + 1, new_children);
+        dividers.splice(p..p + 1, new_divs);
+    } else {
+        // Descended into the right-most child: it keeps its page (now a normal
+        // cell with separator `first_key`); the last new sibling becomes the new
+        // right-most pointer.
+        let last = sibs.pop().expect("split always has a sibling");
+        dividers.push(s.first_key);
+        for (k, _) in &sibs {
+            dividers.push(*k);
+        }
+        for (_, pg) in &sibs {
+            children.push(*pg);
+        }
+        children.push(last.1);
+    }
+}
+
+/// Rebuild an interior page from its `children`/`dividers` lists, writing it back
+/// if it fits, else performing the (rare) greedy multi-way interior split and
+/// bubbling a [`Split`] up.
+fn finish_interior(
+    wp: &mut WritePager,
+    page_no: u32,
+    body: usize,
+    page_size: usize,
+    children: &[u32],
+    dividers: &[i64],
+    prefix: Option<Vec<u8>>,
+) -> Result<Up> {
+    let mut cells: Vec<(u32, i64)> = Vec::with_capacity(dividers.len());
+    for i in 0..dividers.len() {
+        cells.push((children[i], dividers[i]));
+    }
+    let right = *children.last().expect("interior always has a right child");
+
+    if interior_fits(&cells, body, page_size) {
+        let buf = serialize_interior(page_size, body, &cells, right, prefix.as_deref())?;
+        wp.write_page(page_no, buf)?;
+        return Ok(Up::Fit);
+    }
+    // Robust multi-way interior split (interiors overflow only in deep trees).
+    let (parts, seps) = pack_interior(&cells, right, body, page_size);
+    if parts.len() == 1 {
+        let (pc, pr) = &parts[0];
+        let buf = serialize_interior(page_size, body, pc, *pr, prefix.as_deref())?;
+        wp.write_page(page_no, buf)?;
+        return Ok(Up::Fit);
+    }
+    let first_key = seps[0];
+    let (p0c, p0r) = &parts[0];
+    let left_buf = serialize_interior(page_size, body, p0c, *p0r, prefix.as_deref())?;
+    wp.write_page(page_no, left_buf)?;
+    let mut siblings = Vec::with_capacity(parts.len() - 1);
+    for k in 1..parts.len() {
+        let (pc, pr) = &parts[k];
+        let pg = wp.allocate_page()?;
+        let buf = serialize_interior(page_size, 0, pc, *pr, None)?;
+        wp.write_page(pg, buf)?;
+        let key = if k < seps.len() { seps[k] } else { i64::MAX };
+        siblings.push((key, pg));
+    }
+    Ok(Up::Split(Split {
+        first_key,
+        siblings,
+    }))
+}
+
+/// Rebalance an overflowing leaf (`children[p]`, whose cells are `child_cells`)
+/// together with up to two of its siblings under the same parent, then splice the
+/// resulting pages/dividers back into the parent's `children`/`dividers`. This is
+/// the table-b-tree specialization of SQLite's `balance_nonroot`: because a table
+/// leaf is a leaf-data node, divider keys are regenerated (largest rowid of each
+/// new page) rather than pooled.
+fn balance_leaf_into(
+    wp: &mut WritePager,
+    children: &mut Vec<u32>,
+    dividers: &mut Vec<i64>,
+    p: usize,
+    child_cells: Vec<LeafCell>,
+) -> Result<()> {
+    let (w0, n_old) = super::balance::sibling_window(p, children.len());
+    let usable = wp.usable_size();
+
+    // Pool every window sibling's cells in order. Table leaves are leaf-data, so
+    // the parent dividers are not pooled — they are redundant rowid separators.
+    let old_pages: Vec<u32> = children[w0..w0 + n_old].to_vec();
+    let mut pooled: Vec<LeafCell> = Vec::new();
+    let mut cnt_old: Vec<usize> = Vec::with_capacity(n_old);
+    for (offset, &pg) in old_pages.iter().enumerate() {
+        if w0 + offset == p {
+            pooled.extend(child_cells.iter().cloned());
+        } else {
+            let bt = BtreePage::parse(wp.page(pg)?)?;
+            pooled.extend(read_leaf_cells(&bt, usable)?);
+        }
+        cnt_old.push(pooled.len());
+    }
+
+    let (pages, new_dividers) = balance_leaf_pooled(wp, &old_pages, &pooled, &cnt_old)?;
+
+    // Splice: window children -> new pages; the n_old-1 internal window dividers
+    // -> the new dividers.
+    children.splice(w0..w0 + n_old, pages);
+    dividers.splice(w0..w0 + n_old - 1, new_dividers);
+    Ok(())
+}
+
+/// Redistribute a pool of table-leaf cells across the right number of pages,
+/// reusing `old_pages` (freeing any surplus, allocating any shortfall) and
+/// assigning slices to page numbers in ascending order (matching SQLite's
+/// rekey-to-ascending step). Returns the new page numbers left-to-right and the
+/// `n_new - 1` divider rowids between them (the largest rowid of each page but
+/// the last).
+fn balance_leaf_pooled(
+    wp: &mut WritePager,
+    old_pages: &[u32],
+    pooled: &[LeafCell],
+    cnt_old: &[usize],
+) -> Result<(Vec<u32>, Vec<i64>)> {
+    let usable = wp.usable_size();
+    let page_size = usable + wp.header().reserved_space as usize;
+    let sz: Vec<usize> = pooled.iter().map(|(_, c)| c.len()).collect();
+    let cnt_new = super::balance::distribute(&sz, cnt_old, true, true, usable);
+    let n_new = cnt_new.len();
+    let n_old = old_pages.len();
+
+    // Reuse old pages where possible, allocate the rest, free the surplus, then
+    // assign slices to page numbers in ascending order.
+    let mut kept: Vec<u32> = old_pages.iter().take(n_new).copied().collect();
+    for _ in n_old..n_new {
+        kept.push(wp.allocate_page()?);
+    }
+    for &pg in &old_pages[n_new.min(n_old)..] {
+        wp.free_page(pg)?;
+    }
+    kept.sort_unstable();
+
+    let mut dividers = Vec::with_capacity(n_new.saturating_sub(1));
+    let mut start = 0usize;
+    for (i, &end) in cnt_new.iter().enumerate() {
+        let slice = &pooled[start..end];
+        let buf = serialize_leaf(page_size, 0, slice, None)?;
+        wp.write_page(kept[i], buf)?;
+        if i < n_new - 1 {
+            dividers.push(slice.last().expect("non-empty new page").0);
+        }
+        start = end;
+    }
+    Ok((kept, dividers))
+}
+
+/// The root leaf overflowed: deepen the tree by one level (SQLite's
+/// `balance_deeper`) and redistribute the root's cells across fresh child leaves,
+/// keeping the root's page number (and, for page 1, its database header) stable.
+fn deepen_leaf_root(wp: &mut WritePager, root: u32, cells: Vec<LeafCell>) -> Result<()> {
+    let page_size = wp.usable_size() + wp.header().reserved_space as usize;
+    let bt = BtreePage::parse(wp.page(root)?)?;
+    let body = if root == 1 {
+        crate::format::header::HEADER_LEN
+    } else {
+        0
+    };
+    let prefix = page_one_prefix(root, &bt);
+    drop(bt);
+
+    // A single "old page" holds all the root's cells; balancing splits it into
+    // the necessary leaves. Allocate it as the reuse slot (matching balance_deeper
+    // allocating the child, then balance_nonroot reusing it).
+    let child0 = wp.allocate_page()?;
+    let cnt_old = vec![cells.len()];
+    let (pages, dividers) = balance_leaf_pooled(wp, &[child0], &cells, &cnt_old)?;
+
+    // The root becomes an interior node over the new leaves.
+    let mut icells: Vec<(u32, i64)> = Vec::with_capacity(dividers.len());
+    for (i, d) in dividers.iter().enumerate() {
+        icells.push((pages[i], *d));
+    }
+    let right = *pages.last().expect("deepen always yields >= 2 leaves");
+    let buf = serialize_interior(page_size, body, &icells, right, prefix.as_deref())?;
+    wp.write_page(root, buf)?;
+    Ok(())
 }
 
 /// Grow a new root after the old root split, keeping the root page number stable
@@ -479,43 +602,6 @@ fn interior_cell_len(key: i64) -> usize {
     4 + varint::len(key as u64)
 }
 
-/// Greedily pack an over-full leaf's cells into as many consecutive parts as are
-/// needed for each part to individually fit a leaf page. Returns the index ranges
-/// of the parts, in order. Part 0 is sized against `body0` (its page's body
-/// offset); every later part is sized against a body-0 page. Each returned range
-/// is non-empty and (except for the degenerate case of one cell too large for the
-/// page's body offset — only possible on a page-1 leaf) fits its page.
-fn pack_leaf_ranges(
-    cells: &[LeafCell],
-    body0: usize,
-    page_size: usize,
-) -> Vec<core::ops::Range<usize>> {
-    let n = cells.len();
-    let mut parts = Vec::new();
-    let mut i = 0;
-    while i < n {
-        let body = if parts.is_empty() { body0 } else { 0 };
-        // `leaf_fits` bound: sum(cell.len() + 2) <= page_size - body - 8.
-        let cap = page_size.saturating_sub(body + 8);
-        let mut used = 0usize;
-        let mut j = i;
-        while j < n {
-            let need = cells[j].1.len() + 2;
-            // Always place at least one cell per part (`j == i`), even if that lone
-            // cell exceeds `cap` (unavoidable — a cell cannot be split further).
-            if j == i || used + need <= cap {
-                used += need;
-                j += 1;
-            } else {
-                break;
-            }
-        }
-        parts.push(i..j);
-        i = j;
-    }
-    parts
-}
-
 /// Greedily partition an over-full interior page's children into as many parts as
 /// are needed for each part to individually fit. Children are the cells' left
 /// pointers plus the page's right pointer. Between two adjacent parts one cell's
@@ -584,7 +670,7 @@ fn serialize_leaf(
     // The cell-pointer array grows up from `ptr_base`; cell content is packed down
     // from the page end. They must not meet — otherwise a content byte would land
     // in the pointer array (or the pointer offsets would point past the page end).
-    // The caller (`pack_leaf_ranges`) guarantees a fitting list, but check
+    // The caller (`leaf_fits`/`balance`) guarantees a fitting list, but check
     // defensively so an invariant violation surfaces as `Corrupt`, never a panic.
     let ptr_end = ptr_base + 2 * cells.len();
     let mut content = page_size;
@@ -680,6 +766,51 @@ mod tests {
         let vfs = MemoryVfs::new();
         let f = vfs.open("db", OpenFlags::READ_WRITE_CREATE).unwrap();
         WritePager::create(f, None, 4096).unwrap()
+    }
+
+    fn wp_sized(page_size: u32) -> WritePager {
+        let vfs = MemoryVfs::new();
+        let f = vfs.open("db", OpenFlags::READ_WRITE_CREATE).unwrap();
+        WritePager::create(f, None, page_size).unwrap()
+    }
+
+    /// Insert rowids in a scrambled (non-sequential) order into a small-page tree
+    /// so it grows several levels deep, then verify every row is present, in
+    /// order, and the tree stays compact (sibling rebalancing avoided the
+    /// 1-cell-per-page fragmentation the greedy splitter produced).
+    #[test]
+    fn deep_tree_random_order_is_compact_and_ordered() {
+        let mut wp = wp_sized(512);
+        let root = new_table_root(&mut wp);
+        // 5001 is prime; i*104729 mod 5001 is a permutation of 0..5000.
+        let n: i64 = 5001;
+        for i in 0..n {
+            let rowid = (i.wrapping_mul(104729)).rem_euclid(n) + 1;
+            let rec = encode_record(&[Value::Integer(rowid), Value::Integer(rowid * 3)]);
+            insert_table(&mut wp, root, rowid, &rec).unwrap();
+        }
+        // Scan back: strictly ascending, all present, payloads intact.
+        let mut cur = TableCursor::new(&wp, root);
+        let mut prev = 0i64;
+        let mut count = 0i64;
+        let mut ok = cur.first().unwrap();
+        while ok {
+            let rid = cur.rowid().unwrap();
+            assert!(rid > prev, "out of order: {rid} after {prev}");
+            prev = rid;
+            let cols = decode_record(&cur.payload().unwrap(), TextEncoding::Utf8).unwrap();
+            assert_eq!(cols[1], Value::Integer(rid * 3));
+            count += 1;
+            ok = cur.next().unwrap();
+        }
+        assert_eq!(count, n);
+        // Compactness: a fragmented tree would use thousands of pages for 5001
+        // tiny rows on 512-byte pages; a well-filled one uses ~120-150.
+        assert!(
+            wp.page_count() < 250,
+            "tree fragmented: {} pages for {n} rows",
+            wp.page_count()
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@
 //! This phase is read-only. Insertion, deletion, and page balancing arrive in
 //! Phase 6.
 
+mod balance;
 pub mod cursor;
 pub mod index_writer;
 pub mod page;
