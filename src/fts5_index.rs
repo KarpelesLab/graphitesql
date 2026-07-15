@@ -939,35 +939,41 @@ fn prefix_bytelen(t: &[u8], n_char: usize) -> Option<usize> {
 /// are unioned by rowid; per column the positions are merged and sorted (a
 /// document listing the prefix once per contributing term keeps every position),
 /// matching sqlite's hash-merge of the several `'N'`-prefixed doclists.
+///
+/// The DELETE flag propagates: sqlite's `sqlite3Fts5IndexWrite` writes a delete
+/// marker into the prefix index for every deleted token, and `bDel` is a
+/// per-`(prefix key, rowid)` flag committed with the poslist size. So the merged
+/// prefix posting for a rowid is a tombstone iff ANY contributing main-term
+/// posting for that rowid is a delete — a pure delete keeps `del=true` with no
+/// positions, and an update whose old and new tokens share a prefix keeps
+/// `del=true` WITH the new positions (size field `content_len*2 + 1`). For a
+/// pure-insert flush every contributor has `del=false`, so this is unchanged.
 fn merge_prefix_postings(groups: &[&[Posting]]) -> Vec<Posting> {
     use alloc::collections::BTreeMap;
-    // rowid -> per-column positions (kept sorted+deduplicated per column).
-    let mut by_rowid: BTreeMap<i64, Vec<Vec<u32>>> = BTreeMap::new();
+    // rowid -> (delete flag, per-column positions kept sorted+deduplicated).
+    let mut by_rowid: BTreeMap<i64, (bool, Vec<Vec<u32>>)> = BTreeMap::new();
     for postings in groups {
         for p in *postings {
             let entry = by_rowid
                 .entry(p.rowid)
-                .or_insert_with(|| alloc::vec![Vec::new(); p.cols.len()]);
-            if entry.len() < p.cols.len() {
-                entry.resize(p.cols.len(), Vec::new());
+                .or_insert_with(|| (false, alloc::vec![Vec::new(); p.cols.len()]));
+            entry.0 |= p.del;
+            if entry.1.len() < p.cols.len() {
+                entry.1.resize(p.cols.len(), Vec::new());
             }
             for (c, positions) in p.cols.iter().enumerate() {
-                entry[c].extend_from_slice(positions);
+                entry.1[c].extend_from_slice(positions);
             }
         }
     }
     by_rowid
         .into_iter()
-        .map(|(rowid, mut cols)| {
+        .map(|(rowid, (del, mut cols))| {
             for col in &mut cols {
                 col.sort_unstable();
                 col.dedup();
             }
-            Posting {
-                rowid,
-                cols,
-                del: false,
-            }
+            Posting { rowid, cols, del }
         })
         .collect()
 }
@@ -1131,6 +1137,42 @@ pub(crate) fn build_merged_segment_block(
         w.merge_mode = true;
         for (term, postings) in terms {
             w.add_term(term, postings);
+        }
+        if terms.is_empty() {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            w.finish()
+        }
+    };
+    let mut data: Vec<(i64, Vec<u8>)> = Vec::new();
+    for (i, leaf) in leaves.iter().enumerate() {
+        data.push((segment_leaf_rowid(segid, i as i64 + 1), leaf.clone()));
+    }
+    data.extend(dlidx);
+    SegmentBlock {
+        data,
+        idx,
+        docsize: Vec::new(),
+        n_leaves: leaves.len() as i64,
+    }
+}
+
+/// The prefix-aware sibling of [`build_merged_segment_block`]: the input `terms`
+/// carry FULL stored keys (the `'0'`/`'1'`/`'2'`… index-prefix byte included, as
+/// produced by [`merge_segments_keepdel_full`]), so they are written verbatim with
+/// [`SegWriter::add_key`] rather than re-deriving prefixes from the main terms.
+/// Keys must already be in globally ascending order (main terms, then each prefix
+/// index) — which the merge preserves.
+pub(crate) fn build_merged_segment_block_full(
+    terms: &[(Vec<u8>, Vec<Posting>)],
+    pgsz: usize,
+    segid: i64,
+) -> SegmentBlock {
+    let (leaves, idx, dlidx) = {
+        let mut w = SegWriter::new(pgsz.max(16), segid);
+        w.merge_mode = true;
+        for (key, postings) in terms {
+            w.add_key(key, postings);
         }
         if terms.is_empty() {
             (Vec::new(), Vec::new(), Vec::new())
@@ -1867,6 +1909,33 @@ pub(crate) fn read_segment_postings(leaves: &[&[u8]]) -> Option<Vec<(Vec<u8>, Ve
     Some(out)
 }
 
+/// Like [`read_segment_postings`] but keeps the FULL stored key (the index-prefix
+/// byte plus the term bytes) for every term, so a prefix-configured segment (main
+/// `'0'` terms followed by each prefix index's `'1'`/`'2'`/… terms) round-trips
+/// through the tombstone-preserving merge path. Feed the result back to
+/// [`build_merged_segment_block_full`], which re-emits the keys verbatim.
+/// Postings preserve DELETE markers. `None` (bail) on an interior/doclist-index
+/// page (an unparseable leaf).
+pub(crate) fn read_segment_postings_full(leaves: &[&[u8]]) -> Option<Vec<(Vec<u8>, Vec<Posting>)>> {
+    let mut views: Vec<LeafView> = Vec::with_capacity(leaves.len());
+    for leaf in leaves {
+        views.push(parse_leaf(leaf)?);
+    }
+    let mut out: Vec<(Vec<u8>, Vec<Posting>)> = Vec::new();
+    for (li, view) in views.iter().enumerate() {
+        for (ti, rec) in view.terms.iter().enumerate() {
+            if rec.key.is_empty() {
+                return None; // empty key: unexpected, bail
+            }
+            let key = rec.key.clone();
+            let runs = gather_doclist_runs(leaves, li, ti, rec.doclist_start, &views)?;
+            let postings = decode_doclist_keepdel(&runs)?;
+            out.push((key, postings));
+        }
+    }
+    Some(out)
+}
+
 /// Merge already-parsed segments (`segs[0]` OLDEST … `segs.last()` NEWEST — the
 /// `pLvl->aSeg[]` order) into one ascending-term / ascending-rowid stream,
 /// newest-segment-wins per rowid, applying sqlite's key-annihilation rule.
@@ -1921,6 +1990,24 @@ pub(crate) fn merge_segments_keepdel(
     let mut segs: Vec<Vec<(Vec<u8>, Vec<Posting>)>> = Vec::with_capacity(seg_leaves.len());
     for leaves in seg_leaves {
         segs.push(read_segment_postings(leaves)?);
+    }
+    Some(merge_level_postings(&segs, b_oldest))
+}
+
+/// The prefix-aware sibling of [`merge_segments_keepdel`]: reads each segment with
+/// [`read_segment_postings_full`] (FULL keys, so the main `'0'` and prefix
+/// `'1'`/`'2'`/… term streams are merged together, exactly as sqlite keeps them in
+/// one segment) then [`merge_level_postings`] them. Because `merge_level_postings`
+/// keys purely on the raw key bytes and `'0' < '1' < '2' < …`, the output stays in
+/// the globally ascending key order the writer requires. `None` if any segment is
+/// unservable (interior/dlidx page).
+pub(crate) fn merge_segments_keepdel_full(
+    seg_leaves: &[Vec<&[u8]>],
+    b_oldest: bool,
+) -> Option<Vec<(Vec<u8>, Vec<Posting>)>> {
+    let mut segs: Vec<Vec<(Vec<u8>, Vec<Posting>)>> = Vec::with_capacity(seg_leaves.len());
+    for leaves in seg_leaves {
+        segs.push(read_segment_postings_full(leaves)?);
     }
     Some(merge_level_postings(&segs, b_oldest))
 }

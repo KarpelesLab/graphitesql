@@ -332,14 +332,24 @@ pub struct Connection {
     /// the rest of the transaction state at commit / rollback.
     #[cfg(feature = "fts5")]
     fts5_txn_ops: alloc::collections::BTreeMap<String, Vec<Fts5TxnOp>>,
-    /// Self-content `fts5` tables written while a `SAVEPOINT` was open in the
-    /// current transaction. Their ordered op-log cannot be replayed faithfully
-    /// (a `ROLLBACK TO` can discard an arbitrary suffix), so they fall back to the
-    /// consolidated content-diff flush (`fts5_txn_dirty`) — correct and
-    /// integrity-clean, matching the pre-existing behavior. Cleared at commit /
-    /// rollback.
+    /// Self-content `fts5` tables that are SAVEPOINT-involved: written while a
+    /// `SAVEPOINT` was open, or reached at a savepoint-boundary flush. These mirror
+    /// SQLite's `xSavepoint`, which flushes the pending in-memory postings to disk
+    /// as a level-0 segment at each savepoint open (before the pager savepoint, so a
+    /// later `ROLLBACK TO` reverts only the segments written after it) and again at
+    /// `xSync`/commit. The per-table op-log (`fts5_txn_ops`) holds the ops since the
+    /// last flush; each boundary/commit flush replays it into batches and then
+    /// clears it. Cleared at commit / rollback.
     #[cfg(feature = "fts5")]
     fts5_txn_sp_used: alloc::collections::BTreeSet<String>,
+    /// SAVEPOINT-involved tables whose incremental batch flush DECLINED at some
+    /// boundary (a spanning doclist or all-empty tombstone batch the incremental
+    /// writer cannot reproduce). They fall back to a single consolidated rebuild
+    /// from the live `<name>_content` at the final commit flush — correct and
+    /// integrity-clean, though not byte-identical for that rare shape. Cleared at
+    /// commit / rollback.
+    #[cfg(feature = "fts5")]
+    fts5_txn_sp_bail: alloc::collections::BTreeSet<String>,
     /// Whether `SELECT` execution tries the VDBE engine first, falling back
     /// transparently to the tree-walker for any query shape it does not support.
     /// **On by default** (Track B, B7b): the VDBE is the primary engine, parity-
@@ -622,6 +632,8 @@ impl Connection {
             fts5_txn_ops: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "fts5")]
             fts5_txn_sp_used: alloc::collections::BTreeSet::new(),
+            #[cfg(feature = "fts5")]
+            fts5_txn_sp_bail: alloc::collections::BTreeSet::new(),
             use_vdbe: core::cell::Cell::new(true),
             session: core::cell::RefCell::new(None),
             update_hook: core::cell::RefCell::new(None),
@@ -685,6 +697,8 @@ impl Connection {
             fts5_txn_ops: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "fts5")]
             fts5_txn_sp_used: alloc::collections::BTreeSet::new(),
+            #[cfg(feature = "fts5")]
+            fts5_txn_sp_bail: alloc::collections::BTreeSet::new(),
             use_vdbe: core::cell::Cell::new(true),
             session: core::cell::RefCell::new(None),
             update_hook: core::cell::RefCell::new(None),
@@ -5895,6 +5909,10 @@ impl Connection {
                 self.backend.writer()?.rollback_to_savepoint(name)?;
                 self.rollback_to_attached(name)?;
                 self.open_savepoints = self.backend.writer()?.savepoint_depth();
+                // Discard the fts5 pending postings made since the last flush; the
+                // pager reverts any on-disk segments written after this savepoint.
+                #[cfg(feature = "fts5")]
+                self.fts5_rollback_to_txn();
                 // The schema may have reverted to the savepoint's state.
                 self.schema = Schema::read(self.backend.source())?;
                 return Ok(0);
@@ -33883,42 +33901,55 @@ impl Connection {
             if crate::vtab::fts5_no_local_content(&arg_refs) {
                 continue;
             }
-            let prefixes = crate::vtab::fts5_prefix_lengths(&arg_refs);
 
-            // A table written under an open SAVEPOINT, or any flush at a savepoint
-            // boundary (`!is_final`), takes the LEGACY consolidated path: insert-only
-            // tables append one incremental segment; delete/update tables rebuild
-            // once at the final flush. This preserves the pre-existing behavior
-            // (correct, integrity-clean) for the shapes the ordered-op replay cannot
-            // reproduce faithfully across a `ROLLBACK TO`. Prefix tables with a
-            // delete/update also rebuild (the incremental delete path is main-index
-            // only).
-            let legacy = !is_final || self.fts5_txn_sp_used.contains(&table);
-            if legacy || (!prefixes.is_empty() && needs_rebuild) {
-                if needs_rebuild {
+            // SAVEPOINT-involved (written under an open savepoint, or reached at a
+            // savepoint-boundary flush, `!is_final`): mirror SQLite's `xSavepoint`,
+            // which flushes the pending postings to disk as a level-0 segment at each
+            // savepoint open (before the pager savepoint, so `ROLLBACK TO` reverts
+            // only later segments) and again at `xSync`. Replay the CURRENT pending
+            // op-log (the ops since the last flush) into its batches, write each as a
+            // segment, then CLEAR the op-log so the next boundary/commit flush only
+            // emits the new ops. The `dirty` rebuild flag is irrelevant here — the
+            // batch flush carries inserts AND tombstones uniformly — so it is not
+            // consulted; `fts5_flush_batch` and the tombstone-preserving merge honor
+            // the `prefixes` list, so prefix tables work too.
+            let sp_mode = !is_final || self.fts5_txn_sp_used.contains(&table);
+            if sp_mode {
+                if !is_final {
+                    self.fts5_txn_sp_used.insert(table.clone());
+                }
+                if self.fts5_txn_sp_bail.contains(&table) {
+                    // An earlier flush declined; the whole index is rebuilt once at
+                    // commit from the live corpus.
                     if is_final {
                         self.fts5_rebuild_index(&table)?;
                     }
-                } else if !self.fts5_incremental_write(&table)? && is_final {
-                    self.fts5_rebuild_index(&table)?;
+                    continue;
+                }
+                let ops = self.fts5_txn_ops.get(&table).cloned().unwrap_or_default();
+                if !ops.is_empty() {
+                    let batches = Self::fts5_txn_simulate_batches(&ops);
+                    if self.fts5_flush_txn_batches(&table, &batches)? {
+                        // Consumed — start the next flush's op-log fresh.
+                        self.fts5_txn_ops.insert(table.clone(), Vec::new());
+                    } else {
+                        // Decline: defer to a single consolidated rebuild at commit.
+                        // The partial batches already written are discarded by the
+                        // rebuild (which wipes the shadow tables first).
+                        self.fts5_txn_sp_bail.insert(table.clone());
+                        if is_final {
+                            self.fts5_rebuild_index(&table)?;
+                        }
+                    }
                 }
                 continue;
             }
 
-            // Prefix table, insert-only, plain transaction: the incremental append
-            // (which handles prefixes) writes one level-0 segment — byte-identical
-            // to sqlite for monotonic rowids. (Out-of-order rowids in a prefix table
-            // consolidate to one segment here rather than several; an accepted
-            // residual, since the tombstone-preserving reader is main-index only.)
-            if !prefixes.is_empty() {
-                if !self.fts5_incremental_write(&table)? {
-                    self.fts5_rebuild_index(&table)?;
-                }
-                continue;
-            }
-
-            // Non-prefix, plain transaction: replay the ordered op log through
-            // sqlite's flush-boundary logic and emit one level-0 segment per batch.
+            // Plain transaction (no savepoint; main OR prefix index): replay the
+            // ordered op log through sqlite's flush-boundary logic and emit one
+            // level-0 segment per batch. Prefix tables take the same path —
+            // `fts5_flush_batch` and the tombstone-preserving merge both honor the
+            // `prefixes` list.
             let ops = self.fts5_txn_ops.get(&table).cloned().unwrap_or_default();
             let batches = Self::fts5_txn_simulate_batches(&ops);
             if batches.len() <= 1 && !needs_rebuild {
@@ -33941,6 +33972,7 @@ impl Connection {
             self.fts5_txn_dirty.clear();
             self.fts5_txn_ops.clear();
             self.fts5_txn_sp_used.clear();
+            self.fts5_txn_sp_bail.clear();
         }
         Ok(())
     }
@@ -34095,10 +34127,10 @@ impl Connection {
         let (_module, args, schema) = self.vtab_meta(name)?;
         let ncols = schema.columns.len();
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        // Prefix-configured tables append a prefix-aware segment: `build_segment_block`
+        // derives the prefix postings/tombstones from the main terms, and the
+        // tombstone-preserving merge services the FULL key stream.
         let prefixes = crate::vtab::fts5_prefix_lengths(&arg_refs);
-        if !prefixes.is_empty() {
-            return Ok(false); // main-index only
-        }
         let tok = crate::vtab::fts5_tok_config(&arg_refs);
 
         // Build the appended segment's ascending term stream: tombstone every old
@@ -34298,6 +34330,24 @@ impl Connection {
         self.fts5_txn_dirty.clear();
         self.fts5_txn_ops.clear();
         self.fts5_txn_sp_used.clear();
+        self.fts5_txn_sp_bail.clear();
+    }
+
+    /// `ROLLBACK TO <sp>` discards the in-memory pending postings (SQLite's fts5
+    /// `xRollbackTo`, which resets the pending-terms hash), while the pager reverts
+    /// the on-disk segments written after the savepoint AND the `<name>_content`
+    /// rows. The per-table op-log holds exactly the ops made since the last flush
+    /// (the most recent savepoint-open boundary or `BEGIN`), so clearing it discards
+    /// the right suffix — every op flushed at a deeper savepoint boundary was
+    /// written to disk after this savepoint and is reverted by the pager. The
+    /// `dirty`/`sp_used` bookkeeping is kept: the table stays SAVEPOINT-involved so
+    /// the commit flush still (re)writes its averages from the reverted corpus. A
+    /// no-op when the feature is off.
+    #[cfg(feature = "fts5")]
+    fn fts5_rollback_to_txn(&mut self) {
+        for ops in self.fts5_txn_ops.values_mut() {
+            ops.clear();
+        }
     }
 
     /// Handle an fts5 special-command INSERT whose first column is the hidden
@@ -35219,14 +35269,23 @@ impl Connection {
             .iter()
             .map(|s| s.iter().map(|l| l.as_slice()).collect())
             .collect();
-        let terms = match fts5_index::merge_segments_keepdel(&seg_leaves, b_oldest) {
-            Some(t) => t,
-            None => return Ok(None), // unservable (prefix/dlidx/interior) → rebuild
+        // Prefix-configured tables keep the main `'0'` and prefix `'1'`/`'2'`… term
+        // streams in ONE segment, so they read/merge/rewrite the FULL keys together;
+        // the main index uses the `'0'`-stripped reader/writer.
+        let block = if prefixes.is_empty() {
+            let terms = match fts5_index::merge_segments_keepdel(&seg_leaves, b_oldest) {
+                Some(t) => t,
+                None => return Ok(None), // unservable (dlidx/interior) → rebuild
+            };
+            fts5_index::build_merged_segment_block(&terms, 4050, out_segid)
+        } else {
+            let terms = match fts5_index::merge_segments_keepdel_full(&seg_leaves, b_oldest) {
+                Some(t) => t,
+                None => return Ok(None), // unservable (dlidx/interior) → rebuild
+            };
+            fts5_index::build_merged_segment_block_full(&terms, 4050, out_segid)
         };
-
-        // Build the merged output segment with the incremental-merge writer.
-        let block = fts5_index::build_merged_segment_block(&terms, 4050, out_segid);
-        let _ = (ncols, tok, prefixes);
+        let _ = (ncols, tok);
 
         let q = |s: &str| sql::print::ident(s);
         let pv = |vals: Vec<Value>| Params {
@@ -35429,12 +35488,13 @@ impl Connection {
         let (_module, args, schema) = self.vtab_meta(name)?;
         let ncols = schema.columns.len();
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        // Prefix indexes complicate the merged term stream; keep the write path to
-        // the main-index case and let prefix tables rebuild.
+        // Prefix-configured tables append a prefix-aware tombstone/mixed segment:
+        // `build_segment_block` derives the prefix delete markers from the main
+        // terms (`merge_prefix_postings` propagates the `del` flag), and the
+        // tombstone-preserving merge reader/writer service the FULL key stream. A
+        // spanning (dlidx) segment or an unservable merge shape still falls back to
+        // the bulk rebuild below.
         let prefixes = crate::vtab::fts5_prefix_lengths(&arg_refs);
-        if !prefixes.is_empty() {
-            return Ok(false);
-        }
         let tok = crate::vtab::fts5_tok_config(&arg_refs);
 
         // The current live corpus (post-mutation content) drives the averages and

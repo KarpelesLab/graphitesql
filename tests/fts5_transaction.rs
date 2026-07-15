@@ -250,6 +250,133 @@ fn prefix_index_transaction() {
     assert_bytes_identical("prefix", sql);
 }
 
+/// A DELETE under a SAVEPOINT appends the same tombstone segment sqlite's
+/// `xSavepoint`/`xSync` hash flush does — byte-identical, not a consolidated
+/// rebuild. (The delete's pending postings flush at the outermost RELEASE.)
+#[test]
+fn savepoint_delete_byte_identical() {
+    let script = "CREATE VIRTUAL TABLE f USING fts5(a);\n\
+        INSERT INTO f(rowid,a) VALUES(1,'alpha shared body');\n\
+        INSERT INTO f(rowid,a) VALUES(2,'beta shared body');\n\
+        INSERT INTO f(rowid,a) VALUES(3,'gamma shared body');\n\
+        SAVEPOINT s;\n\
+        DELETE FROM f WHERE rowid=2;\n\
+        RELEASE s;\n";
+    assert_bytes_identical("sp-del", script);
+}
+
+/// An UPDATE under a SAVEPOINT (delete-old + insert-new terms) is byte-identical.
+#[test]
+fn savepoint_update_byte_identical() {
+    let script = "CREATE VIRTUAL TABLE f USING fts5(a);\n\
+        INSERT INTO f(rowid,a) VALUES(1,'alpha shared body');\n\
+        INSERT INTO f(rowid,a) VALUES(2,'beta shared body');\n\
+        SAVEPOINT s;\n\
+        UPDATE f SET a='beta changed entirely' WHERE rowid=2;\n\
+        RELEASE s;\n";
+    assert_bytes_identical("sp-upd", script);
+}
+
+/// `SAVEPOINT s; DELETE …; ROLLBACK TO s; DELETE …; RELEASE s` — the first delete
+/// is discarded (pending postings dropped, `_content` reverted), only the second
+/// delete's tombstone segment is written, byte-identical to sqlite.
+#[test]
+fn savepoint_rollback_to_delete_byte_identical() {
+    let script = "CREATE VIRTUAL TABLE f USING fts5(a);\n\
+        INSERT INTO f(rowid,a) VALUES(1,'alpha shared body');\n\
+        INSERT INTO f(rowid,a) VALUES(2,'beta shared body');\n\
+        INSERT INTO f(rowid,a) VALUES(3,'gamma shared body');\n\
+        SAVEPOINT s;\n\
+        DELETE FROM f WHERE rowid=2;\n\
+        ROLLBACK TO s;\n\
+        DELETE FROM f WHERE rowid=3;\n\
+        RELEASE s;\n";
+    assert_bytes_identical("sp-rbto", script);
+}
+
+/// A nested-savepoint delete: `xSavepoint` flushes the pending tombstone for the
+/// outer delete when the inner savepoint opens, so two separate tombstone segments
+/// land — byte-identical to sqlite's per-savepoint hash flush.
+#[test]
+fn savepoint_nested_delete_byte_identical() {
+    let script = "CREATE VIRTUAL TABLE f USING fts5(a);\n\
+        INSERT INTO f(rowid,a) VALUES(1,'alpha shared body');\n\
+        INSERT INTO f(rowid,a) VALUES(2,'beta shared body');\n\
+        INSERT INTO f(rowid,a) VALUES(3,'gamma shared body');\n\
+        SAVEPOINT s1;\n\
+        DELETE FROM f WHERE rowid=1;\n\
+        SAVEPOINT s2;\n\
+        DELETE FROM f WHERE rowid=2;\n\
+        RELEASE s2;\n\
+        RELEASE s1;\n";
+    assert_bytes_identical("sp-nest", script);
+}
+
+/// A SAVEPOINT mixing INSERT + DELETE + UPDATE, then a prefix table under a nested
+/// savepoint with a ROLLBACK TO — the full combined path stays byte-identical.
+#[test]
+fn savepoint_prefix_mixed_byte_identical() {
+    let script = "CREATE VIRTUAL TABLE f USING fts5(a, prefix='2 3');\n\
+        INSERT INTO f(rowid,a) VALUES(1,'apple apricot');\n\
+        INSERT INTO f(rowid,a) VALUES(2,'apple avocado');\n\
+        INSERT INTO f(rowid,a) VALUES(3,'banana berry');\n\
+        SAVEPOINT s1;\n\
+        DELETE FROM f WHERE rowid=1;\n\
+        SAVEPOINT s2;\n\
+        UPDATE f SET a='apple applied' WHERE rowid=2;\n\
+        ROLLBACK TO s2;\n\
+        INSERT INTO f(rowid,a) VALUES(7,'apple xigua');\n\
+        RELEASE s1;\n";
+    assert_bytes_identical("sp-pfx", script);
+}
+
+/// A prefix-index table with a DELETE inside a transaction appends the SAME
+/// prefix-aware tombstone segment sqlite's hash flush does (delete markers for the
+/// main `'0'` terms AND each `'1'`/`'2'`… prefix term) — byte-identical, not a
+/// consolidated rebuild.
+#[test]
+fn prefix_delete_in_txn_byte_identical() {
+    let script = "CREATE VIRTUAL TABLE f USING fts5(a, prefix='2 3');\n\
+        INSERT INTO f(rowid,a) VALUES(1,'apple apricot banana');\n\
+        INSERT INTO f(rowid,a) VALUES(2,'apple avocado cherry');\n\
+        INSERT INTO f(rowid,a) VALUES(3,'banana berry blueberry');\n\
+        INSERT INTO f(rowid,a) VALUES(4,'cherry citrus date');\n\
+        BEGIN;\n\
+        DELETE FROM f WHERE rowid=2;\n\
+        COMMIT;\n";
+    assert_bytes_identical("pfx-del", script);
+}
+
+/// A prefix-index UPDATE inside a transaction (a prefix shared by the old and new
+/// tokens keeps `del=true` WITH the new positions) is byte-identical to sqlite.
+#[test]
+fn prefix_update_in_txn_byte_identical() {
+    let script = "CREATE VIRTUAL TABLE f USING fts5(a, prefix='2 3');\n\
+        INSERT INTO f(rowid,a) VALUES(1,'apple apricot banana');\n\
+        INSERT INTO f(rowid,a) VALUES(2,'apple avocado cherry');\n\
+        INSERT INTO f(rowid,a) VALUES(3,'banana berry blueberry');\n\
+        BEGIN;\n\
+        UPDATE f SET a='apple aardvark applied' WHERE rowid=2;\n\
+        COMMIT;\n";
+    assert_bytes_identical("pfx-upd", script);
+}
+
+/// A prefix-index table with an out-of-order rowid regression inside a transaction
+/// emits the same MULTIPLE prefix-aware level-0 segments sqlite's flush boundaries
+/// do (not one consolidated segment).
+#[test]
+fn prefix_out_of_order_in_txn_byte_identical() {
+    let script = "CREATE VIRTUAL TABLE f USING fts5(a, prefix='2 3');\n\
+        INSERT INTO f(rowid,a) VALUES(1,'apple apricot banana');\n\
+        INSERT INTO f(rowid,a) VALUES(2,'apple avocado cherry');\n\
+        BEGIN;\n\
+        INSERT INTO f(rowid,a) VALUES(9,'zebra zenith');\n\
+        INSERT INTO f(rowid,a) VALUES(6,'apple xigua yam');\n\
+        DELETE FROM f WHERE rowid=1;\n\
+        COMMIT;\n";
+    assert_bytes_identical("pfx-ooo", script);
+}
+
 /// In-transaction `MATCH` visibility: an uncommitted INSERT is visible to a
 /// `MATCH` later in the same transaction, and an uncommitted DELETE hides its row.
 #[test]
