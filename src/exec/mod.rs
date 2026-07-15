@@ -35149,11 +35149,25 @@ impl Connection {
         // leaves the caller's `structure` untouched (it then rebuilds from
         // scratch, discarding this attempt).
         let mut merged = structure.clone();
-        // Replace level 0 with an empty level, add the merged segment at level 1,
-        // then promote. This mirrors fts5IndexMergeLevel + fts5StructurePromote
-        // for the single-crisis case.
-        merged.levels[0].segs.clear();
-        merged.levels[0].n_merge = 0;
+        // This crisis merge REBUILDS the entire live corpus (`docs`) into a single
+        // fresh segment, and the `%_data`/`%_idx` rewrite below WIPES every existing
+        // segment row. So every pre-existing segment — at any level, not just the
+        // level-0 inputs — is now subsumed by the rebuilt segment and its backing
+        // data is gone; drop them ALL, then add the one merged segment at level 1
+        // and promote.
+        //
+        // For the SINGLE-crisis case (level 1 was empty before) this is byte-
+        // identical to sqlite: exactly one segment ends up at level 1. For a DOUBLE
+        // crisis (a second level-0 crisis while level 1 already holds a merged
+        // segment) it diverges structurally — sqlite keeps the older level-1 segment
+        // and produces two via its incremental automerge (not ported) — but the file
+        // stays VALID. Retaining the older segment here (as the code used to) left it
+        // referenced in the structure with no `%_data` backing, which sqlite and the
+        // integrity checker both reject as a malformed inverted index.
+        for lvl in merged.levels.iter_mut() {
+            lvl.segs.clear();
+            lvl.n_merge = 0;
+        }
         if merged.levels.len() < 2 {
             merged.levels.push(crate::fts5_index::StructLevel {
                 n_merge: 0,
