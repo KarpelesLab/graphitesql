@@ -698,8 +698,30 @@ history / `CHANGELOG.md`. Remaining:
   DELETE/UPDATE tombstones incl. delete-crisis merge (git history / `CHANGELOG.md`).
   **Remaining (thin tails — all fall back to the *correct* bulk rebuild, never
   wrong, just not incremental):**
-  - **D2e-1 — delete-crisis with a populated higher level** (needs tombstones
-    carried into the merge). *Target pinned (2026-07-14):* reproduce with an FTS5
+  - **D2e-1 — automerge — DONE 2026-07-14 (`873bbcb`).** Ported sqlite's
+    incremental automerge scheduler (`fts5IndexAutomerge`/`fts5IndexMerge`/
+    `fts5IndexMergeLevel`/`fts5IndexCrisismerge`: `FTS5_WORK_UNIT=64`, threshold 4,
+    `bOldest` key-annihilation) plus a tombstone-preserving segment reader and a
+    merge-mode segment writer, so graphite's `%_data`/`%_idx`/STRUCTURE is now
+    BYTE-IDENTICAL to sqlite for delete-heavy and boundary-crossing corpora (verified
+    40/30, 60/50, 100/80, 88/88, 70/35, pure 66/128/200/256; sqlite reads graphite's
+    files; full FTS5 corpus green; `tests/fts5_automerge.rs`, +953 lines). Residual:
+    a single-level merge exceeding the page budget (thousands of docs) bails to the
+    correct bulk rebuild (never wrong bytes); prefix-index automerge past 64 leaves
+    keeps prior behavior. Implemented via a worktree agent + independent oracle
+    verification. *Investigation history below is SUPERSEDED (kept for context):*
+  - **NEW BUG — delete-heavy FTS5 `%_content` file is sqlite-malformed (found
+    2026-07-14, PRE-EXISTING on master, orthogonal to automerge).** For some
+    delete-heavy corpora (e.g. 150 ins / 100 del, 175/120) graphite writes a file
+    whose fts5 index bytes are byte-identical to sqlite but whose OVERALL b-tree is
+    malformed per sqlite (`PRAGMA quick_check` → "database disk image is malformed")
+    — while graphite's OWN `integrity_check` says `ok`. So it's a `%_content` (or
+    shared-btree) DELETE defect AND an `integrity_check` gap (graphite doesn't detect
+    the malformation sqlite does). Reproduces on `master` before automerge. This is a
+    real CORRECTNESS issue (graphite emits files sqlite can't open) and higher
+    priority than the remaining byte-layout tails. Repro: create an fts5 table, 150
+    autocommit INSERTs, 100 autocommit DELETEs → `sqlite3 g.db 'PRAGMA quick_check'`.
+  - *(historical D2e-1 investigation)* Target pinned (2026-07-14): reproduce with an FTS5
     table, 40 single-row autocommit INSERTs then 30 single-row DELETEs — sqlite
     settles to **7** `%_data` segments, graphite to **10** (graphite stays
     integrity-clean and `MATCH`-correct — byte-structure only). graphite's delete
