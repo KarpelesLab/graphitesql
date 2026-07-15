@@ -8318,7 +8318,8 @@ impl Connection {
                 continue;
             }
             let meta = self.table_meta(&obj.name, None)?;
-            for (_, row) in self.scan_table(&meta)? {
+            // The child may be WITHOUT ROWID — scan by storage kind.
+            for row in self.scan_rows(&meta)? {
                 for fk in &fks {
                     if let Some(key) = self.child_key_values(&meta, fk, &row)
                         && !self.parent_has_key(fk, &key)?
@@ -8358,7 +8359,8 @@ impl Connection {
     fn parent_has_key(&self, fk: &ForeignKey, key: &[Value]) -> Result<bool> {
         let pmeta = self.table_meta(&fk.ref_table, None)?;
         let positions = self.column_positions(&pmeta, &fk.ref_columns)?;
-        for (_, row) in self.scan_table(&pmeta)? {
+        // The parent may be WITHOUT ROWID — scan by storage kind.
+        for row in self.scan_rows(&pmeta)? {
             if positions.iter().zip(key).all(|(&p, k)| {
                 // SQLite compares under the *parent* key column's affinity and
                 // collation: a text child '1' matches an INTEGER parent key 1 (and
@@ -8503,11 +8505,10 @@ impl Connection {
         // matching, the same rule as the child→parent existence check
         // (`parent_has_key`): a text child '1' matches an INTEGER parent key 1.
         let pmeta = self.table_meta(&fk.ref_table, None)?;
-        // Find child rowids whose key matches old_key.
-        let mut matches: Vec<i64> = Vec::new();
-        for (rowid, row) in self.scan_table(&cmeta)? {
-            if cpos
-                .iter()
+        // Whether a child row's FK columns equal `old_key` under the parent key
+        // columns' affinity/collation (the same rule `parent_has_key` uses).
+        let row_matches = |row: &[Value]| -> bool {
+            cpos.iter()
                 .zip(old_key)
                 .zip(parent_pos)
                 .all(|((&cp, k), &pp)| {
@@ -8520,7 +8521,40 @@ impl Connection {
                     crate::value::cmp_values_coll(&pv, &kv, pmeta.columns[pp].collation)
                         == core::cmp::Ordering::Equal
                 })
-            {
+        };
+        // A WITHOUT ROWID child is index-organized (no rowid): identify its rows
+        // by scan position and apply changes with a whole-table rewrite (the same
+        // primitive its native DELETE/UPDATE use), never by rowid.
+        if cmeta.without_rowid {
+            let rows = self.scan_without_rowid(&cmeta)?;
+            let matched: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| row_matches(r))
+                .map(|(i, _)| i)
+                .collect();
+            if matched.is_empty() {
+                return Ok(());
+            }
+            return self.apply_fk_action_wr(
+                &cmeta,
+                &pmeta,
+                child_table,
+                fk,
+                old_key,
+                new_parent,
+                parent_pos,
+                &cpos,
+                action,
+                &rows,
+                &matched,
+                params,
+            );
+        }
+        // Find child rowids whose key matches old_key.
+        let mut matches: Vec<i64> = Vec::new();
+        for (rowid, row) in self.scan_table(&cmeta)? {
+            if row_matches(&row) {
                 matches.push(rowid);
             }
         }
@@ -8556,56 +8590,170 @@ impl Connection {
                 Ok(())
             }
             FkAction::SetDefault => {
-                let defaults: Vec<Value> = cpos
-                    .iter()
-                    .map(|&p| match &cmeta.defaults[p] {
-                        Some(e) => eval::eval(e, &EvalCtx::rowless(params)).unwrap_or(Value::Null),
-                        None => Value::Null,
-                    })
-                    .collect();
-                // SQLite re-checks the FK after applying the default value: unless
-                // the default key contains a NULL (MATCH SIMPLE ⇒ satisfied), it
-                // must reference a parent that still exists *after* this change,
-                // else the child dangles and the statement fails.
-                if !defaults.iter().any(|v| matches!(v, Value::Null)) {
-                    // Compare two FK keys under the parent columns' affinity /
-                    // collation, the same rule the child→parent match uses.
-                    let key_eq = |a: &[Value], b: &[Value]| -> bool {
-                        a.iter().zip(b).zip(parent_pos).all(|((av, bv), &pp)| {
-                            let (x, y) = eval::apply_comparison_affinity(
-                                av.clone(),
-                                Some(pmeta.columns[pp].affinity),
-                                bv.clone(),
-                                None,
-                            );
-                            crate::value::cmp_values_coll(&x, &y, pmeta.columns[pp].collation)
-                                == core::cmp::Ordering::Equal
-                        })
-                    };
-                    let valid = match new_parent {
-                        // UPDATE: the parent whose key was `old_key` now has the new
-                        // key. The default is valid if it names that new key, or a
-                        // *different* unchanged parent (`parent_has_key` still sees
-                        // the pre-write table, so exclude the row being changed).
-                        Some(np) => {
-                            let new_key: Vec<Value> =
-                                parent_pos.iter().map(|&p| np[p].clone()).collect();
-                            key_eq(&defaults, &new_key)
-                                || (self.parent_has_key(fk, &defaults)?
-                                    && !key_eq(&defaults, old_key))
-                        }
-                        // DELETE: the parent row is already removed (exec_delete_inner
-                        // reorders the delete ahead of this), so a plain existence
-                        // check reflects the post-delete state.
-                        None => self.parent_has_key(fk, &defaults)?,
-                    };
-                    if !valid {
-                        return Err(Error::Constraint("FOREIGN KEY constraint failed".into()));
-                    }
-                }
+                let defaults = self.fk_set_default_values(
+                    &cmeta, &pmeta, fk, old_key, new_parent, parent_pos, &cpos, params,
+                )?;
                 for rowid in matches {
                     self.update_child_key(&cmeta, child_table, rowid, &cpos, &defaults)?;
                 }
+                Ok(())
+            }
+        }
+    }
+
+    /// Compute the SET DEFAULT replacement key for `fk`'s child columns and
+    /// verify (as SQLite does) that it still references an existing parent —
+    /// unless a NULL makes the key MATCH SIMPLE-satisfied. Shared by the rowid
+    /// and WITHOUT ROWID child paths.
+    #[allow(clippy::too_many_arguments)]
+    fn fk_set_default_values(
+        &self,
+        cmeta: &TableMeta,
+        pmeta: &TableMeta,
+        fk: &ForeignKey,
+        old_key: &[Value],
+        new_parent: Option<&[Value]>,
+        parent_pos: &[usize],
+        cpos: &[usize],
+        params: &Params,
+    ) -> Result<Vec<Value>> {
+        let defaults: Vec<Value> = cpos
+            .iter()
+            .map(|&p| match &cmeta.defaults[p] {
+                Some(e) => eval::eval(e, &EvalCtx::rowless(params)).unwrap_or(Value::Null),
+                None => Value::Null,
+            })
+            .collect();
+        // SQLite re-checks the FK after applying the default value: unless the
+        // default key contains a NULL (MATCH SIMPLE ⇒ satisfied), it must
+        // reference a parent that still exists *after* this change, else the
+        // child dangles and the statement fails.
+        if !defaults.iter().any(|v| matches!(v, Value::Null)) {
+            // Compare two FK keys under the parent columns' affinity / collation,
+            // the same rule the child→parent match uses.
+            let key_eq = |a: &[Value], b: &[Value]| -> bool {
+                a.iter().zip(b).zip(parent_pos).all(|((av, bv), &pp)| {
+                    let (x, y) = eval::apply_comparison_affinity(
+                        av.clone(),
+                        Some(pmeta.columns[pp].affinity),
+                        bv.clone(),
+                        None,
+                    );
+                    crate::value::cmp_values_coll(&x, &y, pmeta.columns[pp].collation)
+                        == core::cmp::Ordering::Equal
+                })
+            };
+            let valid = match new_parent {
+                // UPDATE: the parent whose key was `old_key` now has the new key.
+                // The default is valid if it names that new key, or a *different*
+                // unchanged parent (`parent_has_key` still sees the pre-write
+                // table, so exclude the row being changed).
+                Some(np) => {
+                    let new_key: Vec<Value> = parent_pos.iter().map(|&p| np[p].clone()).collect();
+                    key_eq(&defaults, &new_key)
+                        || (self.parent_has_key(fk, &defaults)? && !key_eq(&defaults, old_key))
+                }
+                // DELETE: the parent row is already removed (exec_delete_inner
+                // reorders the delete ahead of this), so a plain existence check
+                // reflects the post-delete state.
+                None => self.parent_has_key(fk, &defaults)?,
+            };
+            if !valid {
+                return Err(Error::Constraint("FOREIGN KEY constraint failed".into()));
+            }
+        }
+        Ok(defaults)
+    }
+
+    /// Apply a foreign-key action to a WITHOUT ROWID (index-organized) child.
+    /// Rows are identified by their scan position (`matched` indexes into
+    /// `rows`); the change is committed with a whole-table rewrite via
+    /// [`rewrite_without_rowid`](Self::rewrite_without_rowid) +
+    /// [`rebuild_wr_indexes`](Self::rebuild_wr_indexes) — the same primitives the
+    /// table's native DELETE/UPDATE use. `compact_table` is rowid-only and must
+    /// never run here.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_fk_action_wr(
+        &mut self,
+        cmeta: &TableMeta,
+        pmeta: &TableMeta,
+        child_table: &str,
+        fk: &ForeignKey,
+        old_key: &[Value],
+        new_parent: Option<&[Value]>,
+        parent_pos: &[usize],
+        cpos: &[usize],
+        action: FkAction,
+        rows: &[Vec<Value>],
+        matched: &[usize],
+        params: &Params,
+    ) -> Result<()> {
+        match action {
+            FkAction::NoAction | FkAction::Restrict => {
+                Err(Error::Constraint("FOREIGN KEY constraint failed".into()))
+            }
+            FkAction::Cascade if new_parent.is_none() => {
+                // DELETE CASCADE: cascade each matched row to its own dependents
+                // first (this may recurse — under a self-referential FK, back into
+                // this same table), then drop the matched rows.
+                let victims: Vec<Vec<Value>> = matched.iter().map(|&i| rows[i].clone()).collect();
+                for row in &victims {
+                    self.enforce_parent_change(child_table, row, None, params)?;
+                    if self.fk_depth.get() > 0 {
+                        self.record_session_change(
+                            child_table,
+                            cmeta,
+                            crate::session::ChangeOp::Delete,
+                            0,
+                            Some(row),
+                            None,
+                        );
+                    }
+                }
+                // Re-scan live: a recursive cascade may have already rewritten this
+                // table. Keep every row that is not one of the victims.
+                let live = self.scan_without_rowid(cmeta)?;
+                let kept = live.into_iter().filter(|r| !victims.contains(r));
+                self.rewrite_without_rowid(cmeta, kept)?;
+                self.rebuild_wr_indexes(cmeta, child_table)?;
+                Ok(())
+            }
+            _ => {
+                // The data-changing actions all rewrite the matched rows' FK
+                // columns to a new key: UPDATE CASCADE → the new parent key;
+                // SET NULL → NULLs; SET DEFAULT → the columns' DEFAULTs.
+                let new_vals: Vec<Value> = match action {
+                    FkAction::Cascade => {
+                        let np = new_parent.expect("UPDATE action has a new parent");
+                        parent_pos.iter().map(|&p| np[p].clone()).collect()
+                    }
+                    FkAction::SetNull => alloc::vec![Value::Null; cpos.len()],
+                    FkAction::SetDefault => self.fk_set_default_values(
+                        cmeta, pmeta, fk, old_key, new_parent, parent_pos, cpos, params,
+                    )?,
+                    FkAction::NoAction | FkAction::Restrict => unreachable!(),
+                };
+                let mut out = rows.to_vec();
+                for &i in matched {
+                    let original = rows[i].clone();
+                    for (&p, v) in cpos.iter().zip(&new_vals) {
+                        out[i][p] = v.clone();
+                    }
+                    if self.fk_depth.get() > 0 {
+                        self.record_session_change(
+                            child_table,
+                            cmeta,
+                            crate::session::ChangeOp::Update,
+                            0,
+                            Some(&original),
+                            Some(&out[i]),
+                        );
+                    }
+                }
+                // A change to a FK column that is part of the PK re-clusters the
+                // b-tree; the whole-table rewrite handles that transparently.
+                self.rewrite_without_rowid(cmeta, out.into_iter())?;
+                self.rebuild_wr_indexes(cmeta, child_table)?;
                 Ok(())
             }
         }
@@ -11670,7 +11818,13 @@ impl Connection {
         self.cascade_compact.borrow_mut().clear();
         for name in tables {
             // The table may have been dropped by a later cascade; skip if gone.
-            if let Ok(meta) = self.table_meta(&name, None) {
+            // Never compact a WITHOUT ROWID table: `compact_table` walks a rowid
+            // `TableCursor` (misreads an index-organized b-tree). Its clustered
+            // b-tree is maintained by the WR rewrite path, so it never needs it —
+            // and never enters this set — but guard defensively.
+            if let Ok(meta) = self.table_meta(&name, None)
+                && !meta.without_rowid
+            {
                 self.compact_table(&meta)?;
             }
         }
@@ -31951,6 +32105,21 @@ impl Connection {
 
     /// Scan a `WITHOUT ROWID` table's clustered index b-tree, decoding each entry
     /// (stored PK-first) back into declared column order.
+    /// Scan a table's rows (declared column order) independent of its storage
+    /// kind: rowid tables via [`scan_table`](Self::scan_table) (rowids dropped),
+    /// WITHOUT ROWID (index-organized) tables via
+    /// [`scan_without_rowid`](Self::scan_without_rowid). Used by the storage-kind
+    /// agnostic foreign-key existence checks, where either side may be WITHOUT
+    /// ROWID (a rowid `TableCursor` misreads an index-organized b-tree's pages as
+    /// table-leaf pages: `table-leaf cell on non-table-leaf page`).
+    fn scan_rows(&self, meta: &TableMeta) -> Result<Vec<Vec<Value>>> {
+        if meta.without_rowid {
+            self.scan_without_rowid(meta)
+        } else {
+            Ok(self.scan_table(meta)?.into_iter().map(|(_, r)| r).collect())
+        }
+    }
+
     fn scan_without_rowid(&self, meta: &TableMeta) -> Result<Vec<Vec<Value>>> {
         let encoding = self.backend.source().header().text_encoding;
         let mut cur = IndexCursor::new(self.backend.source(), meta.root);
@@ -32150,6 +32319,10 @@ impl Connection {
                     }
                 }
             }
+            // This row (as a child) must reference an existing parent — the same
+            // check the rowid INSERT path runs. Any FK parent may itself be
+            // WITHOUT ROWID; `check_fk_child` scans it storage-kind-agnostically.
+            self.check_fk_child(&ins.table, meta, &values)?;
             let record = encode_record(&permute_row(meta, &values));
             let scolls = wr_storage_collations(meta);
             // WITHOUT ROWID clustered PK insert: order the b-tree by the PK's
@@ -32298,7 +32471,11 @@ impl Connection {
     ) -> Result<usize> {
         let all = self.scan_without_rowid(meta)?;
         let mut kept = Vec::new();
-        let mut deleted = 0;
+        // Deleted rows are held so their referential actions can fire after the
+        // table is rewritten without them (mirroring the rowid path, which
+        // removes the parent row first, then enforces — so a `SET DEFAULT` that
+        // names the just-deleted key correctly sees it gone).
+        let mut victims: Vec<Vec<Value>> = Vec::new();
         for row in all {
             let keep = match &del.where_clause {
                 Some(p) => {
@@ -32321,12 +32498,24 @@ impl Connection {
                     Some(&row),
                     None,
                 );
-                deleted += 1;
+                victims.push(row);
             }
         }
+        let deleted = victims.len();
         if deleted > 0 {
             self.rewrite_without_rowid(meta, kept.into_iter())?;
             self.rebuild_wr_indexes(meta, &del.table)?;
+            // This table may be a parent: propagate the deletes to referencing
+            // children (CASCADE / SET NULL / SET DEFAULT / RESTRICT). A referenced
+            // child may itself be WITHOUT ROWID — `enforce_parent_change` →
+            // `apply_fk_action` dispatches on the child's storage kind.
+            if self.foreign_keys {
+                for old in &victims {
+                    self.enforce_parent_change(&del.table, old, None, params)?;
+                }
+                // A cascade may have emptied leaves in rowid child tables.
+                self.drain_cascade_compact()?;
+            }
         }
         Ok(deleted)
     }
@@ -32493,6 +32682,15 @@ impl Connection {
                     return Err(Error::Constraint(m));
                 }
             }
+            // Foreign keys (same as the rowid UPDATE path): this row as a child
+            // must still point at an existing parent, and as a parent it must
+            // propagate a referenced-key change to its children. Enforced before
+            // the deferred whole-table rewrite, so `parent_has_key` (used by a
+            // child's SET DEFAULT re-check) still sees this table's pre-update key.
+            self.check_fk_child(&upd.table, meta, &row)?;
+            if self.foreign_keys {
+                self.enforce_parent_change(&upd.table, &original, Some(&row), params)?;
+            }
             if !upd.returning.is_empty() {
                 returned.push(row.clone());
             }
@@ -32513,6 +32711,10 @@ impl Connection {
         if affected > 0 {
             self.rewrite_without_rowid(meta, out.into_iter())?;
             self.rebuild_wr_indexes(meta, &upd.table)?;
+            // A cascade to a rowid child may have emptied its leaves.
+            if self.foreign_keys {
+                self.drain_cascade_compact()?;
+            }
         }
         Ok(affected)
     }
