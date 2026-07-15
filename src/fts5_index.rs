@@ -389,8 +389,19 @@ impl SegWriter {
                         None => break,
                     }
                 }
-                if n_c == 0 || n_c > a.len() {
-                    break;
+                // `n_c` is 0 when the page is already exactly (or over) full
+                // (`n_req <= 0`). sqlite's `fts5WriteAppendPoslistData` still
+                // FLUSHES in that case — copying nothing — which SPLITS the
+                // poslist across the leaf boundary (its trailing varints land on
+                // the next continuation leaf, whose `first_rowid_off` then points
+                // PAST them). Riding the whole poslist onto the current page
+                // instead diverges from sqlite by one leaf boundary. Clamp is a
+                // safety net only: the outer guard ensures `a.len() >= n_req`, so
+                // `n_c <= a.len()`. After a `n_c == 0` flush the body resets to 4
+                // bytes (< pgsz), so `n_req` becomes positive and the loop makes
+                // progress — no infinite loop.
+                if n_c > a.len() {
+                    n_c = a.len();
                 }
                 self.body.extend_from_slice(&a[..n_c]);
                 a = &a[n_c..];
@@ -477,7 +488,27 @@ impl SegWriter {
         self.prev_rowid = 0;
         for p in postings {
             self.append_rowid(p.rowid, term_start_leaf);
-            self.append_poslist_data(&poslist(p));
+            let pl = poslist(p);
+            if self.merge_mode {
+                // sqlite's incremental-merge writer (`fts5IndexMergeLevel`) does
+                // NOT hand the whole poslist to `fts5WriteAppendPoslistData`. It
+                // appends the position-list SIZE varint directly to the leaf
+                // buffer with NO page-full check (`fts5BufferAppendVarint(&buf,
+                // nPos)` — this can push the leaf PAST pgsz), then streams only the
+                // position DATA (the bytes after the size) through
+                // `fts5WriteAppendPoslistData` (via `fts5MergeChunkCallback`). The
+                // bulk `fts5FlushOneHash` writer instead copies size+content as one
+                // unit — which is why the two paths split spanning leaves at
+                // different byte offsets. Mirror the merge split so the incremental
+                // merge output is byte-identical to sqlite's.
+                let size_len = varint::decode(&pl).map(|(_, n)| n).unwrap_or(pl.len());
+                self.body.extend_from_slice(&pl[..size_len]);
+                if size_len < pl.len() {
+                    self.append_poslist_data(&pl[size_len..]);
+                }
+            } else {
+                self.append_poslist_data(&pl);
+            }
         }
         self.finish_term_dlidx(term_start_leaf);
     }
