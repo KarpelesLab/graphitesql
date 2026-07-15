@@ -321,6 +321,25 @@ pub struct Connection {
     /// though not byte-identical to sqlite's incremental tombstone segments).
     #[cfg(feature = "fts5")]
     fts5_txn_dirty: alloc::collections::BTreeMap<String, bool>,
+    /// Per-table ORDERED log of the writes made to each self-content `fts5` table
+    /// inside the current explicit transaction (keyed by table name). At the
+    /// commit-time flush this is replayed through SQLite's
+    /// `sqlite3Fts5IndexBeginWrite` flush-boundary logic to reproduce its level-0
+    /// segment structure byte-for-byte for the delete/update and out-of-order-rowid
+    /// shapes (a plain `BEGIN … COMMIT`). Populated alongside `fts5_txn_dirty`;
+    /// ignored for tables written under an open `SAVEPOINT` (see
+    /// `fts5_txn_sp_used`), which keep the consolidated legacy flush. Cleared with
+    /// the rest of the transaction state at commit / rollback.
+    #[cfg(feature = "fts5")]
+    fts5_txn_ops: alloc::collections::BTreeMap<String, Vec<Fts5TxnOp>>,
+    /// Self-content `fts5` tables written while a `SAVEPOINT` was open in the
+    /// current transaction. Their ordered op-log cannot be replayed faithfully
+    /// (a `ROLLBACK TO` can discard an arbitrary suffix), so they fall back to the
+    /// consolidated content-diff flush (`fts5_txn_dirty`) — correct and
+    /// integrity-clean, matching the pre-existing behavior. Cleared at commit /
+    /// rollback.
+    #[cfg(feature = "fts5")]
+    fts5_txn_sp_used: alloc::collections::BTreeSet<String>,
     /// Whether `SELECT` execution tries the VDBE engine first, falling back
     /// transparently to the tree-walker for any query shape it does not support.
     /// **On by default** (Track B, B7b): the VDBE is the primary engine, parity-
@@ -453,6 +472,41 @@ pub type AggregateFactory = Box<dyn Fn() -> Box<dyn AggregateFunction>>;
 #[cfg(feature = "fts5")]
 type Fts5Change = (i64, Vec<Value>, Option<Vec<Value>>);
 
+/// One recorded FTS5 write inside an explicit transaction, in execution order.
+/// Replays SQLite's `sqlite3Fts5IndexBeginWrite` sequence so the commit-time flush
+/// can reproduce its level-0 segment boundaries byte-for-byte (a rowid regression,
+/// a same-rowid re-write, or a hash overflow flushes the pending postings as one
+/// segment). Each variant carries the fts5 column values (declared order, no
+/// leading rowid) the flush needs to (re)tokenize.
+#[cfg(feature = "fts5")]
+#[derive(Clone)]
+enum Fts5TxnOp {
+    /// A new document (`INSERT`): insert postings for `values` under `rowid`.
+    Insert { rowid: i64, values: Vec<Value> },
+    /// A `DELETE`: tombstone `old_values`' terms for `rowid`.
+    Delete { rowid: i64, old_values: Vec<Value> },
+    /// An `UPDATE` (or a delete+reinsert collapsed by SQLite's hash): tombstone
+    /// `old_values`' terms and insert `new_values`' postings under `rowid`. Modeled
+    /// as SQLite does — a delete `BeginWrite` immediately followed by an insert
+    /// `BeginWrite` for the same rowid (which never flushes between them).
+    Update {
+        rowid: i64,
+        old_values: Vec<Value>,
+        new_values: Vec<Value>,
+    },
+}
+
+/// One document's contribution to a single flushed level-0 segment: tombstone the
+/// `old_values` terms (when `Some`) and/or insert the `new_values` postings (when
+/// `Some`) under `rowid`. A pure insert has `old_values = None`; a pure delete has
+/// `new_values = None`; an update has both.
+#[cfg(feature = "fts5")]
+struct Fts5BatchEntry {
+    rowid: i64,
+    old_values: Option<Vec<Value>>,
+    new_values: Option<Vec<Value>>,
+}
+
 /// Initial seed for a connection's `random()` generator. Under `std` it mixes
 /// the wall clock so repeated invocations of the binary produce different
 /// sequences; `no_std` builds, lacking any entropy source, fall back to a fixed
@@ -564,6 +618,10 @@ impl Connection {
             fts5_rank: core::cell::RefCell::new(None),
             #[cfg(feature = "fts5")]
             fts5_txn_dirty: alloc::collections::BTreeMap::new(),
+            #[cfg(feature = "fts5")]
+            fts5_txn_ops: alloc::collections::BTreeMap::new(),
+            #[cfg(feature = "fts5")]
+            fts5_txn_sp_used: alloc::collections::BTreeSet::new(),
             use_vdbe: core::cell::Cell::new(true),
             session: core::cell::RefCell::new(None),
             update_hook: core::cell::RefCell::new(None),
@@ -623,6 +681,10 @@ impl Connection {
             fts5_rank: core::cell::RefCell::new(None),
             #[cfg(feature = "fts5")]
             fts5_txn_dirty: alloc::collections::BTreeMap::new(),
+            #[cfg(feature = "fts5")]
+            fts5_txn_ops: alloc::collections::BTreeMap::new(),
+            #[cfg(feature = "fts5")]
+            fts5_txn_sp_used: alloc::collections::BTreeSet::new(),
             use_vdbe: core::cell::Cell::new(true),
             session: core::cell::RefCell::new(None),
             update_hook: core::cell::RefCell::new(None),
@@ -12581,6 +12643,17 @@ impl Connection {
             self.rtree_apply(&table, n_coord, integer, cells, &[])?;
             return Ok(n);
         }
+        // Record each new self-content fts5 document (assigned rowid + column
+        // values) when inside an explicit transaction, so the commit-time flush can
+        // reproduce SQLite's incremental level-0 segment boundaries (out-of-order
+        // rowids flush multiple segments). Captured inside the store closure because
+        // an auto-assigned rowid is only known once `dyn_update` runs.
+        #[cfg(feature = "fts5")]
+        let record_fts5_ops = module_name.eq_ignore_ascii_case("fts5")
+            && !fts5_no_local
+            && (self.in_tx || self.open_savepoints > 0);
+        #[cfg(feature = "fts5")]
+        let mut fts5_inserted: Vec<(i64, Vec<Value>)> = Vec::new();
         let inserted = self.with_vtab_store(
             &module_name,
             &args,
@@ -12627,11 +12700,26 @@ impl Connection {
                         store,
                     )?;
                     existing.insert(assigned);
+                    #[cfg(feature = "fts5")]
+                    if record_fts5_ops {
+                        fts5_inserted.push((assigned, values.clone()));
+                    }
                     n += 1;
                 }
                 Ok(n)
             },
         )?;
+        // Log the transaction's fts5 inserts in execution order for the flush.
+        #[cfg(feature = "fts5")]
+        if record_fts5_ops {
+            if self.open_savepoints > 0 {
+                self.fts5_txn_sp_used.insert(ins.table.clone());
+            }
+            let log = self.fts5_txn_ops.entry(ins.table.clone()).or_default();
+            for (rowid, values) in fts5_inserted {
+                log.push(Fts5TxnOp::Insert { rowid, values });
+            }
+        }
         self.fts5_maybe_rebuild(&module_name, &ins.table)?;
         Ok(inserted)
     }
@@ -12742,9 +12830,10 @@ impl Connection {
                 }
             }
         }
-        // Inside a transaction a delete of a previously-committed document needs
-        // tombstone semantics the incremental appender can't provide, so force the
-        // table's transaction flush to be a full rebuild (see `fts5_txn_dirty`).
+        // Inside a transaction, record each deleted document (rowid + old fts5
+        // column values) in execution order so the commit-time flush can emit a
+        // byte-identical tombstone segment. Also set the rebuild flag as a safety
+        // net for the savepoint (legacy) flush path (`fts5_txn_sp_used`).
         #[cfg(feature = "fts5")]
         if module_name.eq_ignore_ascii_case("fts5")
             && !victims.is_empty()
@@ -12753,6 +12842,16 @@ impl Connection {
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             if !crate::vtab::fts5_no_local_content(&arg_refs) {
                 self.fts5_txn_dirty.insert(del.table.clone(), true);
+                if self.open_savepoints > 0 {
+                    self.fts5_txn_sp_used.insert(del.table.clone());
+                }
+                let log = self.fts5_txn_ops.entry(del.table.clone()).or_default();
+                for (rowid, old_values) in victims.iter().zip(victim_vals.iter()) {
+                    log.push(Fts5TxnOp::Delete {
+                        rowid: *rowid,
+                        old_values: old_values.clone(),
+                    });
+                }
             }
         }
         self.fts5_maybe_rebuild(&module_name, &del.table)?;
@@ -12918,9 +13017,12 @@ impl Connection {
                 }
             }
         }
-        // Inside a transaction an update changes a document's content while keeping
-        // its rowid, which the rowid-set incremental appender cannot detect — force
-        // the table's transaction flush to be a full rebuild (see `fts5_txn_dirty`).
+        // Inside a transaction, record each updated document (rowid + old and new
+        // fts5 column values) in execution order — SQLite writes an UPDATE as a
+        // delete of the old terms plus an insert of the new terms under the same
+        // rowid, which the commit-time flush reproduces as a byte-identical
+        // tombstone+insert segment. The rebuild flag remains as the savepoint
+        // (legacy) flush fallback (`fts5_txn_sp_used`).
         #[cfg(feature = "fts5")]
         if module_name.eq_ignore_ascii_case("fts5")
             && !changes.is_empty()
@@ -12929,6 +13031,17 @@ impl Connection {
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
             if !crate::vtab::fts5_no_local_content(&arg_refs) {
                 self.fts5_txn_dirty.insert(upd.table.clone(), true);
+                if self.open_savepoints > 0 {
+                    self.fts5_txn_sp_used.insert(upd.table.clone());
+                }
+                let log = self.fts5_txn_ops.entry(upd.table.clone()).or_default();
+                for ((rowid, new_values), old_values) in changes.iter().zip(old_vals.iter()) {
+                    log.push(Fts5TxnOp::Update {
+                        rowid: *rowid,
+                        old_values: old_values.clone(),
+                        new_values: new_values.clone(),
+                    });
+                }
             }
         }
         self.fts5_maybe_rebuild(&module_name, &upd.table)?;
@@ -33552,27 +33665,409 @@ impl Connection {
             if crate::vtab::fts5_no_local_content(&arg_refs) {
                 continue;
             }
-            if needs_rebuild {
-                // A delete/update needs tombstone semantics the incremental append
-                // can't provide; rebuild once at the final flush. Deferred at a
-                // savepoint boundary (the stale index is bypassed by the in-txn
-                // `MATCH` content scan until then).
-                if is_final {
+            let prefixes = crate::vtab::fts5_prefix_lengths(&arg_refs);
+
+            // A table written under an open SAVEPOINT, or any flush at a savepoint
+            // boundary (`!is_final`), takes the LEGACY consolidated path: insert-only
+            // tables append one incremental segment; delete/update tables rebuild
+            // once at the final flush. This preserves the pre-existing behavior
+            // (correct, integrity-clean) for the shapes the ordered-op replay cannot
+            // reproduce faithfully across a `ROLLBACK TO`. Prefix tables with a
+            // delete/update also rebuild (the incremental delete path is main-index
+            // only).
+            let legacy = !is_final || self.fts5_txn_sp_used.contains(&table);
+            if legacy || (!prefixes.is_empty() && needs_rebuild) {
+                if needs_rebuild {
+                    if is_final {
+                        self.fts5_rebuild_index(&table)?;
+                    }
+                } else if !self.fts5_incremental_write(&table)? && is_final {
                     self.fts5_rebuild_index(&table)?;
                 }
                 continue;
             }
-            // Insert-only: append this batch as one level-0 segment. If the
-            // appender declines (e.g. a spanning doclist), rebuild — but only at
-            // the final flush; a savepoint boundary leaves it pending.
-            if !self.fts5_incremental_write(&table)? && is_final {
+
+            // Prefix table, insert-only, plain transaction: the incremental append
+            // (which handles prefixes) writes one level-0 segment — byte-identical
+            // to sqlite for monotonic rowids. (Out-of-order rowids in a prefix table
+            // consolidate to one segment here rather than several; an accepted
+            // residual, since the tombstone-preserving reader is main-index only.)
+            if !prefixes.is_empty() {
+                if !self.fts5_incremental_write(&table)? {
+                    self.fts5_rebuild_index(&table)?;
+                }
+                continue;
+            }
+
+            // Non-prefix, plain transaction: replay the ordered op log through
+            // sqlite's flush-boundary logic and emit one level-0 segment per batch.
+            let ops = self.fts5_txn_ops.get(&table).cloned().unwrap_or_default();
+            let batches = Self::fts5_txn_simulate_batches(&ops);
+            if batches.len() <= 1 && !needs_rebuild {
+                // A single pure-insert batch (monotonic rowids) is the common case —
+                // take the proven incremental-append path unchanged.
+                if !self.fts5_incremental_write(&table)? {
+                    self.fts5_rebuild_index(&table)?;
+                }
+                continue;
+            }
+            // Multiple segments (a rowid regression / re-write) and/or tombstones:
+            // flush each batch as its own segment. On any decline, fall back to the
+            // consolidated rebuild (which wipes the shadow tables first, discarding
+            // whatever partial batches were written).
+            if !self.fts5_flush_txn_batches(&table, &batches)? {
                 self.fts5_rebuild_index(&table)?;
             }
         }
         if is_final {
             self.fts5_txn_dirty.clear();
+            self.fts5_txn_ops.clear();
+            self.fts5_txn_sp_used.clear();
         }
         Ok(())
+    }
+
+    /// Replay an fts5 transaction's ordered write log through SQLite's
+    /// `sqlite3Fts5IndexBeginWrite` flush-boundary logic, partitioning it into the
+    /// batches that each become one level-0 segment. A new batch begins whenever the
+    /// next write's rowid REGRESSES below the current write rowid, or re-writes the
+    /// current rowid after a non-delete (SQLite flushes the in-memory hash before
+    /// recording such a write). The 1 MiB hash-overflow trigger
+    /// (`p->pConfig->nHashSize`) is not modeled — a single transaction that large is
+    /// out of scope for these boundary cases and would still be correct (it merely
+    /// consolidates into fewer segments; verified shapes stay well under it).
+    ///
+    /// Each `Update` op is expanded to SQLite's delete-then-insert pair for the same
+    /// rowid (which never flushes between the two), so a delete followed by a
+    /// re-insert of the same rowid collapses into one `old + new` batch entry.
+    #[cfg(feature = "fts5")]
+    fn fts5_txn_simulate_batches(ops: &[Fts5TxnOp]) -> Vec<Vec<Fts5BatchEntry>> {
+        // Flatten to SQLite's per-`BeginWrite` events: (rowid, is_delete, values).
+        struct Ev {
+            rowid: i64,
+            del: bool,
+            values: Vec<Value>,
+        }
+        let mut events: Vec<Ev> = Vec::new();
+        for op in ops {
+            match op {
+                Fts5TxnOp::Insert { rowid, values } => events.push(Ev {
+                    rowid: *rowid,
+                    del: false,
+                    values: values.clone(),
+                }),
+                Fts5TxnOp::Delete { rowid, old_values } => events.push(Ev {
+                    rowid: *rowid,
+                    del: true,
+                    values: old_values.clone(),
+                }),
+                Fts5TxnOp::Update {
+                    rowid,
+                    old_values,
+                    new_values,
+                } => {
+                    events.push(Ev {
+                        rowid: *rowid,
+                        del: true,
+                        values: old_values.clone(),
+                    });
+                    events.push(Ev {
+                        rowid: *rowid,
+                        del: false,
+                        values: new_values.clone(),
+                    });
+                }
+            }
+        }
+
+        // Partition into batches at each flush boundary.
+        let mut raw_batches: Vec<Vec<Ev>> = Vec::new();
+        let mut cur: Vec<Ev> = Vec::new();
+        let mut i_write_rowid: i64 = 0;
+        let mut prev_del = false;
+        for ev in events {
+            if !cur.is_empty()
+                && (ev.rowid < i_write_rowid || (ev.rowid == i_write_rowid && !prev_del))
+            {
+                raw_batches.push(core::mem::take(&mut cur));
+            }
+            i_write_rowid = ev.rowid;
+            prev_del = ev.del;
+            cur.push(ev);
+        }
+        if !cur.is_empty() {
+            raw_batches.push(cur);
+        }
+
+        // Collapse each batch's events into one entry per rowid: the first delete
+        // sets `old_values`, an insert sets `new_values` (delete-then-insert of the
+        // same rowid within a batch is an update).
+        raw_batches
+            .into_iter()
+            .map(|batch| {
+                let mut order: Vec<i64> = Vec::new();
+                let mut map: alloc::collections::BTreeMap<i64, Fts5BatchEntry> =
+                    alloc::collections::BTreeMap::new();
+                for ev in batch {
+                    let entry = map.entry(ev.rowid).or_insert_with(|| {
+                        order.push(ev.rowid);
+                        Fts5BatchEntry {
+                            rowid: ev.rowid,
+                            old_values: None,
+                            new_values: None,
+                        }
+                    });
+                    if ev.del {
+                        if entry.old_values.is_none() {
+                            entry.old_values = Some(ev.values);
+                        }
+                    } else {
+                        entry.new_values = Some(ev.values);
+                    }
+                }
+                order.into_iter().map(|r| map.remove(&r).unwrap()).collect()
+            })
+            .collect()
+    }
+
+    /// Flush a transaction's replayed `batches` (each one level-0 segment) for the
+    /// non-prefix self-content fts5 table `name`. Returns `Ok(false)` if any batch
+    /// hits a shape the incremental writer declines (a spanning doclist, an
+    /// all-empty tombstone batch, an unexpected crisis cascade) — the caller then
+    /// rebuilds the whole index (which clears the shadow tables first, so any
+    /// partial batches already written are discarded).
+    #[cfg(feature = "fts5")]
+    fn fts5_flush_txn_batches(
+        &mut self,
+        name: &str,
+        batches: &[Vec<Fts5BatchEntry>],
+    ) -> Result<bool> {
+        for (i, batch) in batches.iter().enumerate() {
+            let is_last = i + 1 == batches.len();
+            if !self.fts5_flush_batch(name, batch, is_last)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Append ONE level-0 segment for a single flushed batch of `entries`
+    /// (tombstones for `old_values`, insert postings for `new_values`), then run
+    /// automerge + crisismerge exactly like `fts5FlushOneHash`. This generalizes
+    /// [`Self::fts5_incremental_delete`] to also carry pure inserts, so it
+    /// reproduces SQLite's per-flush segment for the delete/update and
+    /// out-of-order-rowid transaction shapes. Non-prefix (main index) only.
+    ///
+    /// `is_last` selects when the whole-corpus AVERAGES record is (re)written — only
+    /// the final batch's value persists, and it must equal the post-transaction live
+    /// corpus, so writing it once at the end matches SQLite's committed state.
+    /// Returns `Ok(false)` to signal a fallback to the bulk rebuild.
+    #[cfg(feature = "fts5")]
+    fn fts5_flush_batch(
+        &mut self,
+        name: &str,
+        entries: &[Fts5BatchEntry],
+        is_last: bool,
+    ) -> Result<bool> {
+        use crate::fts5_index::{self, IdxRow, Posting, SegStructure};
+        use alloc::collections::{BTreeMap, BTreeSet};
+        if entries.is_empty() {
+            return Ok(true);
+        }
+        let (_module, args, schema) = self.vtab_meta(name)?;
+        let ncols = schema.columns.len();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let prefixes = crate::vtab::fts5_prefix_lengths(&arg_refs);
+        if !prefixes.is_empty() {
+            return Ok(false); // main-index only
+        }
+        let tok = crate::vtab::fts5_tok_config(&arg_refs);
+
+        // Build the appended segment's ascending term stream: tombstone every old
+        // document's terms, then overlay each new document's insert postings (a term
+        // shared by an update's old and new row keeps `del = true` with the new
+        // positions — SQLite's re-write size field is `content_len*2 + 1`).
+        let mut term_map: BTreeMap<Vec<u8>, BTreeMap<i64, Posting>> = BTreeMap::new();
+        let mut new_doc_sizes: Vec<(i64, Vec<u64>)> = Vec::new();
+        let mut deleted_rowids: BTreeSet<i64> = BTreeSet::new();
+        for entry in entries {
+            let rowid = entry.rowid;
+            if let Some(old_values) = &entry.old_values {
+                deleted_rowids.insert(rowid);
+                for c in 0..ncols {
+                    let text = match old_values.get(c) {
+                        Some(v) if !matches!(v, Value::Null) => eval::to_text(v),
+                        _ => String::new(),
+                    };
+                    for tk in crate::vtab::fts5_tokenize(&text, tok) {
+                        term_map
+                            .entry(tk.as_bytes().to_vec())
+                            .or_default()
+                            .entry(rowid)
+                            .or_insert(Posting {
+                                rowid,
+                                cols: alloc::vec![Vec::new(); ncols],
+                                del: true,
+                            });
+                    }
+                }
+            }
+            if let Some(new_values) = &entry.new_values {
+                let mut sizes = alloc::vec![0u64; ncols];
+                let mut per_term: BTreeMap<Vec<u8>, Vec<Vec<u32>>> = BTreeMap::new();
+                for (c, size) in sizes.iter_mut().enumerate() {
+                    let text = match new_values.get(c) {
+                        Some(v) if !matches!(v, Value::Null) => eval::to_text(v),
+                        _ => String::new(),
+                    };
+                    let toks = crate::vtab::fts5_tokenize(&text, tok);
+                    *size = toks.len() as u64;
+                    for (pos, tk) in toks.iter().enumerate() {
+                        per_term
+                            .entry(tk.as_bytes().to_vec())
+                            .or_insert_with(|| alloc::vec![Vec::new(); ncols])[c]
+                            .push(pos as u32);
+                    }
+                }
+                for (key, cols) in per_term {
+                    let by_rowid = term_map.entry(key).or_default();
+                    match by_rowid.get_mut(&rowid) {
+                        Some(existing) => existing.cols = cols,
+                        None => {
+                            by_rowid.insert(
+                                rowid,
+                                Posting {
+                                    rowid,
+                                    cols,
+                                    del: false,
+                                },
+                            );
+                        }
+                    }
+                }
+                new_doc_sizes.push((rowid, sizes));
+            }
+        }
+        let terms: Vec<(Vec<u8>, Vec<Posting>)> = term_map
+            .into_iter()
+            .map(|(term, per_doc)| (term, per_doc.into_values().collect()))
+            .collect();
+        if terms.is_empty() {
+            // An all-empty batch (only NULL/empty documents) would still write a
+            // structurally distinct segment in sqlite; fall back to stay exact.
+            return Ok(false);
+        }
+
+        // Read the current STRUCTURE record (fresh from disk — the previous batch
+        // persisted it), or start empty for a fresh index.
+        let struct_blob = self
+            .query(&format!(
+                "SELECT block FROM {} WHERE id={}",
+                sql::print::ident(&format!("{name}_data")),
+                fts5_index::STRUCTURE_ROWID
+            ))?
+            .rows
+            .into_iter()
+            .next()
+            .and_then(|r| match r.into_iter().next() {
+                Some(Value::Blob(b)) => Some(b),
+                _ => None,
+            });
+        let mut structure = match &struct_blob {
+            Some(b) => match SegStructure::parse(b) {
+                Some(s) => s,
+                None => return Ok(false),
+            },
+            None => SegStructure {
+                cookie: 0,
+                write_counter: 0,
+                levels: Vec::new(),
+            },
+        };
+
+        let segid = structure.allocate_segid();
+        let block = fts5_index::build_segment_block(&terms, &new_doc_sizes, 4050, segid, &prefixes);
+        if block.data.iter().any(|(id, _)| (*id & (1 << 36)) != 0) {
+            return Ok(false); // spanning (doclist-index) segment — out of scope
+        }
+        structure.append_level0(segid, block.n_leaves);
+
+        let q = |s: &str| sql::print::ident(s);
+        let pv = |vals: Vec<Value>| Params {
+            positional: vals,
+            named: Vec::new(),
+        };
+        let data_t = q(&format!("{name}_data"));
+        let idx_t = q(&format!("{name}_idx"));
+
+        // Persist the block, then run automerge + crisismerge as real %_data merges
+        // (the tombstone-preserving reader reproduces sqlite's key annihilation).
+        for (id, block_bytes) in &block.data {
+            self.execute_params(
+                &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
+                &pv(alloc::vec![
+                    Value::Integer(*id),
+                    Value::Blob(block_bytes.clone())
+                ]),
+            )?;
+        }
+        for IdxRow { segid, term, pgno } in &block.idx {
+            self.execute_params(
+                &format!("INSERT INTO {idx_t} VALUES(?1,?2,?3)"),
+                &pv(alloc::vec![
+                    Value::Integer(*segid),
+                    Value::Blob(term.clone()),
+                    Value::Integer(*pgno)
+                ]),
+            )?;
+        }
+        if !self.fts5_automerge(name, &mut structure, block.n_leaves, ncols, tok, &prefixes)? {
+            return Ok(false);
+        }
+        if !self.fts5_crisismerge(name, &mut structure, ncols, tok, &prefixes)? {
+            return Ok(false);
+        }
+
+        // Structure record (id 10).
+        self.execute_params(
+            &format!("INSERT OR REPLACE INTO {data_t} VALUES(?1,?2)"),
+            &pv(alloc::vec![
+                Value::Integer(fts5_index::STRUCTURE_ROWID),
+                Value::Blob(structure.encode())
+            ]),
+        )?;
+
+        // AVERAGES (id 1): the whole live corpus. Only the last batch's value has to
+        // match sqlite's committed state, so write it once at the end.
+        if is_last {
+            let docs = self.fts5_load_documents(name, &schema.columns, &arg_refs)?;
+            let (_all_terms, col_totals, _all_sizes) = self.fts5_tokenize_docs(&docs, ncols, tok);
+            let avg = fts5_index::encode_averages_full(docs.len() as u64, &col_totals);
+            self.execute_params(
+                &format!("INSERT OR REPLACE INTO {data_t} VALUES(?1,?2)"),
+                &pv(alloc::vec![
+                    Value::Integer(fts5_index::AVERAGES_ROWID),
+                    Value::Blob(avg)
+                ]),
+            )?;
+        }
+
+        // `_docsize`: drop each tombstoned rowid's old row, then write the new one
+        // for inserts/updates.
+        let docsize_t = q(&format!("{name}_docsize"));
+        for rid in &deleted_rowids {
+            self.execute_params(
+                &format!("DELETE FROM {docsize_t} WHERE id=?1"),
+                &pv(alloc::vec![Value::Integer(*rid)]),
+            )?;
+        }
+        for (rowid, sz) in fts5_index::build_docsize(&new_doc_sizes) {
+            self.execute_params(
+                &format!("INSERT INTO {docsize_t} VALUES(?1,?2)"),
+                &pv(alloc::vec![Value::Integer(rowid), Value::Blob(sz)]),
+            )?;
+        }
+        Ok(true)
     }
 
     /// Discard the pending in-transaction fts5 flush set on ROLLBACK / ROLLBACK TO
@@ -33583,6 +34078,8 @@ impl Connection {
     #[cfg(feature = "fts5")]
     fn fts5_discard_txn(&mut self) {
         self.fts5_txn_dirty.clear();
+        self.fts5_txn_ops.clear();
+        self.fts5_txn_sp_used.clear();
     }
 
     /// Handle an fts5 special-command INSERT whose first column is the hidden

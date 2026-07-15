@@ -15,9 +15,12 @@
 //! * in-transaction `MATCH` visibility (an uncommitted INSERT is visible to a
 //!   later `MATCH` in the same transaction; an uncommitted DELETE hides its row);
 //! * `ROLLBACK` discards the transaction's writes entirely (index untouched);
-//! * delete/update-containing transactions stay integrity-clean and MATCH-correct
-//!   (they flush as a single consolidated rebuild — correct, not byte-identical to
-//!   sqlite's incremental tombstone segments; asserted for integrity + MATCH only).
+//! * BYTE-IDENTICAL `%_data`/`%_idx`/`%_docsize` for the delete/update and
+//!   out-of-order-rowid shapes in a plain `BEGIN … COMMIT`: the transaction's
+//!   ordered writes are replayed through SQLite's `sqlite3Fts5IndexBeginWrite`
+//!   flush-boundary logic, so a rowid regression, a same-rowid re-write, or a
+//!   delete/update emits the same multi-segment / tombstone structure sqlite's
+//!   in-memory hash flush does — instead of one consolidated rebuild.
 //!
 //! Skipped when `sqlite3` with FTS5 is not on PATH.
 
@@ -320,16 +323,11 @@ fn rollback_discards_transaction() {
     assert_eq!(scalar_text(&c, "PRAGMA integrity_check"), "ok");
 }
 
-/// A transaction that DELETEs or UPDATEs a previously-committed document is NOT
-/// byte-identical to sqlite (it consolidates to one rebuild rather than sqlite's
-/// incremental tombstone segments), but it MUST stay integrity-clean, be readable
-/// by stock sqlite, and return the same `MATCH` rows as sqlite.
+/// A plain `BEGIN … COMMIT` that UPDATEs and DELETEs previously-committed
+/// documents (plus a fresh INSERT) now emits the SAME tombstone/insert segment
+/// sqlite's hash flush does — byte-identical, not a consolidated rebuild.
 #[test]
-fn delete_update_txn_correct_and_integrity_clean() {
-    if !have_fts5_sqlite() {
-        eprintln!("skip: no fts5 sqlite3");
-        return;
-    }
+fn delete_update_txn_byte_identical() {
     let script = "CREATE VIRTUAL TABLE f USING fts5(a);\n\
         INSERT INTO f VALUES('original alpha shared');\n\
         INSERT INTO f VALUES('original beta shared');\n\
@@ -339,32 +337,185 @@ fn delete_update_txn_correct_and_integrity_clean() {
         DELETE FROM f WHERE rowid=2;\n\
         INSERT INTO f VALUES('added delta shared');\n\
         COMMIT;\n";
+    assert_bytes_identical("du", script);
+}
 
-    let g = tmp_path("du-g");
-    let s = tmp_path("du-s");
-    let mut c = Connection::create(&g).unwrap();
-    c.execute_batch(script).unwrap();
-    sqlite_raw(&s, script);
+/// Out-of-order rowids inside one transaction: sqlite flushes a new level-0
+/// segment each time the rowid regresses below the current write rowid, so
+/// `INSERT 10, 3, 25` produces TWO segments (`{10}` then `{3,25}`) — reproduced
+/// byte-for-byte via the replayed flush-boundary logic.
+#[test]
+fn out_of_order_inserts_multiple_segments() {
+    let script = "CREATE VIRTUAL TABLE f USING fts5(a);\n\
+        BEGIN;\n\
+        INSERT INTO f(rowid,a) VALUES(10,'alpha ten lorem');\n\
+        INSERT INTO f(rowid,a) VALUES(3,'beta three ipsum');\n\
+        INSERT INTO f(rowid,a) VALUES(25,'gamma twentyfive dolor');\n\
+        COMMIT;\n";
+    assert_bytes_identical("ooo", script);
+}
 
-    // graphite's own integrity check + sqlite's must both accept the file.
-    assert_eq!(scalar_text(&c, "PRAGMA integrity_check"), "ok");
-    assert!(
-        sqlite_integrity_ok(&g),
-        "sqlite integrity-check rejected graphite's delete/update-txn file"
-    );
-
-    // MATCH parity across the interesting terms.
-    for term in ["shared", "changed", "original", "delta", "beta", "alpha"] {
-        let gr = fmt_result(
-            c.query(&format!(
-                "SELECT rowid FROM f WHERE f MATCH '{term}' ORDER BY rowid"
-            ))
-            .unwrap(),
-        );
-        let sr = sqlite_raw(
-            &s,
-            &format!("SELECT rowid FROM f WHERE f MATCH '{term}' ORDER BY rowid;"),
-        );
-        assert_eq!(gr, sr, "MATCH '{term}' rows diverge (delete/update txn)");
+/// A monotonic run then a rowid regression then a DELETE and a later INSERT — the
+/// transaction spans several flush boundaries (a segment for `1..8`, then the
+/// tombstone-for-5 + insert-9 batch), byte-identical to sqlite.
+#[test]
+fn delete_then_insert_in_txn_byte_identical() {
+    let mut sql = String::from("CREATE VIRTUAL TABLE f USING fts5(a);\nBEGIN;\n");
+    for i in 1..=8 {
+        sql.push_str(&format!(
+            "INSERT INTO f(rowid,a) VALUES({i},'doc {i} shared body');\n"
+        ));
     }
+    sql.push_str("DELETE FROM f WHERE rowid=5;\n");
+    sql.push_str("INSERT INTO f(rowid,a) VALUES(9,'doc nine shared body');\n");
+    sql.push_str("COMMIT;\n");
+    assert_bytes_identical("delins", &sql);
+}
+
+/// A DELETE followed by a re-INSERT of the SAME rowid inside a transaction is
+/// SQLite's delete-then-insert hash sequence (no flush between them) — one
+/// tombstone+insert segment, byte-identical.
+#[test]
+fn delete_then_reinsert_same_rowid() {
+    let script = "CREATE VIRTUAL TABLE f USING fts5(a);\n\
+        INSERT INTO f(rowid,a) VALUES(1,'original one alpha');\n\
+        INSERT INTO f(rowid,a) VALUES(2,'original two beta');\n\
+        BEGIN;\n\
+        DELETE FROM f WHERE rowid=1;\n\
+        INSERT INTO f(rowid,a) VALUES(1,'reinserted one gamma');\n\
+        COMMIT;\n";
+    assert_bytes_identical("delreins", script);
+}
+
+/// A single UPDATE inside a transaction (delete old terms + insert new terms under
+/// the same rowid) appends one tombstone+insert segment, byte-identical.
+#[test]
+fn update_in_txn_byte_identical() {
+    let script = "CREATE VIRTUAL TABLE f USING fts5(a, b);\n\
+        INSERT INTO f(rowid,a,b) VALUES(1,'orig one','col two here');\n\
+        INSERT INTO f(rowid,a,b) VALUES(2,'orig two','more words');\n\
+        BEGIN;\n\
+        UPDATE f SET a='changed one entirely', b='new second column' WHERE rowid=1;\n\
+        COMMIT;\n";
+    assert_bytes_identical("upd", script);
+}
+
+/// Insert, delete, update and out-of-order re-insert all interleaved in one
+/// transaction against a pre-populated index — the full flush-boundary replay.
+#[test]
+fn interleaved_writes_byte_identical() {
+    let script = "CREATE VIRTUAL TABLE f USING fts5(a);\n\
+        INSERT INTO f(rowid,a) VALUES(1,'committed one shared');\n\
+        INSERT INTO f(rowid,a) VALUES(2,'committed two shared');\n\
+        INSERT INTO f(rowid,a) VALUES(3,'committed three shared');\n\
+        BEGIN;\n\
+        INSERT INTO f(rowid,a) VALUES(4,'txn four shared');\n\
+        DELETE FROM f WHERE rowid=2;\n\
+        UPDATE f SET a='txn three changed shared' WHERE rowid=3;\n\
+        INSERT INTO f(rowid,a) VALUES(5,'txn five shared');\n\
+        COMMIT;\n";
+    assert_bytes_identical("interleave", script);
+}
+
+/// Several transactions in sequence, each mixing inserts/deletes/updates — every
+/// commit flushes its own batch(es), byte-identical to sqlite.
+#[test]
+fn multiple_transactions_with_mutations() {
+    let script = "CREATE VIRTUAL TABLE f USING fts5(a);\n\
+        BEGIN; INSERT INTO f(rowid,a) VALUES(5,'five eee'); \
+        INSERT INTO f(rowid,a) VALUES(2,'two bbb'); COMMIT;\n\
+        BEGIN; DELETE FROM f WHERE rowid=5; \
+        INSERT INTO f(rowid,a) VALUES(9,'nine iii'); COMMIT;\n\
+        BEGIN; UPDATE f SET a='two changed bbb' WHERE rowid=2; COMMIT;\n";
+    assert_bytes_identical("multimut", script);
+}
+
+/// In-transaction `MATCH` visibility across a DELETE and an UPDATE: the live
+/// `_content` scan reflects the uncommitted mutations, and the committed index
+/// agrees + stays integrity-clean.
+#[test]
+fn in_transaction_match_visibility_mutations() {
+    let g = tmp_path("vism");
+    let mut c = Connection::create(&g).unwrap();
+    c.execute("CREATE VIRTUAL TABLE f USING fts5(a)").unwrap();
+    c.execute("INSERT INTO f(rowid,a) VALUES(1,'apple red')")
+        .unwrap();
+    c.execute("INSERT INTO f(rowid,a) VALUES(2,'banana yellow')")
+        .unwrap();
+    c.execute("BEGIN").unwrap();
+    c.execute("DELETE FROM f WHERE rowid=1").unwrap();
+    c.execute("UPDATE f SET a='banana green now' WHERE rowid=2")
+        .unwrap();
+    c.execute("INSERT INTO f(rowid,a) VALUES(3,'cherry dark')")
+        .unwrap();
+
+    let ids = |c: &Connection, q: &str| -> Vec<i64> {
+        c.query(q)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Integer(i) => *i,
+                _ => -1,
+            })
+            .collect()
+    };
+    // Deleted row hidden; updated row visible under its new term but not the old;
+    // fresh insert visible.
+    assert!(ids(&c, "SELECT rowid FROM f WHERE f MATCH 'apple'").is_empty());
+    assert!(ids(&c, "SELECT rowid FROM f WHERE f MATCH 'yellow'").is_empty());
+    assert_eq!(
+        ids(&c, "SELECT rowid FROM f WHERE f MATCH 'green'"),
+        vec![2]
+    );
+    assert_eq!(
+        ids(&c, "SELECT rowid FROM f WHERE f MATCH 'cherry'"),
+        vec![3]
+    );
+    c.execute("COMMIT").unwrap();
+
+    // Committed index serves the same answers and is clean.
+    assert!(ids(&c, "SELECT rowid FROM f WHERE f MATCH 'apple'").is_empty());
+    assert_eq!(
+        ids(&c, "SELECT rowid FROM f WHERE f MATCH 'green'"),
+        vec![2]
+    );
+    assert_eq!(
+        ids(&c, "SELECT rowid FROM f WHERE f MATCH 'cherry'"),
+        vec![3]
+    );
+    assert_eq!(scalar_text(&c, "PRAGMA integrity_check"), "ok");
+}
+
+/// `ROLLBACK` of a transaction that deleted and inserted leaves the index exactly
+/// as it was committed before `BEGIN`.
+#[test]
+fn rollback_discards_mutation_transaction() {
+    let g = tmp_path("rbm");
+    let mut c = Connection::create(&g).unwrap();
+    c.execute("CREATE VIRTUAL TABLE f USING fts5(a)").unwrap();
+    c.execute("INSERT INTO f(rowid,a) VALUES(1,'keep alpha')")
+        .unwrap();
+    c.execute("INSERT INTO f(rowid,a) VALUES(2,'keep beta')")
+        .unwrap();
+    c.execute("BEGIN").unwrap();
+    c.execute("DELETE FROM f WHERE rowid=1").unwrap();
+    c.execute("INSERT INTO f(rowid,a) VALUES(3,'gone gamma')")
+        .unwrap();
+    c.execute("UPDATE f SET a='gone delta' WHERE rowid=2")
+        .unwrap();
+    c.execute("ROLLBACK").unwrap();
+
+    let count = |q: &str| -> i64 {
+        match &c.query(q).unwrap().rows[0][0] {
+            Value::Integer(i) => *i,
+            _ => -1,
+        }
+    };
+    assert_eq!(count("SELECT count(*) FROM f"), 2);
+    assert_eq!(count("SELECT count(*) FROM f WHERE f MATCH 'alpha'"), 1);
+    assert_eq!(count("SELECT count(*) FROM f WHERE f MATCH 'beta'"), 1);
+    assert_eq!(count("SELECT count(*) FROM f WHERE f MATCH 'gamma'"), 0);
+    assert_eq!(count("SELECT count(*) FROM f WHERE f MATCH 'delta'"), 0);
+    assert_eq!(scalar_text(&c, "PRAGMA integrity_check"), "ok");
 }
