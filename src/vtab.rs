@@ -1730,6 +1730,9 @@ pub struct Fts5Tok {
     /// `separators '…'`: ASCII characters that split tokens even though they are
     /// alphanumeric. Same bitmap layout; takes precedence over `tokenchars`.
     pub separators: u128,
+    /// The table's `detail=` mode (`full` default, `none`, `columns`) — governs the
+    /// segment doclist's position-list encoding (see [`crate::fts5_index::Fts5Detail`]).
+    pub(crate) detail: crate::fts5_index::Fts5Detail,
 }
 
 #[cfg(feature = "fts5")]
@@ -1742,6 +1745,7 @@ impl Default for Fts5Tok {
             diacritics: 1,
             tokenchars: 0,
             separators: 0,
+            detail: crate::fts5_index::Fts5Detail::Full,
         }
     }
 }
@@ -3649,6 +3653,7 @@ pub(crate) fn fts5_tok_config(args: &[&str]) -> Fts5Tok {
             s
         }
     }
+    let detail = fts5_detail(args);
     let value = args.iter().find_map(|a| {
         a.split_once('=').and_then(|(k, v)| {
             k.trim()
@@ -3658,7 +3663,12 @@ pub(crate) fn fts5_tok_config(args: &[&str]) -> Fts5Tok {
     });
     let value = match value {
         Some(v) => v,
-        None => return Fts5Tok::default(),
+        None => {
+            return Fts5Tok {
+                detail,
+                ..Fts5Tok::default()
+            };
+        }
     };
     let words: Vec<&str> = value.split_whitespace().collect();
     let mut i = 0;
@@ -3715,7 +3725,31 @@ pub(crate) fn fts5_tok_config(args: &[&str]) -> Fts5Tok {
         diacritics,
         tokenchars,
         separators,
+        detail,
     }
+}
+
+/// Parse the `detail=` table option (`none` / `columns` / `full`, default full)
+/// from the `CREATE VIRTUAL TABLE ... USING fts5(...)` args. SQLite accepts the
+/// value quoted (`detail='none'`) or bare; the match is case-insensitive and only
+/// the first character is significant (sqlite's `fts5ConfigSetValue`: `'n'`, `'c'`,
+/// else full). Threaded into [`Fts5Tok`] so the segment writer/reader honor it.
+#[cfg(feature = "fts5")]
+pub(crate) fn fts5_detail(args: &[&str]) -> crate::fts5_index::Fts5Detail {
+    use crate::fts5_index::Fts5Detail;
+    for a in args {
+        if let Some((k, v)) = a.split_once('=')
+            && k.trim().eq_ignore_ascii_case("detail")
+        {
+            let v = v.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+            return match v.as_bytes().first().map(u8::to_ascii_lowercase) {
+                Some(b'n') => Fts5Detail::None,
+                Some(b'c') => Fts5Detail::Columns,
+                _ => Fts5Detail::Full,
+            };
+        }
+    }
+    Fts5Detail::Full
 }
 
 #[cfg(feature = "fts5")]

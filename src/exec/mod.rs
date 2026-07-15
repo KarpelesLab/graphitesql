@@ -5408,16 +5408,33 @@ impl Connection {
         // empty columns makes the index decode (which omits empty trailing columns)
         // and the re-tokenization (which pads every posting to `ncols`) compare
         // equal on the columns that actually carry the term.
+        //
+        // The value retained depends on the `detail=` mode, mirroring what the
+        // segment actually records: `full` keeps per-column positions; `columns`
+        // keeps only which columns carry the term (positions cleared on BOTH the
+        // index and content sides so they compare equal); `none` records neither
+        // column nor position, so the value is dropped to an empty map — the check
+        // then compares just the `(term, rowid)` set, which is all a detail=none
+        // segment stores.
         fn canonical(
             terms: &[(Vec<u8>, Vec<Posting>)],
+            detail: crate::fts5_index::Fts5Detail,
         ) -> BTreeMap<(Vec<u8>, i64), BTreeMap<usize, Vec<u32>>> {
+            use crate::fts5_index::Fts5Detail;
             let mut m: BTreeMap<(Vec<u8>, i64), BTreeMap<usize, Vec<u32>>> = BTreeMap::new();
             for (term, postings) in terms {
                 for p in postings {
                     let mut cols: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
-                    for (c, positions) in p.cols.iter().enumerate() {
-                        if !positions.is_empty() {
-                            cols.insert(c, positions.clone());
+                    if detail != Fts5Detail::None {
+                        for (c, positions) in p.cols.iter().enumerate() {
+                            if !positions.is_empty() {
+                                let kept = if detail == Fts5Detail::Columns {
+                                    Vec::new() // column presence only, positions cleared
+                                } else {
+                                    positions.clone()
+                                };
+                                cols.insert(c, kept);
+                            }
                         }
                     }
                     m.insert((term.clone(), p.rowid), cols);
@@ -5479,7 +5496,8 @@ impl Connection {
                 Err(_) => continue, // no `%_data` backing table: nothing to check
             };
 
-            match fts5_index::scan_main_index(&data) {
+            let detail = crate::vtab::fts5_detail(&arg_refs);
+            match fts5_index::scan_main_index(&data, detail) {
                 MainIndexScan::Skip => continue,
                 MainIndexScan::Malformed => {
                     problems.push(format!(
@@ -5495,7 +5513,7 @@ impl Connection {
                     };
                     let (content_terms, _totals, _sizes) =
                         self.fts5_tokenize_docs(&docs, ncols, tok);
-                    if canonical(&index_terms) != canonical(&content_terms) {
+                    if canonical(&index_terms, detail) != canonical(&content_terms, detail) {
                         problems.push(format!(
                             "malformed inverted index for FTS5 table main.{name}"
                         ));
@@ -13524,6 +13542,14 @@ impl Connection {
         query: &str,
     ) -> Result<Option<Vec<i64>>> {
         let tok = crate::vtab::fts5_tok_config(arg_refs);
+        // The index reader below decodes full-detail poslists. A detail=none/columns
+        // segment stores a different (positionless) doclist, so index-routing a MATCH
+        // there is not correct — return `Ok(None)` to fall back to the `%_content`
+        // document scan, which re-tokenizes each row and is always right for a
+        // self-content table (the only shape reaching this routing).
+        if tok.detail != crate::fts5_index::Fts5Detail::Full {
+            return Ok(None);
+        }
         enum Routed {
             AnyColumn(Vec<u8>),
             InColumn(Vec<u8>, usize),
@@ -34480,7 +34506,14 @@ impl Connection {
         };
 
         let segid = structure.allocate_segid();
-        let block = fts5_index::build_segment_block(&terms, &new_doc_sizes, 4050, segid, &prefixes);
+        let block = fts5_index::build_segment_block(
+            &terms,
+            &new_doc_sizes,
+            4050,
+            segid,
+            &prefixes,
+            tok.detail,
+        );
         if block.data.iter().any(|(id, _)| (*id & (1 << 36)) != 0) {
             return Ok(false); // spanning (doclist-index) segment — out of scope
         }
@@ -34999,7 +35032,15 @@ impl Connection {
             ),
             &Params::default(),
         )?;
-        let seg = crate::fts5_index::build_segment(&[], 0, &alloc::vec![0u64; ncols], &[], 4050, 0);
+        let seg = crate::fts5_index::build_segment(
+            &[],
+            0,
+            &alloc::vec![0u64; ncols],
+            &[],
+            4050,
+            0,
+            crate::fts5_index::Fts5Detail::Full,
+        );
         let data_t = q(&format!("{name}_data"));
         for (id, block) in &seg.data {
             self.execute_params(
@@ -35185,7 +35226,14 @@ impl Connection {
         // Build the appended segment for JUST the new docs, with a fresh segid.
         let segid = structure.allocate_segid();
         let (terms, _new_totals, new_doc_sizes) = self.fts5_tokenize_docs(&new_docs, ncols, tok);
-        let block = fts5_index::build_segment_block(&terms, &new_doc_sizes, 4050, segid, &prefixes);
+        let block = fts5_index::build_segment_block(
+            &terms,
+            &new_doc_sizes,
+            4050,
+            segid,
+            &prefixes,
+            tok.detail,
+        );
         // A segment with a doclist-index (spanning) page — `%_data` rowid with the
         // dlidx bit (1<<36) set — falls back to the bulk rebuild. A probe showed the
         // append itself is byte-identical to sqlite for the simple two-segment span,
@@ -35380,19 +35428,21 @@ impl Connection {
         // streams in ONE segment, so they read/merge/rewrite the FULL keys together;
         // the main index uses the `'0'`-stripped reader/writer.
         let block = if prefixes.is_empty() {
-            let terms = match fts5_index::merge_segments_keepdel(&seg_leaves, b_oldest) {
+            let terms = match fts5_index::merge_segments_keepdel(&seg_leaves, b_oldest, tok.detail)
+            {
                 Some(t) => t,
                 None => return Ok(None), // unservable (dlidx/interior) → rebuild
             };
-            fts5_index::build_merged_segment_block(&terms, 4050, out_segid)
+            fts5_index::build_merged_segment_block(&terms, 4050, out_segid, tok.detail)
         } else {
-            let terms = match fts5_index::merge_segments_keepdel_full(&seg_leaves, b_oldest) {
-                Some(t) => t,
-                None => return Ok(None), // unservable (dlidx/interior) → rebuild
-            };
-            fts5_index::build_merged_segment_block_full(&terms, 4050, out_segid)
+            let terms =
+                match fts5_index::merge_segments_keepdel_full(&seg_leaves, b_oldest, tok.detail) {
+                    Some(t) => t,
+                    None => return Ok(None), // unservable (dlidx/interior) → rebuild
+                };
+            fts5_index::build_merged_segment_block_full(&terms, 4050, out_segid, tok.detail)
         };
-        let _ = (ncols, tok);
+        let _ = ncols;
 
         let q = |s: &str| sql::print::ident(s);
         let pv = |vals: Vec<Value>| Params {
@@ -35603,6 +35653,13 @@ impl Connection {
         // the bulk rebuild below.
         let prefixes = crate::vtab::fts5_prefix_lengths(&arg_refs);
         let tok = crate::vtab::fts5_tok_config(&arg_refs);
+        // detail=none/columns deletes produce doclist tombstones whose merge
+        // annihilation this incremental slice does not reproduce byte-for-byte;
+        // fall back to the bulk rebuild (a valid, integrity-clean detail-aware
+        // segment) so the index is always correct.
+        if tok.detail != crate::fts5_index::Fts5Detail::Full {
+            return Ok(false);
+        }
 
         // The current live corpus (post-mutation content) drives the averages and
         // the docsize set; the segment we append is derived purely from `changes`.
@@ -35720,7 +35777,14 @@ impl Connection {
 
         // Build the appended tombstone/mixed segment with a fresh segid.
         let segid = structure.allocate_segid();
-        let block = fts5_index::build_segment_block(&terms, &new_doc_sizes, 4050, segid, &prefixes);
+        let block = fts5_index::build_segment_block(
+            &terms,
+            &new_doc_sizes,
+            4050,
+            segid,
+            &prefixes,
+            tok.detail,
+        );
         // A spanning (doclist-index) segment is out of this slice; fall back so we
         // never write a subtly wrong index.
         if block.data.iter().any(|(id, _)| (*id & (1 << 36)) != 0) {
@@ -35892,6 +35956,7 @@ impl Connection {
             4050,
             0,
             &prefixes,
+            tok.detail,
         );
 
         let q = |s: &str| sql::print::ident(s);
@@ -36139,6 +36204,7 @@ impl Connection {
             4050,
             0,
             &prefixes,
+            crate::vtab::fts5_detail(&arg_refs),
         );
 
         let q = |s: &str| sql::print::ident(s);

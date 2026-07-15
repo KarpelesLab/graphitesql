@@ -46,6 +46,26 @@ pub(crate) static INDEX_ROUTE_HITS: core::sync::atomic::AtomicUsize =
 /// `FTS5_MAIN_PREFIX` — every term in the main index is stored prefixed with '0'.
 const MAIN_PREFIX: u8 = b'0';
 
+/// The FTS5 `detail=` mode of a table (a `CREATE VIRTUAL TABLE` arg, default
+/// `full`). It governs the per-posting position-list encoding written into a
+/// segment doclist (sqlite's `pConfig->eDetail`):
+///
+/// * [`Full`](Fts5Detail::Full) — each posting carries a full position list:
+///   `size` varint then, per column, the `0x01`-separated token offsets. The
+///   original graphite behaviour.
+/// * [`Columns`](Fts5Detail::Columns) — each posting records only WHICH columns
+///   the term occurs in: a `size` varint then a delta-coded list of `(col+2)`
+///   column markers (no in-column offsets, no `0x01` separators).
+/// * [`None`](Fts5Detail::None) — each posting is a bare delta rowid with NO
+///   position list at all (a delete tombstone is a trailing `0x00`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Fts5Detail {
+    #[default]
+    Full,
+    None,
+    Columns,
+}
+
 /// `%_data` rowid of the averages record.
 pub(crate) const AVERAGES_ROWID: i64 = 1;
 /// `%_data` rowid of the structure record.
@@ -124,22 +144,60 @@ fn collist(positions: &[u32]) -> Vec<u8> {
 /// term the old row also had keeps `del = true` AND carries the new positions:
 /// `size2 = content_len*2 + 1` followed by the content — exactly how sqlite's hash
 /// flush encodes a docid that was deleted then re-written in one transaction.
-fn poslist(p: &Posting) -> Vec<u8> {
-    let mut content = Vec::new();
-    for (c, positions) in p.cols.iter().enumerate() {
-        if positions.is_empty() {
-            continue;
+fn poslist(p: &Posting, detail: Fts5Detail) -> Vec<u8> {
+    match detail {
+        Fts5Detail::Full => {
+            let mut content = Vec::new();
+            for (c, positions) in p.cols.iter().enumerate() {
+                if positions.is_empty() {
+                    continue;
+                }
+                if c != 0 {
+                    content.push(0x01);
+                    put_varint(&mut content, c as u64);
+                }
+                content.extend_from_slice(&collist(positions));
+            }
+            let mut out = Vec::new();
+            put_varint(&mut out, (content.len() as u64) * 2 + u64::from(p.del));
+            out.extend_from_slice(&content);
+            out
         }
-        if c != 0 {
-            content.push(0x01);
-            put_varint(&mut content, c as u64);
+        Fts5Detail::Columns => {
+            // Record only which columns the term occurs in, as a delta-coded list
+            // of `(col+2)` markers (sqlite writes `iPos - prevCol + 2`, `prevCol`
+            // seeded 0). No in-column offsets, no `0x01` separators. Reuses
+            // [`collist`] over the ascending list of present column indexes.
+            let present: Vec<u32> = p
+                .cols
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| !v.is_empty())
+                .map(|(c, _)| c as u32)
+                .collect();
+            let content = collist(&present);
+            let mut out = Vec::new();
+            put_varint(&mut out, (content.len() as u64) * 2 + u64::from(p.del));
+            out.extend_from_slice(&content);
+            out
         }
-        content.extend_from_slice(&collist(positions));
+        Fts5Detail::None => {
+            // No position list. A live insert contributes nothing after its rowid
+            // (sqlite's `iSzPoslist` reserves no size byte); a delete tombstone is
+            // a trailing `0x00` (plus a second `0x00` when it also carries content,
+            // sqlite's `bContent`). A pure insert has an empty poslist.
+            if p.del {
+                let has_content = p.cols.iter().any(|c| !c.is_empty());
+                if has_content {
+                    alloc::vec![0x00, 0x00]
+                } else {
+                    alloc::vec![0x00]
+                }
+            } else {
+                Vec::new()
+            }
+        }
     }
-    let mut out = Vec::new();
-    put_varint(&mut out, (content.len() as u64) * 2 + u64::from(p.del));
-    out.extend_from_slice(&content);
-    out
 }
 
 /// Port of sqlite's `fts5PoslistPrefix`: the byte length of the largest run of
@@ -209,6 +267,9 @@ pub(crate) type TokenizedDocs = (Vec<(Vec<u8>, Vec<Posting>)>, Vec<u64>, Vec<(i6
 struct SegWriter {
     pgsz: usize,
     segid: i64,
+    /// The table's `detail=` mode — governs each posting's poslist encoding
+    /// (see [`poslist`]).
+    detail: Fts5Detail,
     leaves: Vec<Vec<u8>>,
     idx: Vec<IdxRow>,
     body: Vec<u8>,
@@ -245,10 +306,11 @@ struct SegWriter {
 }
 
 impl SegWriter {
-    fn new(pgsz: usize, segid: i64) -> Self {
+    fn new(pgsz: usize, segid: i64, detail: Fts5Detail) -> Self {
         SegWriter {
             pgsz,
             segid,
+            detail,
             leaves: Vec::new(),
             idx: Vec::new(),
             body: Vec::new(),
@@ -488,7 +550,7 @@ impl SegWriter {
         self.prev_rowid = 0;
         for p in postings {
             self.append_rowid(p.rowid, term_start_leaf);
-            let pl = poslist(p);
+            let pl = poslist(p, self.detail);
             if self.merge_mode {
                 // sqlite's incremental-merge writer (`fts5IndexMergeLevel`) does
                 // NOT hand the whole poslist to `fts5WriteAppendPoslistData`. It
@@ -927,8 +989,18 @@ pub(crate) fn build_segment(
     doc_sizes: &[(i64, Vec<u64>)],
     pgsz: usize,
     cookie: u32,
+    detail: Fts5Detail,
 ) -> Segment {
-    build_segment_prefixed(terms, n_docs, col_totals, doc_sizes, pgsz, cookie, &[])
+    build_segment_prefixed(
+        terms,
+        n_docs,
+        col_totals,
+        doc_sizes,
+        pgsz,
+        cookie,
+        &[],
+        detail,
+    )
 }
 
 /// The number of BYTES occupied by the first `n_char` unicode characters of the
@@ -1018,6 +1090,7 @@ fn merge_prefix_postings(groups: &[&[Posting]]) -> Vec<Posting> {
 /// merge of every main term's doclist whose term starts with `p` (positions
 /// preserved). Since `'0' < '1' < '2' < …`, appending main terms then each prefix
 /// index in turn yields the globally ascending key order the writer requires.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_segment_prefixed(
     terms: &[(Vec<u8>, Vec<Posting>)],
     n_docs: u64,
@@ -1026,9 +1099,10 @@ pub(crate) fn build_segment_prefixed(
     pgsz: usize,
     cookie: u32,
     prefixes: &[usize],
+    detail: Fts5Detail,
 ) -> Segment {
     let segid = 1;
-    let (leaves, idx, dlidx) = build_segment_leaves(terms, pgsz, segid, prefixes);
+    let (leaves, idx, dlidx) = build_segment_leaves(terms, pgsz, segid, prefixes, detail);
 
     let mut data: Vec<(i64, Vec<u8>)> = Vec::new();
     // Averages (id 1): empty when there are no documents, else [nRow, per-col].
@@ -1077,8 +1151,9 @@ fn build_segment_leaves(
     pgsz: usize,
     segid: i64,
     prefixes: &[usize],
+    detail: Fts5Detail,
 ) -> SegParts {
-    build_segment_leaves_mode(terms, pgsz, segid, prefixes, false)
+    build_segment_leaves_mode(terms, pgsz, segid, prefixes, false, detail)
 }
 
 /// Core of [`build_segment_leaves`] with an explicit writer mode. `merge_mode ==
@@ -1095,9 +1170,10 @@ fn build_segment_leaves_mode(
     segid: i64,
     prefixes: &[usize],
     merge_mode: bool,
+    detail: Fts5Detail,
 ) -> SegParts {
     use alloc::collections::BTreeMap;
-    let mut w = SegWriter::new(pgsz.max(16), segid);
+    let mut w = SegWriter::new(pgsz.max(16), segid, detail);
     w.merge_mode = merge_mode;
     for (term, postings) in terms {
         w.add_term(term, postings);
@@ -1156,8 +1232,9 @@ pub(crate) fn build_segment_block(
     pgsz: usize,
     segid: i64,
     prefixes: &[usize],
+    detail: Fts5Detail,
 ) -> SegmentBlock {
-    let (leaves, idx, dlidx) = build_segment_leaves(terms, pgsz, segid, prefixes);
+    let (leaves, idx, dlidx) = build_segment_leaves(terms, pgsz, segid, prefixes, detail);
     let mut data: Vec<(i64, Vec<u8>)> = Vec::new();
     for (i, leaf) in leaves.iter().enumerate() {
         data.push((segment_leaf_rowid(segid, i as i64 + 1), leaf.clone()));
@@ -1181,9 +1258,10 @@ pub(crate) fn build_merged_segment_block(
     terms: &[(Vec<u8>, Vec<Posting>)],
     pgsz: usize,
     segid: i64,
+    detail: Fts5Detail,
 ) -> SegmentBlock {
     let (leaves, idx, dlidx) = {
-        let mut w = SegWriter::new(pgsz.max(16), segid);
+        let mut w = SegWriter::new(pgsz.max(16), segid, detail);
         w.merge_mode = true;
         for (term, postings) in terms {
             w.add_term(term, postings);
@@ -1217,9 +1295,10 @@ pub(crate) fn build_merged_segment_block_full(
     terms: &[(Vec<u8>, Vec<Posting>)],
     pgsz: usize,
     segid: i64,
+    detail: Fts5Detail,
 ) -> SegmentBlock {
     let (leaves, idx, dlidx) = {
-        let mut w = SegWriter::new(pgsz.max(16), segid);
+        let mut w = SegWriter::new(pgsz.max(16), segid, detail);
         w.merge_mode = true;
         for (key, postings) in terms {
             w.add_key(key, postings);
@@ -1861,47 +1940,106 @@ fn merge_segments(
 
 /// Like [`decode_poslist`] but returns the DELETE flag (`size2 & 1`) rather than
 /// bailing on a tombstone. The inverse of [`poslist`] including its low bit.
-fn decode_poslist_keepdel(buf: &[u8], pos: &mut usize) -> Option<(Vec<Vec<u32>>, bool)> {
-    let size2 = read_varint(buf, pos)?;
-    let del = (size2 & 1) != 0;
-    let content_len = (size2 / 2) as usize;
-    let end = pos.checked_add(content_len)?;
-    if end > buf.len() {
-        return None;
-    }
-    let mut cols: Vec<Vec<u32>> = Vec::new();
-    let mut col = 0usize;
-    let mut p = *pos;
-    cols.push(Vec::new());
-    while p < end {
-        if buf[p] == 0x01 {
-            p += 1;
-            let c = read_varint(buf, &mut p)? as usize;
-            col = c;
-            while cols.len() <= col {
-                cols.push(Vec::new());
+fn decode_poslist_keepdel(
+    buf: &[u8],
+    pos: &mut usize,
+    detail: Fts5Detail,
+) -> Option<(Vec<Vec<u32>>, bool)> {
+    match detail {
+        Fts5Detail::None => {
+            // No position list. A trailing `0x00` (never the first byte of the
+            // next delta rowid, which is always >= 1) marks a delete tombstone;
+            // a second `0x00` is the `bContent` re-write marker. A live insert
+            // consumes nothing. Column info is unavailable in this mode.
+            let mut del = false;
+            if *pos < buf.len() && buf[*pos] == 0 {
+                del = true;
+                *pos += 1;
+                if *pos < buf.len() && buf[*pos] == 0 {
+                    *pos += 1;
+                }
             }
-        } else {
-            let raw = read_varint(buf, &mut p)?;
-            if raw < 2 {
+            Some((Vec::new(), del))
+        }
+        Fts5Detail::Columns => {
+            let size2 = read_varint(buf, pos)?;
+            let del = (size2 & 1) != 0;
+            let content_len = (size2 / 2) as usize;
+            let end = pos.checked_add(content_len)?;
+            if end > buf.len() {
                 return None;
             }
-            let delta = (raw - 2) as u32;
-            let next = if cols[col].is_empty() {
-                delta
-            } else {
-                cols[col].last().copied()?.checked_add(delta)?
-            };
-            cols[col].push(next);
+            // The content is a delta-coded list of `(col+2)` markers (seed 0). Each
+            // present column is recorded with a non-empty presence marker so column
+            // filters and the re-encode round-trip.
+            let mut cols: Vec<Vec<u32>> = alloc::vec![Vec::new()];
+            let mut prev = 0u32;
+            let mut p = *pos;
+            let mut first = true;
+            while p < end {
+                let raw = read_varint(buf, &mut p)?;
+                if raw < 2 {
+                    return None;
+                }
+                let delta = raw - 2;
+                let col = if first {
+                    delta as usize
+                } else {
+                    (prev as u64).checked_add(delta)? as usize
+                };
+                first = false;
+                prev = col as u32;
+                while cols.len() <= col {
+                    cols.push(Vec::new());
+                }
+                cols[col].push(0);
+            }
+            *pos = end;
+            Some((cols, del))
+        }
+        Fts5Detail::Full => {
+            let size2 = read_varint(buf, pos)?;
+            let del = (size2 & 1) != 0;
+            let content_len = (size2 / 2) as usize;
+            let end = pos.checked_add(content_len)?;
+            if end > buf.len() {
+                return None;
+            }
+            let mut cols: Vec<Vec<u32>> = Vec::new();
+            let mut col = 0usize;
+            let mut p = *pos;
+            cols.push(Vec::new());
+            while p < end {
+                if buf[p] == 0x01 {
+                    p += 1;
+                    let c = read_varint(buf, &mut p)? as usize;
+                    col = c;
+                    while cols.len() <= col {
+                        cols.push(Vec::new());
+                    }
+                } else {
+                    let raw = read_varint(buf, &mut p)?;
+                    if raw < 2 {
+                        return None;
+                    }
+                    let delta = (raw - 2) as u32;
+                    let next = if cols[col].is_empty() {
+                        delta
+                    } else {
+                        cols[col].last().copied()?.checked_add(delta)?
+                    };
+                    cols[col].push(next);
+                }
+            }
+            *pos = end;
+            Some((cols, del))
         }
     }
-    *pos = end;
-    Some((cols, del))
 }
 
 /// Like [`decode_spanning_doclist`] but builds [`Posting`]s (carrying the DELETE
 /// flag via [`decode_poslist_keepdel`]) instead of position-only [`DecodedPosting`]s.
-fn decode_doclist_keepdel(runs: &[DoclistRun]) -> Option<Vec<Posting>> {
+fn decode_doclist_keepdel(runs: &[DoclistRun], detail: Fts5Detail) -> Option<Vec<Posting>> {
     let mut buf: Vec<u8> = Vec::new();
     let mut abs_at: Vec<usize> = Vec::new();
     for run in runs {
@@ -1920,7 +2058,7 @@ fn decode_doclist_keepdel(runs: &[DoclistRun]) -> Option<Vec<Posting>> {
         let d = read_varint(&buf, &mut pos)? as i64;
         rowid = if absolute { d } else { rowid.wrapping_add(d) };
         first = false;
-        let (cols, del) = decode_poslist_keepdel(&buf, &mut pos)?;
+        let (cols, del) = decode_poslist_keepdel(&buf, &mut pos, detail)?;
         if pos > end {
             return None;
         }
@@ -1937,7 +2075,10 @@ fn decode_doclist_keepdel(runs: &[DoclistRun]) -> Option<Vec<Posting>> {
 /// [`build_segment_block`]). `None` (bail) on an interior/doclist-index page (an
 /// unparseable leaf) or a non-`MAIN_PREFIX` term (a prefix-index key) — the
 /// automerge path only services the main index. Postings preserve DELETE markers.
-pub(crate) fn read_segment_postings(leaves: &[&[u8]]) -> Option<Vec<(Vec<u8>, Vec<Posting>)>> {
+pub(crate) fn read_segment_postings(
+    leaves: &[&[u8]],
+    detail: Fts5Detail,
+) -> Option<Vec<(Vec<u8>, Vec<Posting>)>> {
     let mut views: Vec<LeafView> = Vec::with_capacity(leaves.len());
     for leaf in leaves {
         views.push(parse_leaf(leaf)?);
@@ -1952,7 +2093,7 @@ pub(crate) fn read_segment_postings(leaves: &[&[u8]]) -> Option<Vec<(Vec<u8>, Ve
             }
             let term = rec.key.get(1..)?.to_vec();
             let runs = gather_doclist_runs(leaves, li, ti, rec.doclist_start, &views)?;
-            let postings = decode_doclist_keepdel(&runs)?;
+            let postings = decode_doclist_keepdel(&runs, detail)?;
             out.push((term, postings));
         }
     }
@@ -1966,7 +2107,10 @@ pub(crate) fn read_segment_postings(leaves: &[&[u8]]) -> Option<Vec<(Vec<u8>, Ve
 /// [`build_merged_segment_block_full`], which re-emits the keys verbatim.
 /// Postings preserve DELETE markers. `None` (bail) on an interior/doclist-index
 /// page (an unparseable leaf).
-pub(crate) fn read_segment_postings_full(leaves: &[&[u8]]) -> Option<Vec<(Vec<u8>, Vec<Posting>)>> {
+pub(crate) fn read_segment_postings_full(
+    leaves: &[&[u8]],
+    detail: Fts5Detail,
+) -> Option<Vec<(Vec<u8>, Vec<Posting>)>> {
     let mut views: Vec<LeafView> = Vec::with_capacity(leaves.len());
     for leaf in leaves {
         views.push(parse_leaf(leaf)?);
@@ -1979,7 +2123,7 @@ pub(crate) fn read_segment_postings_full(leaves: &[&[u8]]) -> Option<Vec<(Vec<u8
             }
             let key = rec.key.clone();
             let runs = gather_doclist_runs(leaves, li, ti, rec.doclist_start, &views)?;
-            let postings = decode_doclist_keepdel(&runs)?;
+            let postings = decode_doclist_keepdel(&runs, detail)?;
             out.push((key, postings));
         }
     }
@@ -2000,6 +2144,7 @@ pub(crate) fn read_segment_postings_full(leaves: &[&[u8]]) -> Option<Vec<(Vec<u8
 fn merge_level_postings(
     segs: &[Vec<(Vec<u8>, Vec<Posting>)>],
     b_oldest: bool,
+    detail: Fts5Detail,
 ) -> Vec<(Vec<u8>, Vec<Posting>)> {
     use alloc::collections::BTreeMap;
     // term -> (rowid -> Posting); iterating segments oldest→newest and inserting
@@ -2017,8 +2162,15 @@ fn merge_level_postings(
     for (term, by_rowid) in map {
         let mut ps: Vec<Posting> = Vec::new();
         for (_rowid, p) in by_rowid {
-            let empty = p.cols.iter().all(|c| c.is_empty());
-            if empty && (b_oldest || !p.del) {
+            // Key annihilation (`nPos==0 && (bOldest || bDel==0)`). For full/columns
+            // an empty poslist (`nPos==0`) has no non-empty column; for detail=none
+            // a live insert has `nPos==1` (never dropped) — only a delete tombstone
+            // can be annihilated.
+            let npos_zero = match detail {
+                Fts5Detail::None => p.del && p.cols.iter().all(|c| c.is_empty()),
+                _ => p.cols.iter().all(|c| c.is_empty()),
+            };
+            if npos_zero && (b_oldest || !p.del) {
                 continue;
             }
             ps.push(p);
@@ -2036,12 +2188,13 @@ fn merge_level_postings(
 pub(crate) fn merge_segments_keepdel(
     seg_leaves: &[Vec<&[u8]>],
     b_oldest: bool,
+    detail: Fts5Detail,
 ) -> Option<Vec<(Vec<u8>, Vec<Posting>)>> {
     let mut segs: Vec<Vec<(Vec<u8>, Vec<Posting>)>> = Vec::with_capacity(seg_leaves.len());
     for leaves in seg_leaves {
-        segs.push(read_segment_postings(leaves)?);
+        segs.push(read_segment_postings(leaves, detail)?);
     }
-    Some(merge_level_postings(&segs, b_oldest))
+    Some(merge_level_postings(&segs, b_oldest, detail))
 }
 
 /// The prefix-aware sibling of [`merge_segments_keepdel`]: reads each segment with
@@ -2054,12 +2207,13 @@ pub(crate) fn merge_segments_keepdel(
 pub(crate) fn merge_segments_keepdel_full(
     seg_leaves: &[Vec<&[u8]>],
     b_oldest: bool,
+    detail: Fts5Detail,
 ) -> Option<Vec<(Vec<u8>, Vec<Posting>)>> {
     let mut segs: Vec<Vec<(Vec<u8>, Vec<Posting>)>> = Vec::with_capacity(seg_leaves.len());
     for leaves in seg_leaves {
-        segs.push(read_segment_postings_full(leaves)?);
+        segs.push(read_segment_postings_full(leaves, detail)?);
     }
-    Some(merge_level_postings(&segs, b_oldest))
+    Some(merge_level_postings(&segs, b_oldest, detail))
 }
 
 // ---------------------------------------------------------------------------
@@ -2074,7 +2228,10 @@ pub(crate) fn merge_segments_keepdel_full(
 /// prefix-index term (key byte `'1'`, `'2'`, …) rather than bailing, so a
 /// prefix-configured table's main index can still be checked. `None` (bail) on a
 /// genuinely unparseable leaf (an interior/doclist-index page) or a malformed key.
-fn read_main_segment_postings(leaves: &[&[u8]]) -> Option<Vec<(Vec<u8>, Vec<Posting>)>> {
+fn read_main_segment_postings(
+    leaves: &[&[u8]],
+    detail: Fts5Detail,
+) -> Option<Vec<(Vec<u8>, Vec<Posting>)>> {
     let mut views: Vec<LeafView> = Vec::with_capacity(leaves.len());
     for leaf in leaves {
         views.push(parse_leaf(leaf)?);
@@ -2090,7 +2247,7 @@ fn read_main_segment_postings(leaves: &[&[u8]]) -> Option<Vec<(Vec<u8>, Vec<Post
             }
             let term = rec.key.get(1..)?.to_vec();
             let runs = gather_doclist_runs(leaves, li, ti, rec.doclist_start, &views)?;
-            let postings = decode_doclist_keepdel(&runs)?;
+            let postings = decode_doclist_keepdel(&runs, detail)?;
             out.push((term, postings));
         }
     }
@@ -2124,7 +2281,7 @@ pub(crate) enum MainIndexScan {
 /// impossible file (a referenced leaf missing), and [`MainIndexScan::Skip`] for
 /// every valid-but-not-fully-decodable shape — so a mismatch reported against a
 /// `Clean` result is real.
-pub(crate) fn scan_main_index(data: &[(i64, Vec<u8>)]) -> MainIndexScan {
+pub(crate) fn scan_main_index(data: &[(i64, Vec<u8>)], detail: Fts5Detail) -> MainIndexScan {
     use alloc::collections::BTreeMap;
     let Some(structure) = data
         .iter()
@@ -2193,7 +2350,7 @@ pub(crate) fn scan_main_index(data: &[(i64, Vec<u8>)]) -> MainIndexScan {
                 None => return MainIndexScan::Malformed, // structure references a gone leaf
             }
         }
-        let Some(terms) = read_main_segment_postings(&leaves) else {
+        let Some(terms) = read_main_segment_postings(&leaves, detail) else {
             return MainIndexScan::Skip; // interior/doclist-index/unparseable leaf
         };
         for (term, postings) in terms {
@@ -2852,7 +3009,7 @@ mod tests {
 
     #[test]
     fn empty_table_structure_and_averages() {
-        let seg = build_segment(&[], 0, &[0], &[], 1000, 0);
+        let seg = build_segment(&[], 0, &[0], &[], 1000, 0, Fts5Detail::Full);
         // averages empty, structure = cookie(0) + three zero varints.
         assert_eq!(seg.data[0], (AVERAGES_ROWID, Vec::new()));
         assert_eq!(seg.data[1], (STRUCTURE_ROWID, vec![0, 0, 0, 0, 0, 0, 0]));
@@ -2864,7 +3021,7 @@ mod tests {
     fn single_term_single_doc_matches_known_bytes() {
         // "a" at rowid 1, col0 pos0 → leaf X'0000000A 02 3061 01 02 02 04'.
         let terms = vec![(b"a".to_vec(), vec![p(1, &[&[0]])])];
-        let seg = build_segment(&terms, 1, &[1], &[(1, vec![1])], 1000, 0);
+        let seg = build_segment(&terms, 1, &[1], &[(1, vec![1])], 1000, 0, Fts5Detail::Full);
         let leaf = &seg
             .data
             .iter()
@@ -2887,7 +3044,15 @@ mod tests {
     fn multi_column_poslist_bytes() {
         // "hello" in col0 pos0 and col1 pos0 → poslist content `02 01 01 02`.
         let terms = vec![("hello".to_string().into_bytes(), vec![p(1, &[&[0], &[0]])])];
-        let seg = build_segment(&terms, 1, &[1, 1], &[(1, vec![1, 1])], 1000, 0);
+        let seg = build_segment(
+            &terms,
+            1,
+            &[1, 1],
+            &[(1, vec![1, 1])],
+            1000,
+            0,
+            Fts5Detail::Full,
+        );
         let leaf = &seg
             .data
             .iter()
@@ -2967,7 +3132,7 @@ mod tests {
     #[test]
     fn dlidx_absent_when_doclist_fits_one_leaf() {
         let (terms, ndoc, tot, sizes) = single_token_corpus(b"shared", 50);
-        let seg = build_segment(&terms, ndoc, &tot, &sizes, 4050, 0);
+        let seg = build_segment(&terms, ndoc, &tot, &sizes, 4050, 0, Fts5Detail::Full);
         assert!(dlidx_pages(&seg).is_empty());
         // The single `%_idx` entry has no dlidx flag.
         assert_eq!(seg.idx.len(), 1);
@@ -2980,7 +3145,7 @@ mod tests {
     fn dlidx_absent_below_threshold() {
         // ~3 leaves total: term-start + 2 continuation (< 4), so no dlidx.
         let (terms, ndoc, tot, sizes) = single_token_corpus(b"shared", 2500);
-        let seg = build_segment(&terms, ndoc, &tot, &sizes, 4050, 0);
+        let seg = build_segment(&terms, ndoc, &tot, &sizes, 4050, 0, Fts5Detail::Full);
         let leaves = leaves_of(&seg);
         assert!(leaves.len() >= 2, "expected a multi-leaf spill");
         assert!(
@@ -3000,7 +3165,7 @@ mod tests {
     #[test]
     fn dlidx_bytes_match_sqlite_6000_docs() {
         let (terms, ndoc, tot, sizes) = single_token_corpus(b"shared", 6000);
-        let seg = build_segment(&terms, ndoc, &tot, &sizes, 4050, 0);
+        let seg = build_segment(&terms, ndoc, &tot, &sizes, 4050, 0, Fts5Detail::Full);
         // sqlite 3.50.4: 5 leaves, one dlidx page X'00028A438A458A458A45' at
         // dlidx pgno 1, `%_idx` entry X''|leaf=1|dli=1.
         assert_eq!(leaves_of(&seg).len(), 5);
@@ -3023,7 +3188,7 @@ mod tests {
     #[test]
     fn dlidx_bytes_match_sqlite_8000_docs() {
         let (terms, ndoc, tot, sizes) = single_token_corpus(b"shared", 8000);
-        let seg = build_segment(&terms, ndoc, &tot, &sizes, 4050, 0);
+        let seg = build_segment(&terms, ndoc, &tot, &sizes, 4050, 0, Fts5Detail::Full);
         assert_eq!(leaves_of(&seg).len(), 6);
         let dl = dlidx_pages(&seg);
         assert_eq!(dl.len(), 1);
@@ -3043,7 +3208,7 @@ mod tests {
     #[test]
     fn high_frequency_spanning_term_takes_index_route() {
         let (terms, ndoc, tot, sizes) = single_token_corpus(b"shared", 8000);
-        let seg = build_segment(&terms, ndoc, &tot, &sizes, 4050, 0);
+        let seg = build_segment(&terms, ndoc, &tot, &sizes, 4050, 0, Fts5Detail::Full);
         // The segment spills onto MIN_DLIDX_SIZE+ continuation leaves and has a dlidx.
         assert!(leaves_of(&seg).len() > MIN_DLIDX_SIZE);
         assert_eq!(dlidx_pages(&seg).len(), 1);
@@ -3146,7 +3311,7 @@ mod tests {
         let postings: Vec<Posting> = (1..=4000).map(|i| p(i * 1000, &[&[0]])).collect();
         let terms = vec![(b"w".to_vec(), postings)];
         let sizes: Vec<(i64, Vec<u64>)> = (1..=4000).map(|i| (i * 1000, vec![1])).collect();
-        let seg = build_segment(&terms, 4000, &[4000], &sizes, 64, 0);
+        let seg = build_segment(&terms, 4000, &[4000], &sizes, 64, 0, Fts5Detail::Full);
 
         // There must be more than one height-0 index page and exactly one root at
         // height 1 (this is what makes it a MULTI-level dlidx).
@@ -3213,7 +3378,7 @@ mod tests {
     #[test]
     fn decode_single_term_single_doc() {
         let terms = vec![(b"a".to_vec(), vec![p(1, &[&[0]])])];
-        let seg = build_segment(&terms, 1, &[1], &[(1, vec![1])], 1000, 0);
+        let seg = build_segment(&terms, 1, &[1], &[(1, vec![1])], 1000, 0, Fts5Detail::Full);
         assert_eq!(decode(&seg, b"a"), Some(vec![dp(1, &[&[0]])]));
         // Absent term → None.
         assert_eq!(decode(&seg, b"z"), None);
@@ -3235,6 +3400,7 @@ mod tests {
             &[(1, vec![1]), (3, vec![3]), (7, vec![2])],
             1000,
             0,
+            Fts5Detail::Full,
         );
         assert_eq!(
             decode(&seg, b"cat"),
@@ -3246,7 +3412,7 @@ mod tests {
     fn decode_term_multiple_positions_one_doc() {
         // "the" appears at positions 0 and 2 in rowid 1 (collist with a delta).
         let terms = vec![(b"the".to_vec(), vec![p(1, &[&[0, 2]])])];
-        let seg = build_segment(&terms, 1, &[3], &[(1, vec![3])], 1000, 0);
+        let seg = build_segment(&terms, 1, &[3], &[(1, vec![3])], 1000, 0, Fts5Detail::Full);
         assert_eq!(decode(&seg, b"the"), Some(vec![dp(1, &[&[0, 2]])]));
     }
 
@@ -3258,7 +3424,15 @@ mod tests {
             (b"apple".to_vec(), vec![p(1, &[&[0]])]),
             (b"apply".to_vec(), vec![p(2, &[&[0]])]),
         ];
-        let seg = build_segment(&terms, 2, &[2], &[(1, vec![1]), (2, vec![1])], 1000, 0);
+        let seg = build_segment(
+            &terms,
+            2,
+            &[2],
+            &[(1, vec![1]), (2, vec![1])],
+            1000,
+            0,
+            Fts5Detail::Full,
+        );
         assert_eq!(decode(&seg, b"apple"), Some(vec![dp(1, &[&[0]])]));
         assert_eq!(decode(&seg, b"apply"), Some(vec![dp(2, &[&[0]])]));
         // "appl" is a shared prefix, not a stored term.
@@ -3272,7 +3446,15 @@ mod tests {
             (b"hello".to_vec(), vec![p(1, &[&[0], &[0]])]),
             (b"there".to_vec(), vec![p(1, &[&[], &[1]])]),
         ];
-        let seg = build_segment(&terms, 1, &[1, 2], &[(1, vec![1, 2])], 1000, 0);
+        let seg = build_segment(
+            &terms,
+            1,
+            &[1, 2],
+            &[(1, vec![1, 2])],
+            1000,
+            0,
+            Fts5Detail::Full,
+        );
         assert_eq!(decode(&seg, b"hello"), Some(vec![dp(1, &[&[0], &[0]])]));
         // "there": col0 empty, col1 has pos 1.
         assert_eq!(decode(&seg, b"there"), Some(vec![dp(1, &[&[], &[1]])]));
@@ -3296,6 +3478,7 @@ mod tests {
             &doc_sizes,
             1000,
             0,
+            Fts5Detail::Full,
         );
         for (i, w) in words.iter().enumerate() {
             assert_eq!(
@@ -3326,7 +3509,15 @@ mod tests {
             .map(|(i, w)| (w.clone(), vec![p(i as i64 + 1, &[&[0]])]))
             .collect();
         let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=n as i64).map(|r| (r, vec![1])).collect();
-        let seg = build_segment(&terms, n as u64, &[n as u64], &doc_sizes, 64, 0);
+        let seg = build_segment(
+            &terms,
+            n as u64,
+            &[n as u64],
+            &doc_sizes,
+            64,
+            0,
+            Fts5Detail::Full,
+        );
         assert!(leaf_count(&seg) > 1, "pgsz 64 must split into many leaves");
         for (i, w) in words.iter().enumerate() {
             assert_eq!(
@@ -3347,7 +3538,15 @@ mod tests {
         let postings: Vec<Posting> = (1..=n).map(|r| p(r, &[&[0]])).collect();
         let terms = vec![(b"x".to_vec(), postings)];
         let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=n).map(|r| (r, vec![1])).collect();
-        let seg = build_segment(&terms, n as u64, &[n as u64], &doc_sizes, 64, 0);
+        let seg = build_segment(
+            &terms,
+            n as u64,
+            &[n as u64],
+            &doc_sizes,
+            64,
+            0,
+            Fts5Detail::Full,
+        );
         assert!(leaf_count(&seg) > 1, "pgsz 64 must span the doclist");
         let want: Vec<DecodedPosting> = (1..=n).map(|r| dp(r, &[&[0]])).collect();
         assert_eq!(decode(&seg, b"x"), Some(want));
@@ -3362,7 +3561,15 @@ mod tests {
         let postings: Vec<Posting> = (1..=n).map(|r| p(r, &[&[0, 3, 9, 15]])).collect();
         let terms = vec![(b"w".to_vec(), postings)];
         let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=n).map(|r| (r, vec![16])).collect();
-        let seg = build_segment(&terms, n as u64, &[(16 * n) as u64], &doc_sizes, 48, 0);
+        let seg = build_segment(
+            &terms,
+            n as u64,
+            &[(16 * n) as u64],
+            &doc_sizes,
+            48,
+            0,
+            Fts5Detail::Full,
+        );
         assert!(leaf_count(&seg) > 1, "pgsz 48 must span the doclist");
         let want: Vec<DecodedPosting> = (1..=n).map(|r| dp(r, &[&[0, 3, 9, 15]])).collect();
         assert_eq!(decode(&seg, b"w"), Some(want));
@@ -3384,7 +3591,7 @@ mod tests {
         terms.sort_by(|a, b| a.0.cmp(&b.0));
         // doc sizes are irrelevant to decode; supply a plausible set.
         let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=120).map(|r| (r, vec![1])).collect();
-        let seg = build_segment(&terms, 120, &[120], &doc_sizes, 56, 0);
+        let seg = build_segment(&terms, 120, &[120], &doc_sizes, 56, 0, Fts5Detail::Full);
         assert!(leaf_count(&seg) > 2, "expected several leaves");
         // Verify each term decodes to exactly what was written.
         for (term, postings) in &terms {
@@ -3417,6 +3624,7 @@ mod tests {
             &[(1, vec![1]), (3, vec![3]), (7, vec![2])],
             1000,
             0,
+            Fts5Detail::Full,
         );
         assert_eq!(lookup_term_rowids(&seg.data, b"cat"), Some(vec![1, 3, 7]));
         // A servable segment whose term is absent → an empty rowid list (no match),
@@ -3427,7 +3635,7 @@ mod tests {
     #[test]
     fn lookup_rowids_empty_index_falls_back() {
         // An empty index has no leaves and `nLevel == 0`: not servable → `None`.
-        let seg = build_segment(&[], 0, &[0], &[], 1000, 0);
+        let seg = build_segment(&[], 0, &[0], &[], 1000, 0, Fts5Detail::Full);
         assert_eq!(lookup_term_rowids(&seg.data, b"anything"), None);
     }
 
@@ -3438,7 +3646,15 @@ mod tests {
         let postings: Vec<Posting> = (1..=n).map(|r| p(r, &[&[0]])).collect();
         let terms = vec![(b"x".to_vec(), postings)];
         let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=n).map(|r| (r, vec![1])).collect();
-        let seg = build_segment(&terms, n as u64, &[n as u64], &doc_sizes, 64, 0);
+        let seg = build_segment(
+            &terms,
+            n as u64,
+            &[n as u64],
+            &doc_sizes,
+            64,
+            0,
+            Fts5Detail::Full,
+        );
         assert!(leaf_count(&seg) > 1, "pgsz 64 must span the doclist");
         let want: Vec<i64> = (1..=n).collect();
         assert_eq!(lookup_term_rowids(&seg.data, b"x"), Some(want));
@@ -3472,7 +3688,7 @@ mod tests {
             ),
         ];
         let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=8).map(|r| (r, vec![3])).collect();
-        let seg = build_segment(&terms, 8, &[8], &doc_sizes, 1000, 0);
+        let seg = build_segment(&terms, 8, &[8], &doc_sizes, 1000, 0, Fts5Detail::Full);
         let leaf = |t: &[u8]| Fts5BoolTree::Leaf(t.to_vec());
         let op = |o, l, r| Fts5BoolTree::Op(o, Box::new(l), Box::new(r));
 
@@ -3531,7 +3747,7 @@ mod tests {
     fn lookup_bool_tree_empty_index_falls_back() {
         use crate::vtab::Fts5BoolTree;
         // An unservable (empty) index returns None so the caller scans.
-        let seg = build_segment(&[], 0, &[0], &[], 1000, 0);
+        let seg = build_segment(&[], 0, &[0], &[], 1000, 0, Fts5Detail::Full);
         let t = Fts5BoolTree::Leaf(b"x".to_vec());
         assert_eq!(lookup_bool_tree_rowids(&seg.data, &t), None);
     }
@@ -3554,7 +3770,7 @@ mod tests {
             (3, vec![1, 2]),
             (4, vec![3, 0]),
         ];
-        let seg = build_segment(&terms, 4, &[3, 2], &doc_sizes, 1000, 0);
+        let seg = build_segment(&terms, 4, &[3, 2], &doc_sizes, 1000, 0, Fts5Detail::Full);
         // Column 0: docs 1, 3, 4. Column 1: docs 2, 3.
         assert_eq!(
             lookup_term_rowids_in_column(&seg.data, b"word", 0),
@@ -3597,7 +3813,15 @@ mod tests {
             .collect();
         let terms = vec![(b"x".to_vec(), postings)];
         let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=n).map(|r| (r, vec![1, 1])).collect();
-        let seg = build_segment(&terms, n as u64, &[20, 20], &doc_sizes, 64, 0);
+        let seg = build_segment(
+            &terms,
+            n as u64,
+            &[20, 20],
+            &doc_sizes,
+            64,
+            0,
+            Fts5Detail::Full,
+        );
         assert!(leaf_count(&seg) > 1, "pgsz 64 must span the doclist");
         let even: Vec<i64> = (1..=n).filter(|r| r % 2 == 0).collect();
         let odd: Vec<i64> = (1..=n).filter(|r| r % 2 == 1).collect();
@@ -3626,7 +3850,7 @@ mod tests {
             (5, vec![1]),
             (6, vec![2]),
         ];
-        let seg = build_segment(&terms, 6, &[8], &doc_sizes, 1000, 0);
+        let seg = build_segment(&terms, 6, &[8], &doc_sizes, 1000, 0, Fts5Detail::Full);
         // "ap" → apex, apple, apply → docs {1,3,4,6} (6 appears via both apple+apply,
         // deduped to one).
         assert_eq!(
@@ -3645,7 +3869,7 @@ mod tests {
         // A prefix matching nothing → empty (servable), not None.
         assert_eq!(lookup_prefix_rowids(&seg.data, b"zzz"), Some(Vec::new()));
         // An empty index is not servable → None.
-        let empty = build_segment(&[], 0, &[0], &[], 1000, 0);
+        let empty = build_segment(&[], 0, &[0], &[], 1000, 0, Fts5Detail::Full);
         assert_eq!(lookup_prefix_rowids(&empty.data, b"ap"), None);
     }
 
@@ -3664,7 +3888,15 @@ mod tests {
             })
             .collect();
         let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=n as i64).map(|r| (r, vec![1])).collect();
-        let seg = build_segment(&terms, n as u64, &[n as u64], &doc_sizes, 64, 0);
+        let seg = build_segment(
+            &terms,
+            n as u64,
+            &[n as u64],
+            &doc_sizes,
+            64,
+            0,
+            Fts5Detail::Full,
+        );
         assert!(leaf_count(&seg) > 1, "pgsz 64 must split into many leaves");
         // "word" → every doc.
         assert_eq!(
@@ -3695,7 +3927,7 @@ mod tests {
             (3, vec![1, 0]),
             (4, vec![0, 2]),
         ];
-        let seg = build_segment(&terms, 4, &[2, 3], &doc_sizes, 1000, 0);
+        let seg = build_segment(&terms, 4, &[2, 3], &doc_sizes, 1000, 0, Fts5Detail::Full);
         // "fo" any column → {1,2,3,4}.
         assert_eq!(
             lookup_prefix_rowids(&seg.data, b"fo"),
@@ -3752,7 +3984,7 @@ mod tests {
             ),
         ];
         let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=6).map(|r| (r, vec![8])).collect::<Vec<_>>();
-        let seg = build_segment(&terms, 6, &[40], &doc_sizes, 1000, 0);
+        let seg = build_segment(&terms, 6, &[40], &doc_sizes, 1000, 0, Fts5Detail::Full);
         // Only docs 1 and 4 have "a" immediately followed by "b".
         assert_eq!(
             lookup_phrase_rowids_k(&seg.data, &[b"a", b"b"]),
@@ -3774,7 +4006,15 @@ mod tests {
     fn lookup_phrase_repeated_word() {
         // The phrase "a a": doc1 has a@0,1 (adjacent self), doc2 has a@0,2 (not).
         let terms = vec![(b"a".to_vec(), vec![p(1, &[&[0, 1]]), p(2, &[&[0, 2]])])];
-        let seg = build_segment(&terms, 2, &[4], &[(1, vec![2]), (2, vec![3])], 1000, 0);
+        let seg = build_segment(
+            &terms,
+            2,
+            &[4],
+            &[(1, vec![2]), (2, vec![3])],
+            1000,
+            0,
+            Fts5Detail::Full,
+        );
         assert_eq!(
             lookup_phrase_rowids_k(&seg.data, &[b"a", b"a"]),
             Some(vec![1])
@@ -3809,7 +4049,7 @@ mod tests {
             ),
         ];
         let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=4).map(|r| (r, vec![8, 8])).collect::<Vec<_>>();
-        let seg = build_segment(&terms, 4, &[40, 40], &doc_sizes, 1000, 0);
+        let seg = build_segment(&terms, 4, &[40, 40], &doc_sizes, 1000, 0, Fts5Detail::Full);
         // Table-wide: any column with the adjacent phrase → docs 1, 3, 4.
         assert_eq!(
             lookup_phrase_rowids_k(&seg.data, &[b"a", b"b"]),
@@ -3845,7 +4085,15 @@ mod tests {
             .collect();
         let terms = vec![(b"a".to_vec(), a_post), (b"b".to_vec(), b_post)];
         let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=n).map(|r| (r, vec![8])).collect();
-        let seg = build_segment(&terms, n as u64, &[8 * n as u64], &doc_sizes, 64, 0);
+        let seg = build_segment(
+            &terms,
+            n as u64,
+            &[8 * n as u64],
+            &doc_sizes,
+            64,
+            0,
+            Fts5Detail::Full,
+        );
         assert!(leaf_count(&seg) > 1, "pgsz 64 must span the doclists");
         let even: Vec<i64> = (1..=n).filter(|r| r % 2 == 0).collect();
         assert_eq!(lookup_phrase_rowids_k(&seg.data, &[b"a", b"b"]), Some(even));
@@ -3853,7 +4101,7 @@ mod tests {
 
     #[test]
     fn lookup_phrase_empty_index_falls_back() {
-        let seg = build_segment(&[], 0, &[0], &[], 1000, 0);
+        let seg = build_segment(&[], 0, &[0], &[], 1000, 0, Fts5Detail::Full);
         assert_eq!(lookup_phrase_rowids_k(&seg.data, &[b"a", b"b"]), None);
         assert_eq!(
             lookup_phrase_rowids_in_column_k(&seg.data, &[b"a", b"b"], 0),
@@ -3902,7 +4150,7 @@ mod tests {
             ),
         ];
         let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=5).map(|r| (r, vec![8])).collect();
-        let seg = build_segment(&terms, 5, &[40], &doc_sizes, 1000, 0);
+        let seg = build_segment(&terms, 5, &[40], &doc_sizes, 1000, 0, Fts5Detail::Full);
         assert_eq!(
             lookup_phrase_rowids_k(&seg.data, &[b"a", b"b", b"c"]),
             Some(vec![1, 4])
@@ -3928,7 +4176,7 @@ mod tests {
             vec![p(1, &[&[0, 1, 2]]), p(2, &[&[0, 1]]), p(3, &[&[0, 2, 4]])],
         )];
         let doc_sizes = [(1, vec![3]), (2, vec![2]), (3, vec![5])];
-        let seg = build_segment(&terms, 3, &[10], &doc_sizes, 1000, 0);
+        let seg = build_segment(&terms, 3, &[10], &doc_sizes, 1000, 0, Fts5Detail::Full);
         // "a a" (K=2): doc1 (0,1) and doc2 (0,1). doc3 has no adjacent pair.
         assert_eq!(
             lookup_phrase_rowids_k(&seg.data, &[b"a", b"a"]),
@@ -3963,7 +4211,7 @@ mod tests {
             ),
         ];
         let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=3).map(|r| (r, vec![8, 8])).collect();
-        let seg = build_segment(&terms, 3, &[40, 40], &doc_sizes, 1000, 0);
+        let seg = build_segment(&terms, 3, &[40, 40], &doc_sizes, 1000, 0, Fts5Detail::Full);
         // Table-wide: any column with the consecutive run → docs 1 and 3 (NOT 2).
         assert_eq!(
             lookup_phrase_rowids_k(&seg.data, &[b"a", b"b", b"c"]),
@@ -4012,7 +4260,7 @@ mod tests {
             ),
         ];
         let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=6).map(|r| (r, vec![8])).collect();
-        let seg = build_segment(&terms, 6, &[40], &doc_sizes, 1000, 0);
+        let seg = build_segment(&terms, 6, &[40], &doc_sizes, 1000, 0, Fts5Detail::Full);
         // n=0 → |gap| <= 1: gap-1 docs only (1, 6).
         assert_eq!(
             lookup_near_rowids(&seg.data, b"a", b"b", 0),
@@ -4074,7 +4322,7 @@ mod tests {
             ),
         ];
         let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=4).map(|r| (r, vec![8, 12])).collect();
-        let seg = build_segment(&terms, 4, &[40, 60], &doc_sizes, 1000, 0);
+        let seg = build_segment(&terms, 4, &[40, 60], &doc_sizes, 1000, 0, Fts5Detail::Full);
         // n=1 → |gap| <= 2 within one column: docs 1 and 3 (doc2/doc4 are split).
         assert_eq!(
             lookup_near_rowids(&seg.data, b"a", b"b", 1),
@@ -4099,7 +4347,15 @@ mod tests {
             .collect();
         let terms = vec![(b"a".to_vec(), a_post), (b"b".to_vec(), b_post)];
         let doc_sizes: Vec<(i64, Vec<u64>)> = (1..=n).map(|r| (r, vec![8])).collect();
-        let seg = build_segment(&terms, n as u64, &[8 * n as u64], &doc_sizes, 64, 0);
+        let seg = build_segment(
+            &terms,
+            n as u64,
+            &[8 * n as u64],
+            &doc_sizes,
+            64,
+            0,
+            Fts5Detail::Full,
+        );
         assert!(leaf_count(&seg) > 1, "pgsz 64 must span the doclists");
         // n=0 → |gap| <= 1: even rowids (gap 1) only.
         let even: Vec<i64> = (1..=n).filter(|r| r % 2 == 0).collect();
@@ -4113,7 +4369,7 @@ mod tests {
 
     #[test]
     fn lookup_near_empty_index_falls_back() {
-        let seg = build_segment(&[], 0, &[0], &[], 1000, 0);
+        let seg = build_segment(&[], 0, &[0], &[], 1000, 0, Fts5Detail::Full);
         assert_eq!(lookup_near_rowids(&seg.data, b"a", b"b", 10), None);
     }
 
@@ -4141,7 +4397,7 @@ mod tests {
         for (segid, terms) in specs {
             // Build this segment's leaves (build_segment uses segid 1 internally).
             let n_docs = terms.iter().flat_map(|(_, ps)| ps.iter()).count() as u64;
-            let seg = build_segment(terms, n_docs.max(1), &[64], &[], 4096, 0);
+            let seg = build_segment(terms, n_docs.max(1), &[64], &[], 4096, 0, Fts5Detail::Full);
             // Extract its leaves in page order.
             let mut pgno = 1i64;
             let mut n_leaves = 0i64;
@@ -4581,6 +4837,7 @@ mod tests {
             &[],
             4096,
             0,
+            Fts5Detail::Full,
         );
         let leaf1 = seg1
             .data
@@ -4617,7 +4874,7 @@ mod tests {
 
     /// The leaf blobs of a segment built by `build_segment_block`.
     fn seg_leaves_of(terms: &[(Vec<u8>, Vec<Posting>)], segid: i64) -> Vec<Vec<u8>> {
-        let block = build_segment_block(terms, &[], 4050, segid, &[]);
+        let block = build_segment_block(terms, &[], 4050, segid, &[], Fts5Detail::Full);
         block
             .data
             .into_iter()
@@ -4637,7 +4894,7 @@ mod tests {
         ];
         let leaves = seg_leaves_of(&terms, 7);
         let refs: Vec<&[u8]> = leaves.iter().map(|l| l.as_slice()).collect();
-        let got = read_segment_postings(&refs).expect("servable");
+        let got = read_segment_postings(&refs, Fts5Detail::Full).expect("servable");
         assert_eq!(got, terms);
     }
 
@@ -4655,13 +4912,14 @@ mod tests {
             new_l.iter().map(|l| l.as_slice()).collect(),
         ];
         // Not oldest: tombstone survives, newest wins per rowid.
-        let merged = merge_segments_keepdel(&segs, false).expect("servable");
+        let merged = merge_segments_keepdel(&segs, false, Fts5Detail::Full).expect("servable");
         assert_eq!(
             merged,
             vec![(b"x".to_vec(), vec![tomb(1), p(2, &[&[0]]), p(3, &[&[0]])])]
         );
         // Oldest output: the tombstone (and the doc it shadows) is annihilated.
-        let merged_oldest = merge_segments_keepdel(&segs, true).expect("servable");
+        let merged_oldest =
+            merge_segments_keepdel(&segs, true, Fts5Detail::Full).expect("servable");
         assert_eq!(
             merged_oldest,
             vec![(b"x".to_vec(), vec![p(2, &[&[0]]), p(3, &[&[0]])])]
