@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/KarpelesLab/graphitesql/compare/v0.1.1...v0.1.2) - 2026-07-15
+
+### Added
+
+- *(fts5)* byte-identical prefix-index spanning segments from incremental merge
+
+### Fixed
+
+- *(exec)* foreign-key actions involving WITHOUT ROWID tables (were rowid-only)
+- *(cli)* skip SQL comments when splitting statements so a comment can't swallow a transaction
+- *(fts5)* prefix double-cascade crisis merge no longer writes a malformed file
+- *(cli)* run a trailing dot-command argument instead of parsing it as SQL
+- *(exec)* compact child tables after a cascading delete so it can't leave empty leaves
+- *(cli)* don't cut a multi-line CREATE TRIGGER at the first ; in its body
+- *(exec)* compact table b-tree after INSERT OR REPLACE so it can't leave empty leaves
+
 ## [0.1.1](https://github.com/KarpelesLab/graphitesql/compare/v0.1.0...v0.1.1) - 2026-07-15
 
 ### Added
