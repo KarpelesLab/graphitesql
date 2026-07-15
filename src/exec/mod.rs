@@ -301,6 +301,26 @@ pub struct Connection {
     /// `highlight()` special forms. `None` outside such a query.
     #[cfg(feature = "fts5")]
     fts5_rank: core::cell::RefCell<Option<Fts5QueryCtx>>,
+    /// Names of self-content `fts5` tables written (INSERT/UPDATE/DELETE) inside
+    /// the current explicit transaction (or open savepoint) whose segment index
+    /// has been left untouched and must be flushed at COMMIT / outermost RELEASE.
+    /// Mirrors SQLite, which accumulates a transaction's postings in an in-memory
+    /// hash and writes them as ONE level-0 segment at `xSync`/`xCommit` — so an
+    /// N-INSERT transaction appends one segment, not N. Cleared at commit (after
+    /// the flush) and on ROLLBACK (nothing was written to the index to undo). The
+    /// document rows themselves live in `<name>_content` (pager-managed, so a
+    /// ROLLBACK/ROLLBACK TO reverts them), and in-transaction `MATCH` reads them
+    /// directly (the stale index is bypassed while `in_tx`/`open_savepoints`).
+    /// Maps each dirtied table to whether it needs a full rebuild at flush time
+    /// (`true`) rather than an incremental append (`false`). A pure-insert
+    /// transaction appends one level-0 segment (byte-identical to sqlite); a
+    /// transaction that deleted or updated a previously-committed document sets
+    /// the flag, because the incremental appender compares rowid *sets* and cannot
+    /// see a same-rowid content change — so those flush as a single consolidated
+    /// rebuild from the live `<name>_content` instead (correct + integrity-clean,
+    /// though not byte-identical to sqlite's incremental tombstone segments).
+    #[cfg(feature = "fts5")]
+    fts5_txn_dirty: alloc::collections::BTreeMap<String, bool>,
     /// Whether `SELECT` execution tries the VDBE engine first, falling back
     /// transparently to the tree-walker for any query shape it does not support.
     /// **On by default** (Track B, B7b): the VDBE is the primary engine, parity-
@@ -542,6 +562,8 @@ impl Connection {
             aggregates: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "fts5")]
             fts5_rank: core::cell::RefCell::new(None),
+            #[cfg(feature = "fts5")]
+            fts5_txn_dirty: alloc::collections::BTreeMap::new(),
             use_vdbe: core::cell::Cell::new(true),
             session: core::cell::RefCell::new(None),
             update_hook: core::cell::RefCell::new(None),
@@ -599,6 +621,8 @@ impl Connection {
             aggregates: alloc::collections::BTreeMap::new(),
             #[cfg(feature = "fts5")]
             fts5_rank: core::cell::RefCell::new(None),
+            #[cfg(feature = "fts5")]
+            fts5_txn_dirty: alloc::collections::BTreeMap::new(),
             use_vdbe: core::cell::Cell::new(true),
             session: core::cell::RefCell::new(None),
             update_hook: core::cell::RefCell::new(None),
@@ -5610,6 +5634,11 @@ impl Connection {
                 // transaction stays open (SQLite leaves it active so the caller
                 // can repair the data and COMMIT again) — nothing is committed.
                 self.check_deferred_fks()?;
+                // Flush the transaction's accumulated fts5 postings as ONE segment
+                // per table (SQLite's commit-time `xSync`/`xCommit`), part of this
+                // same durable transaction. A no-op when no fts5 table was written.
+                #[cfg(feature = "fts5")]
+                self.fts5_flush_txn(true)?;
                 // The commit hook fires just before committing a *write*
                 // transaction; a non-zero return converts the COMMIT to a
                 // ROLLBACK (SQLite's `sqlite3_commit_hook` semantics).
@@ -5631,6 +5660,14 @@ impl Connection {
                 return Ok(0);
             }
             Statement::Savepoint(name) => {
+                // SQLite's fts5 `xSavepoint` flushes the pending in-memory postings
+                // to disk *before* the savepoint opens, so each pre-savepoint batch
+                // becomes its own level-0 segment and a later `ROLLBACK TO` (which
+                // reverts only writes made after this point) leaves it intact. Do
+                // the same for insert-only tables; the appended segment is written
+                // before the savepoint marker, so it survives a rollback to it.
+                #[cfg(feature = "fts5")]
+                self.fts5_flush_txn(false)?;
                 self.backend.writer()?.savepoint(name);
                 self.savepoint_attached(name)?;
                 self.open_savepoints += 1;
@@ -5645,6 +5682,10 @@ impl Connection {
                 // commit hook (a veto converts the finalizing commit to a rollback).
                 if self.open_savepoints == 0 && !self.in_tx {
                     self.check_deferred_fks()?;
+                    // Releasing the outermost savepoint finalizes the implicit
+                    // transaction — flush the accumulated fts5 postings first.
+                    #[cfg(feature = "fts5")]
+                    self.fts5_flush_txn(true)?;
                     if self.backend.writer()?.resident_dirty_pages() > 0 && self.fire_commit_hook()
                     {
                         self.backend.writer()?.rollback();
@@ -5679,6 +5720,10 @@ impl Connection {
                 self.rollback_attached()?;
                 self.in_tx = false;
                 self.open_savepoints = 0;
+                // Nothing was written to the fts5 index during the transaction, so
+                // there is nothing to undo — just drop the pending flush set.
+                #[cfg(feature = "fts5")]
+                self.fts5_discard_txn();
                 self.schema = Schema::read(self.backend.source())?;
                 // The rollback hook fires whenever a transaction is rolled back.
                 self.fire_rollback_hook();
@@ -12697,6 +12742,19 @@ impl Connection {
                 }
             }
         }
+        // Inside a transaction a delete of a previously-committed document needs
+        // tombstone semantics the incremental appender can't provide, so force the
+        // table's transaction flush to be a full rebuild (see `fts5_txn_dirty`).
+        #[cfg(feature = "fts5")]
+        if module_name.eq_ignore_ascii_case("fts5")
+            && !victims.is_empty()
+            && (self.in_tx || self.open_savepoints > 0)
+        {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if !crate::vtab::fts5_no_local_content(&arg_refs) {
+                self.fts5_txn_dirty.insert(del.table.clone(), true);
+            }
+        }
         self.fts5_maybe_rebuild(&module_name, &del.table)?;
         Ok(deleted)
     }
@@ -12858,6 +12916,19 @@ impl Connection {
                 if self.fts5_incremental_delete(&upd.table, &inc)? {
                     return Ok(updated);
                 }
+            }
+        }
+        // Inside a transaction an update changes a document's content while keeping
+        // its rowid, which the rowid-set incremental appender cannot detect — force
+        // the table's transaction flush to be a full rebuild (see `fts5_txn_dirty`).
+        #[cfg(feature = "fts5")]
+        if module_name.eq_ignore_ascii_case("fts5")
+            && !changes.is_empty()
+            && (self.in_tx || self.open_savepoints > 0)
+        {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if !crate::vtab::fts5_no_local_content(&arg_refs) {
+                self.fts5_txn_dirty.insert(upd.table.clone(), true);
             }
         }
         self.fts5_maybe_rebuild(&module_name, &upd.table)?;
@@ -13317,7 +13388,19 @@ impl Connection {
                 // document. Falls back to the full scan for any shape the index
                 // can't serve identically. run_core re-applies the full WHERE, so
                 // the rows (rowid-ascending, like the scan) stay a valid superset.
-                if let Some(rows) = self.fts5_try_index_match(name, alias, &arg_refs, pushdown)? {
+                //
+                // Skip the index route for a table written earlier in the current
+                // transaction: its segment index is intentionally left stale until
+                // the commit-time flush (`fts5_flush_txn`), so the doclist would
+                // miss this transaction's uncommitted inserts and still list its
+                // deletes. The full `_content` scan below reflects the live
+                // (pager-managed) documents, giving correct in-transaction `MATCH`
+                // visibility. Contentless/external tables have no `_content` and
+                // keep their index maintained per statement, so they are exempt.
+                if !self.fts5_txn_dirty.contains_key(name)
+                    && let Some(rows) =
+                        self.fts5_try_index_match(name, alias, &arg_refs, pushdown)?
+                {
                     return Ok(Some((columns, rows)));
                 }
                 // Contentless (`content=''`): no stored text, so a full scan yields
@@ -33399,16 +33482,107 @@ impl Connection {
             // In AUTOCOMMIT, a single INSERT statement is its own transaction, so
             // sqlite appends exactly one new level-0 segment for its new rows —
             // reproduce that incrementally (byte-identical multi-segment layout).
-            // Inside an explicit BEGIN/SAVEPOINT the whole transaction flushes as
-            // ONE segment at commit; graphite would append per statement, so fall
-            // back to the single-segment bulk rebuild there (unchanged behavior).
-            if !self.in_tx && self.open_savepoints == 0 && self.fts5_incremental_write(table)? {
-                return Ok(());
+            if !self.in_tx && self.open_savepoints == 0 {
+                if self.fts5_incremental_write(table)? {
+                    return Ok(());
+                }
+                return self.fts5_rebuild_index(table);
             }
-            return self.fts5_rebuild_index(table);
+            // Inside an explicit BEGIN/SAVEPOINT the whole transaction's postings
+            // flush as ONE level-0 segment at commit (SQLite accumulates them in an
+            // in-memory hash and writes them at `xSync`/`xCommit`). So DON'T touch
+            // the segment index (`_data`/`_idx`/`_docsize`) per statement — the new
+            // document rows are already in `<name>_content` (via the vtab update),
+            // which is enough for in-transaction `MATCH` (served by the content scan
+            // while a txn is open) and for the single flush at commit. Just record
+            // that this table needs flushing when the transaction finalizes. An
+            // INSERT keeps any existing rebuild flag (a prior delete/update in the
+            // same transaction is what forces the rebuild) but never sets it.
+            self.fts5_txn_dirty
+                .entry(String::from(table))
+                .or_insert(false);
+            return Ok(());
         }
         let _ = (module_name, table);
         Ok(())
+    }
+
+    /// Flush the self-content `fts5` tables dirtied inside the current transaction
+    /// to their segment index, matching SQLite's flush of the accumulated
+    /// in-memory postings. Called at two kinds of boundary:
+    ///
+    /// * `is_final = true` — COMMIT / outermost-RELEASE (SQLite's `xSync`). Every
+    ///   dirty table is flushed and the pending set cleared. Insert-only tables
+    ///   append one level-0 segment (byte-identical to sqlite); tables flagged for
+    ///   rebuild (a delete/update touched them) are rebuilt once from live
+    ///   `<name>_content` — a single consolidated rebuild rather than one per
+    ///   statement (correct + integrity-clean, though not byte-identical to
+    ///   sqlite's incremental tombstone segments).
+    /// * `is_final = false` — just before a nested `SAVEPOINT` opens (SQLite's
+    ///   `xSavepoint`, which flushes the hash so a later `ROLLBACK TO` can discard
+    ///   cleanly). Only insert-only tables are flushed incrementally here (so each
+    ///   pre-savepoint batch becomes its own segment, matching sqlite); the pending
+    ///   set is kept — rebuild-flagged tables and any spanning append are deferred
+    ///   to the final flush. The appended segment lands outside the new savepoint,
+    ///   so `ROLLBACK TO` leaves it intact exactly as sqlite does.
+    ///
+    /// A no-op when nothing is dirty (the common non-fts5 commit) or the feature is
+    /// off. Runs *before* the pager commit so the segment is part of the same
+    /// durable transaction.
+    #[cfg(feature = "fts5")]
+    fn fts5_flush_txn(&mut self, is_final: bool) -> Result<()> {
+        if self.fts5_txn_dirty.is_empty() {
+            return Ok(());
+        }
+        let tables: Vec<(String, bool)> = self
+            .fts5_txn_dirty
+            .iter()
+            .map(|(t, r)| (t.clone(), *r))
+            .collect();
+        for (table, needs_rebuild) in tables {
+            // The table may have been dropped within the transaction; skip if it
+            // is no longer a self-content fts5 vtab.
+            let Ok((module, args, _)) = self.vtab_meta(&table) else {
+                continue;
+            };
+            if !module.eq_ignore_ascii_case("fts5") {
+                continue;
+            }
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            if crate::vtab::fts5_no_local_content(&arg_refs) {
+                continue;
+            }
+            if needs_rebuild {
+                // A delete/update needs tombstone semantics the incremental append
+                // can't provide; rebuild once at the final flush. Deferred at a
+                // savepoint boundary (the stale index is bypassed by the in-txn
+                // `MATCH` content scan until then).
+                if is_final {
+                    self.fts5_rebuild_index(&table)?;
+                }
+                continue;
+            }
+            // Insert-only: append this batch as one level-0 segment. If the
+            // appender declines (e.g. a spanning doclist), rebuild — but only at
+            // the final flush; a savepoint boundary leaves it pending.
+            if !self.fts5_incremental_write(&table)? && is_final {
+                self.fts5_rebuild_index(&table)?;
+            }
+        }
+        if is_final {
+            self.fts5_txn_dirty.clear();
+        }
+        Ok(())
+    }
+
+    /// Discard the pending in-transaction fts5 flush set on ROLLBACK / ROLLBACK TO
+    /// the outermost savepoint: nothing was written to the segment index during
+    /// the transaction, so there is nothing to undo, and the reverted
+    /// `<name>_content` (pager-managed) already reflects the rollback. A no-op
+    /// when the feature is off.
+    #[cfg(feature = "fts5")]
+    fn fts5_discard_txn(&mut self) {
+        self.fts5_txn_dirty.clear();
     }
 
     /// Handle an fts5 special-command INSERT whose first column is the hidden
