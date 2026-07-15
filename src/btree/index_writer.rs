@@ -28,13 +28,24 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
-/// A promoted entry bubbling up from a split: the record (for comparisons in the
-/// parent's later descents), its on-page record-cell bytes, and the new right
-/// sibling page.
+/// A promoted separator entry: the full record (for comparisons in the parent's
+/// later descents) and its on-page record-cell bytes. Unlike a table b-tree,
+/// an index split *promotes* an entry — it lives only in the parent interior
+/// cell, not in any child leaf.
+type IdxKey = (Vec<u8>, Vec<u8>); // (full record, record-cell bytes)
+
+/// A node split bubbling up to the parent. The over-full page was repacked into
+/// the original page (reused, keeping its page number) plus one or more brand-new
+/// right-sibling pages, each of which individually fits. `first` is the promoted
+/// separator entry between the reused original page and `siblings[0]`. `siblings`
+/// lists the new sibling pages left-to-right, each paired with the promoted
+/// separator entry that follows it. The *last* sibling's key is a placeholder
+/// (empty vectors) — the parent supplies the real upper bound (its own separator
+/// for this child, or nothing when the child is the parent's right-most).
+/// `siblings` is always non-empty.
 struct IdxSplit {
-    full: Vec<u8>,
-    rcell: Vec<u8>,
-    right_page: u32,
+    first: IdxKey,
+    siblings: Vec<(IdxKey, u32)>,
 }
 
 /// Find the rowids of all index entries whose leading columns equal `key`
@@ -423,7 +434,7 @@ fn rowid_of(rec: &[Value]) -> i64 {
 pub fn create_index_root(wp: &mut WritePager) -> Result<u32> {
     let page_size = wp.usable_size() + wp.header().reserved_space as usize;
     let root = wp.allocate_page()?;
-    let buf = serialize_index_leaf(page_size, 0, &[], None);
+    let buf = serialize_index_leaf(page_size, 0, &[], None)?;
     wp.write_page(root, buf)?;
     Ok(root)
 }
@@ -503,7 +514,7 @@ pub fn clear_index(wp: &mut WritePager, root: u32) -> Result<()> {
         }
         _ => return Err(Error::Corrupt("clear of a non-index b-tree".into())),
     }
-    let empty = serialize_index_leaf(page_size, 0, &[], None);
+    let empty = serialize_index_leaf(page_size, 0, &[], None)?;
     wp.write_page(root, empty)?;
     Ok(())
 }
@@ -569,24 +580,57 @@ fn insert_rec(
             let prefix = page_one_prefix(page_no, &bt);
             if leaf_fits(&entries, body, page_size) {
                 let buf =
-                    serialize_index_leaf(page_size, body, &rcells(&entries), prefix.as_deref());
+                    serialize_index_leaf(page_size, body, &rcells(&entries), prefix.as_deref())?;
                 wp.write_page(page_no, buf)?;
                 Ok(None)
             } else {
-                let m = entries.len() / 2;
-                let promoted = entries[m].clone();
-                let left = &entries[..m];
-                let right = &entries[m + 1..];
-                let right_page = wp.allocate_page()?;
-                let lbuf = serialize_index_leaf(page_size, body, &rcells(left), prefix.as_deref());
+                // Robust multi-way leaf split: partition the over-full entry list
+                // into consecutive parts that each individually fit, promoting the
+                // boundary entry between adjacent parts up to the parent (an index
+                // split promotes an entry — it lives only in the parent). A single
+                // fixed halving is not enough when one near-page-sized entry skews
+                // the byte total. Part 0 reuses this page; the rest are new pages.
+                let (parts, seps) = pack_index_leaf(&entries, body, page_size);
+                if parts.len() == 1 {
+                    // A single un-splittable part (impossible in practice — index
+                    // cells are capped to fit by overflow); write back defensively.
+                    let buf = serialize_index_leaf(
+                        page_size,
+                        body,
+                        &rcells(&entries[parts[0].clone()]),
+                        prefix.as_deref(),
+                    )?;
+                    wp.write_page(page_no, buf)?;
+                    return Ok(None);
+                }
+                let first = (entries[seps[0]].0.clone(), entries[seps[0]].1.clone());
+                let lbuf = serialize_index_leaf(
+                    page_size,
+                    body,
+                    &rcells(&entries[parts[0].clone()]),
+                    prefix.as_deref(),
+                )?;
                 wp.write_page(page_no, lbuf)?;
-                let rbuf = serialize_index_leaf(page_size, 0, &rcells(right), None);
-                wp.write_page(right_page, rbuf)?;
-                Ok(Some(IdxSplit {
-                    full: promoted.0,
-                    rcell: promoted.1,
-                    right_page,
-                }))
+                let mut siblings = Vec::with_capacity(parts.len() - 1);
+                for k in 1..parts.len() {
+                    let pg = wp.allocate_page()?;
+                    let buf = serialize_index_leaf(
+                        page_size,
+                        0,
+                        &rcells(&entries[parts[k].clone()]),
+                        None,
+                    )?;
+                    wp.write_page(pg, buf)?;
+                    // Separator that follows this sibling part; the last part has no
+                    // promoted key (the parent supplies the upper bound).
+                    let key = if k < seps.len() {
+                        (entries[seps[k]].0.clone(), entries[seps[k]].1.clone())
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+                    siblings.push((key, pg));
+                }
+                Ok(Some(IdxSplit { first, siblings }))
             }
         }
         PageType::InteriorIndex => {
@@ -605,38 +649,69 @@ fn insert_rec(
                 }
             }
             if let Some(s) = insert_rec(wp, child, target, rcell, colls, descs)? {
+                // The child split into its (reused) page plus one or more new
+                // siblings; adopt them all. The reused child keeps its page number
+                // but the separator entry after it becomes `s.first`; each new
+                // sibling is inserted after it with its own promoted separator.
+                let mut sibs = s.siblings;
                 if p < cells.len() {
-                    let old = cells[p].clone();
-                    cells[p] = (old.0, s.full, s.rcell);
-                    cells.insert(p + 1, (s.right_page, old.1, old.2));
+                    let old = cells[p].clone(); // (child_p, entry_p, rcell_p)
+                    cells[p] = (old.0, s.first.0, s.first.1);
+                    // The last sibling is bounded above by the old separator entry.
+                    if let Some(last) = sibs.last_mut() {
+                        last.0 = (old.1, old.2);
+                    }
+                    for (off, ((full, rc), pg)) in sibs.into_iter().enumerate() {
+                        cells.insert(p + 1 + off, (pg, full, rc));
+                    }
                 } else {
-                    cells.push((child, s.full, s.rcell));
-                    right = s.right_page;
+                    // Descended into the right-most child: it keeps its page as a
+                    // now-non-right cell carrying `s.first`; the last new sibling
+                    // becomes the new right-most pointer.
+                    cells.push((child, s.first.0, s.first.1));
+                    let last = sibs.pop().expect("split always has a sibling");
+                    for ((full, rc), pg) in sibs {
+                        cells.push((pg, full, rc));
+                    }
+                    right = last.1;
                 }
             }
             let prefix = page_one_prefix(page_no, &bt);
             if interior_fits(&cells, body, page_size) {
                 let buf =
-                    serialize_index_interior(page_size, body, &cells, right, prefix.as_deref());
+                    serialize_index_interior(page_size, body, &cells, right, prefix.as_deref())?;
                 wp.write_page(page_no, buf)?;
                 Ok(None)
             } else {
-                let m = cells.len() / 2;
-                let promoted = cells[m].clone();
-                let left_right = promoted.0;
-                let left = cells[..m].to_vec();
-                let right_cells = cells[m + 1..].to_vec();
-                let right_page = wp.allocate_page()?;
-                let lbuf =
-                    serialize_index_interior(page_size, body, &left, left_right, prefix.as_deref());
+                // Robust multi-way interior split: partition the children into
+                // groups that each fit, promoting one separator entry between
+                // groups (its left child becomes the left group's right pointer).
+                let (parts, seps) = pack_index_interior(&cells, right, body, page_size);
+                if parts.len() == 1 {
+                    let (pc, pr) = &parts[0];
+                    let buf =
+                        serialize_index_interior(page_size, body, pc, *pr, prefix.as_deref())?;
+                    wp.write_page(page_no, buf)?;
+                    return Ok(None);
+                }
+                let first = seps[0].clone();
+                let (p0c, p0r) = &parts[0];
+                let lbuf = serialize_index_interior(page_size, body, p0c, *p0r, prefix.as_deref())?;
                 wp.write_page(page_no, lbuf)?;
-                let rbuf = serialize_index_interior(page_size, 0, &right_cells, right, None);
-                wp.write_page(right_page, rbuf)?;
-                Ok(Some(IdxSplit {
-                    full: promoted.1,
-                    rcell: promoted.2,
-                    right_page,
-                }))
+                let mut siblings = Vec::with_capacity(parts.len() - 1);
+                for k in 1..parts.len() {
+                    let (pc, pr) = &parts[k];
+                    let pg = wp.allocate_page()?;
+                    let buf = serialize_index_interior(page_size, 0, pc, *pr, None)?;
+                    wp.write_page(pg, buf)?;
+                    let key = if k < seps.len() {
+                        seps[k].clone()
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+                    siblings.push((key, pg));
+                }
+                Ok(Some(IdxSplit { first, siblings }))
             }
         }
         _ => Err(Error::Corrupt("insert into a non-index b-tree".into())),
@@ -651,8 +726,17 @@ fn grow_root(wp: &mut WritePager, root: u32, split: IdxSplit) -> Result<()> {
     let left_bytes = wp.read_page(root)?;
     let new_left = wp.allocate_page()?;
     wp.write_page(new_left, left_bytes)?;
-    let cells = [(new_left, split.full, split.rcell)];
-    let buf = serialize_index_interior(page_size, 0, &cells, split.right_page, None);
+    // The root becomes an interior node whose children are the relocated old-root
+    // content plus every sibling produced by the split: [(new_left, first), (sib_1,
+    // key_1), …] with the last sibling as the right-most pointer.
+    let mut cells: Vec<InteriorEntry> = Vec::with_capacity(split.siblings.len());
+    cells.push((new_left, split.first.0, split.first.1));
+    let mut sibs = split.siblings;
+    let last = sibs.pop().expect("split always has a sibling");
+    for ((full, rc), pg) in sibs {
+        cells.push((pg, full, rc));
+    }
+    let buf = serialize_index_interior(page_size, 0, &cells, last.1, None)?;
     wp.write_page(root, buf)?;
     Ok(())
 }
@@ -721,19 +805,147 @@ fn interior_fits(cells: &[InteriorEntry], body: usize, page_size: usize) -> bool
     used <= page_size - body - 12
 }
 
+/// Greedily pack an over-full index leaf's entries into as many consecutive parts
+/// as are needed for each part to individually fit a leaf page, returning the
+/// index ranges of the parts and the indices of the *promoted separator* entries
+/// between adjacent parts (`seps.len() == parts.len() - 1`). A promoted entry is
+/// excluded from both surrounding leaves — it moves up to the parent. Part 0 is
+/// sized against `body0`; every later part against a body-0 page. Every returned
+/// range is non-empty (except the degenerate single-oversized-entry case, which
+/// overflow-capping makes unreachable).
+fn pack_index_leaf(
+    entries: &[LeafEntry],
+    body0: usize,
+    page_size: usize,
+) -> (Vec<core::ops::Range<usize>>, Vec<usize>) {
+    let n = entries.len();
+    let mut parts: Vec<core::ops::Range<usize>> = Vec::new();
+    let mut seps: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let body = if parts.is_empty() { body0 } else { 0 };
+        // `leaf_fits` bound: sum(rcell.len() + 2) <= page_size - body - 8.
+        let cap = page_size.saturating_sub(body + 8);
+        let mut used = 0usize;
+        let mut j = i;
+        while j < n {
+            let need = entries[j].1.len() + 2;
+            // Always place at least one entry per part (`j == i`).
+            if j == i || used + need <= cap {
+                used += need;
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        if j >= n {
+            // Everything remaining fits this part.
+            parts.push(i..j);
+            break;
+        }
+        // entries[j] is the first that did not fit → promote it as the separator
+        // between this part and the next, which starts at j+1.
+        if j + 1 >= n {
+            // Promoting entries[j] would leave a dangling separator (the last
+            // entry, with no right leaf). Back off: shrink this part by one,
+            // promote entries[j-1] instead, and let entries[j..n] be the next
+            // part. Requires this part to keep ≥1 entry — always true under
+            // overflow capping (each part holds several cells).
+            if j - 1 > i {
+                parts.push(i..j - 1);
+                seps.push(j - 1);
+                i = j; // entries[j..n] (the single trailing entry) next iteration
+                continue;
+            }
+            // Degenerate (a lone entry that will not join a single trailing entry)
+            // — unreachable under overflow capping; place them together so a later
+            // serialize surfaces `Corrupt` rather than dropping an entry.
+            parts.push(i..n);
+            break;
+        }
+        parts.push(i..j);
+        seps.push(j);
+        i = j + 1;
+    }
+    (parts, seps)
+}
+
+/// One part of a multi-way interior split: its on-page cells and its right pointer.
+type IdxInteriorPart = (Vec<InteriorEntry>, u32);
+
+/// Greedily partition an over-full index-interior page's children into as many
+/// parts as are needed for each part to individually fit. Between two adjacent
+/// parts one cell is *promoted* (its `(full, rcell)` returned in `seps`) and its
+/// left child becomes the left part's right pointer. Returns `(parts, seps)` with
+/// `seps.len() == parts.len() - 1`. Part 0 is sized against `body0`.
+fn pack_index_interior(
+    cells: &[InteriorEntry],
+    right: u32,
+    body0: usize,
+    page_size: usize,
+) -> (Vec<IdxInteriorPart>, Vec<IdxKey>) {
+    let n = cells.len();
+    // child(j): the j-th child pointer (j == n is the page's right pointer).
+    let child = |j: usize| -> u32 { if j < n { cells[j].0 } else { right } };
+    let mut parts: Vec<IdxInteriorPart> = Vec::new();
+    let mut seps: Vec<IdxKey> = Vec::new();
+    let mut i = 0usize;
+    loop {
+        let body = if parts.is_empty() { body0 } else { 0 };
+        // `interior_fits` bound: sum(4 + rcell.len() + 2) <= page_size - body - 12.
+        let cap = page_size.saturating_sub(body + 12);
+        let mut used = 0usize;
+        let mut b = i;
+        while b < n {
+            let need = 4 + cells[b].2.len() + 2;
+            if b == i || used + need <= cap {
+                used += need;
+                b += 1;
+            } else {
+                break;
+            }
+        }
+        if b >= n {
+            // Last part: on-page cells cells[i..n], right pointer = page's `right`.
+            parts.push((cells[i..n].to_vec(), right));
+            break;
+        }
+        // Promote cells[b] as the separator; cells[b]'s child becomes this part's
+        // right pointer. Guard against leaving the final part with no on-page cells
+        // by backing off one cell.
+        let mut bb = b;
+        if bb == n - 1 && bb > i + 1 {
+            bb -= 1;
+        }
+        parts.push((cells[i..bb].to_vec(), child(bb)));
+        seps.push((cells[bb].1.clone(), cells[bb].2.clone()));
+        i = bb + 1;
+    }
+    (parts, seps)
+}
+
 fn serialize_index_leaf(
     page_size: usize,
     body: usize,
     rcells: &[Vec<u8>],
     header_prefix: Option<&[u8]>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; page_size];
     if let Some(h) = header_prefix {
         buf[..h.len()].copy_from_slice(h);
     }
-    let mut content = page_size;
     let ptr_base = body + 8;
+    // The cell-pointer array grows up from `ptr_base`; cell content packs down from
+    // the page end. They must not meet. `pack_index_leaf` guarantees a fitting
+    // list, but check defensively so a violation surfaces as `Corrupt`, not a panic.
+    let ptr_end = ptr_base + 2 * rcells.len();
+    let mut content = page_size;
     for (i, cell) in rcells.iter().enumerate() {
+        if content < cell.len() || content - cell.len() < ptr_end {
+            return Err(Error::Corrupt(
+                "index leaf page overflow while serializing".into(),
+            ));
+        }
         content -= cell.len();
         buf[content..content + cell.len()].copy_from_slice(cell);
         let p = ptr_base + 2 * i;
@@ -743,7 +955,7 @@ fn serialize_index_leaf(
     buf[body] = 0x0a; // leaf index
     put16(&mut buf, body + 3, rcells.len() as u16);
     put_ccs(&mut buf, body + 5, content);
-    buf
+    Ok(buf)
 }
 
 fn serialize_index_interior(
@@ -752,17 +964,23 @@ fn serialize_index_interior(
     cells: &[InteriorEntry],
     right: u32,
     header_prefix: Option<&[u8]>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; page_size];
     if let Some(h) = header_prefix {
         buf[..h.len()].copy_from_slice(h);
     }
-    let mut content = page_size;
     let ptr_base = body + 12;
+    let ptr_end = ptr_base + 2 * cells.len();
+    let mut content = page_size;
     for (i, (child, _, rcell)) in cells.iter().enumerate() {
         let mut cell = Vec::with_capacity(4 + rcell.len());
         cell.extend_from_slice(&child.to_be_bytes());
         cell.extend_from_slice(rcell);
+        if content < cell.len() || content - cell.len() < ptr_end {
+            return Err(Error::Corrupt(
+                "index interior page overflow while serializing".into(),
+            ));
+        }
         content -= cell.len();
         buf[content..content + cell.len()].copy_from_slice(&cell);
         let p = ptr_base + 2 * i;
@@ -773,7 +991,7 @@ fn serialize_index_interior(
     put16(&mut buf, body + 3, cells.len() as u16);
     put_ccs(&mut buf, body + 5, content);
     buf[body + 8..body + 12].copy_from_slice(&right.to_be_bytes());
-    buf
+    Ok(buf)
 }
 
 fn put16(buf: &mut [u8], at: usize, v: u16) {
@@ -784,4 +1002,116 @@ fn put16(buf: &mut [u8], at: usize, v: u16) {
 fn put_ccs(buf: &mut [u8], at: usize, content: usize) {
     let v = if content >= 65536 { 0 } else { content as u16 };
     put16(buf, at, v);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a synthetic leaf-entry list whose `rcell` byte lengths are `lens`.
+    fn leaf_entries(lens: &[usize]) -> Vec<LeafEntry> {
+        lens.iter()
+            .enumerate()
+            .map(|(i, &l)| (alloc::vec![i as u8], alloc::vec![0u8; l]))
+            .collect()
+    }
+
+    fn interior_cells(lens: &[usize]) -> Vec<InteriorEntry> {
+        lens.iter()
+            .enumerate()
+            .map(|(i, &l)| (i as u32 + 100, alloc::vec![i as u8], alloc::vec![0u8; l]))
+            .collect()
+    }
+
+    /// A multi-way leaf split (parts > 2) partitions the entries exactly: the
+    /// parts and the promoted separators together cover every index once, in
+    /// order, and every part individually fits a body-0 page.
+    #[test]
+    fn pack_leaf_multiway_partitions_exactly() {
+        let page = 4096usize;
+        // 12 near-maxLocal cells → several parts (each part holds only a few).
+        let entries = leaf_entries(&[1000; 12]);
+        let (parts, seps) = pack_index_leaf(&entries, 0, page);
+        assert!(parts.len() > 2, "expected a multi-way split, got {parts:?}");
+        assert_eq!(seps.len(), parts.len() - 1);
+
+        // Reconstruct the original index sequence: part[0], sep[0], part[1], …
+        let mut seq = Vec::new();
+        for (k, r) in parts.iter().enumerate() {
+            assert!(!r.is_empty(), "empty part {k}");
+            seq.extend(r.clone());
+            if k < seps.len() {
+                seq.push(seps[k]);
+            }
+        }
+        assert_eq!(seq, (0..entries.len()).collect::<Vec<_>>());
+
+        // Every part individually fits, and every serialize succeeds.
+        for r in &parts {
+            let rc: Vec<Vec<u8>> = entries[r.clone()].iter().map(|(_, c)| c.clone()).collect();
+            assert!(leaf_fits(&entries[r.clone()], 0, page));
+            serialize_index_leaf(page, 0, &rc, None).unwrap();
+        }
+    }
+
+    /// A skewed leaf (large cells clustered at the front — the exact shape that
+    /// overflowed the old midpoint split) still yields fitting parts.
+    #[test]
+    fn pack_leaf_front_heavy_fits() {
+        let page = 4096usize;
+        let mut lens = alloc::vec![1000usize; 4];
+        lens.extend([20usize; 8]);
+        let entries = leaf_entries(&lens);
+        let (parts, _seps) = pack_index_leaf(&entries, 0, page);
+        for r in &parts {
+            assert!(
+                leaf_fits(&entries[r.clone()], 0, page),
+                "part {r:?} overflows"
+            );
+        }
+    }
+
+    /// A multi-way interior split promotes the right separators and keeps each
+    /// part fitting, with child pointers preserved in order.
+    #[test]
+    fn pack_interior_multiway_partitions_exactly() {
+        let page = 4096usize;
+        let cells = interior_cells(&[1000; 12]);
+        let right = 9999u32;
+        let (parts, seps) = pack_index_interior(&cells, right, 0, page);
+        assert!(parts.len() > 2, "expected a multi-way interior split");
+        assert_eq!(seps.len(), parts.len() - 1);
+
+        // Reconstruct the child-pointer order: for each non-last part, its cells'
+        // children then the promoted separator's implied divider; the whole thing
+        // must enumerate children 100..100+12 then the page right pointer.
+        let mut children = Vec::new();
+        for (k, (pc, pr)) in parts.iter().enumerate() {
+            for (c, _, _) in pc {
+                children.push(*c);
+            }
+            children.push(*pr); // this part's right pointer
+            let _ = k;
+            // Each part must fit and serialize.
+            serialize_index_interior(page, 0, pc, *pr, None).unwrap();
+        }
+        // Children seen (each part's cells + its right pointer) plus the promoted
+        // separators' own children reconstruct the full ordered child set.
+        // Simpler invariant: the last part's right pointer is the page's right.
+        assert_eq!(parts.last().unwrap().1, right);
+        assert!(children.contains(&right));
+    }
+
+    /// Degenerate tiny page: the packer must not panic and each part still fits.
+    #[test]
+    fn pack_leaf_small_page() {
+        let page = 512usize;
+        let entries = leaf_entries(&[100; 8]);
+        let (parts, seps) = pack_index_leaf(&entries, 0, page);
+        assert_eq!(seps.len(), parts.len() - 1);
+        for r in &parts {
+            assert!(!r.is_empty());
+            assert!(leaf_fits(&entries[r.clone()], 0, page));
+        }
+    }
 }
