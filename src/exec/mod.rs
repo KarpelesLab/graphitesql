@@ -12654,6 +12654,31 @@ impl Connection {
             && (self.in_tx || self.open_savepoints > 0);
         #[cfg(feature = "fts5")]
         let mut fts5_inserted: Vec<(i64, Vec<Value>)> = Vec::new();
+        // An `INSERT OR REPLACE` / `REPLACE` that lands on an EXISTING fts5 rowid is
+        // a delete-of-old + insert-of-new — exactly like an `UPDATE`. The old
+        // document's terms must be tombstoned or the inverted index keeps stale
+        // postings and sqlite rejects the file ("malformed inverted index"). Capture
+        // the current documents up front so the conflict branch can pair each
+        // replaced rowid with its old column values; only pay this cost for an
+        // `OR REPLACE` on a self-content fts5 table (where a conflict can occur).
+        #[cfg(feature = "fts5")]
+        let fts5_self_content = module_name.eq_ignore_ascii_case("fts5") && !fts5_no_local;
+        #[cfg(feature = "fts5")]
+        let fts5_replace_mode = fts5_self_content && matches!(on_conflict, OnConflict::Replace);
+        #[cfg(feature = "fts5")]
+        let fts5_old_docs: alloc::collections::BTreeMap<i64, Vec<Value>> = if fts5_replace_mode {
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            self.fts5_load_documents(&ins.table, &col_names, &arg_refs)?
+                .into_iter()
+                .collect()
+        } else {
+            alloc::collections::BTreeMap::new()
+        };
+        // Replace-mode write log in execution order: each entry is
+        // `(rowid, old_values?, new_values)` — `None` old for a fresh insert,
+        // `Some(old)` for a replaced rowid.
+        #[cfg(feature = "fts5")]
+        let mut fts5_repl_ops: Vec<(i64, Option<Vec<Value>>, Vec<Value>)> = Vec::new();
         let inserted = self.with_vtab_store(
             &module_name,
             &args,
@@ -12678,11 +12703,22 @@ impl Connection {
                         let v = values.get(rowid_col?)?;
                         (!matches!(v, Value::Null)).then(|| eval::to_i64(v))
                     });
+                    #[cfg(feature = "fts5")]
+                    let mut replaced_old: Option<Vec<Value>> = None;
                     if let Some(id) = effective
                         && existing.contains(&id)
                     {
                         match on_conflict {
-                            OnConflict::Replace => {}
+                            OnConflict::Replace => {
+                                // Pair this replaced rowid with the old document's
+                                // column values so its terms can be tombstoned. An
+                                // absent/all-NULL old doc yields no terms.
+                                #[cfg(feature = "fts5")]
+                                if fts5_replace_mode {
+                                    replaced_old =
+                                        Some(fts5_old_docs.get(&id).cloned().unwrap_or_default());
+                                }
+                            }
                             OnConflict::Ignore => continue,
                             _ => {
                                 return Err(Error::Constraint(format!(
@@ -12701,7 +12737,9 @@ impl Connection {
                     )?;
                     existing.insert(assigned);
                     #[cfg(feature = "fts5")]
-                    if record_fts5_ops {
+                    if fts5_replace_mode {
+                        fts5_repl_ops.push((assigned, replaced_old, values.clone()));
+                    } else if record_fts5_ops {
                         fts5_inserted.push((assigned, values.clone()));
                     }
                     n += 1;
@@ -12711,13 +12749,64 @@ impl Connection {
         )?;
         // Log the transaction's fts5 inserts in execution order for the flush.
         #[cfg(feature = "fts5")]
-        if record_fts5_ops {
+        if record_fts5_ops && !fts5_replace_mode {
             if self.open_savepoints > 0 {
                 self.fts5_txn_sp_used.insert(ins.table.clone());
             }
             let log = self.fts5_txn_ops.entry(ins.table.clone()).or_default();
             for (rowid, values) in fts5_inserted {
                 log.push(Fts5TxnOp::Insert { rowid, values });
+            }
+        }
+        // Replace-mode fts5: an `OR REPLACE` that hit an existing rowid is a
+        // delete-of-old + insert-of-new. In AUTOCOMMIT the whole statement is one
+        // transaction, so append ONE tombstone/mixed segment (byte-identical to
+        // sqlite's INSERT OR REPLACE, which flushes its hash once) via the same
+        // incremental-delete path the UPDATE case uses; fresh rows in the same
+        // statement contribute insert-only postings to that segment. Inside an
+        // explicit transaction, record each write in execution order (a replaced
+        // rowid as an Update op, a fresh row as an Insert op) and mark the table so
+        // the commit-time flush tombstones the old terms. When nothing actually
+        // conflicted, fall through to the normal insert append.
+        #[cfg(feature = "fts5")]
+        if fts5_replace_mode {
+            let has_replace = fts5_repl_ops.iter().any(|(_, old, _)| old.is_some());
+            if !self.in_tx && self.open_savepoints == 0 {
+                if has_replace {
+                    let inc: Vec<Fts5Change> = fts5_repl_ops
+                        .iter()
+                        .map(|(rid, old, new)| {
+                            (*rid, old.clone().unwrap_or_default(), Some(new.clone()))
+                        })
+                        .collect();
+                    if !self.fts5_incremental_delete(&ins.table, &inc)? {
+                        self.fts5_rebuild_index(&ins.table)?;
+                    }
+                    return Ok(inserted);
+                }
+                // No conflict: the normal incremental append below handles the docs.
+            } else {
+                if self.open_savepoints > 0 {
+                    self.fts5_txn_sp_used.insert(ins.table.clone());
+                }
+                if has_replace {
+                    self.fts5_txn_dirty.insert(ins.table.clone(), true);
+                } else {
+                    self.fts5_txn_dirty
+                        .entry(ins.table.clone())
+                        .or_insert(false);
+                }
+                let log = self.fts5_txn_ops.entry(ins.table.clone()).or_default();
+                for (rowid, old, new) in fts5_repl_ops {
+                    match old {
+                        Some(old_values) => log.push(Fts5TxnOp::Update {
+                            rowid,
+                            old_values,
+                            new_values: new,
+                        }),
+                        None => log.push(Fts5TxnOp::Insert { rowid, values: new }),
+                    }
+                }
             }
         }
         self.fts5_maybe_rebuild(&module_name, &ins.table)?;
