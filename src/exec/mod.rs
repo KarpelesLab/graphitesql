@@ -10751,8 +10751,12 @@ impl Connection {
             }
         }
         // REPLACE removed rows whose index entries were maintained incrementally;
-        // rebuild from the final table state to be safe.
+        // rebuild from the final table state to be safe. The delete of each
+        // conflicting row can leave an empty non-root leaf in the table b-tree
+        // (SQLite's balancer would merge it); compact it away first, exactly as
+        // the UPDATE and DELETE paths do, or the file is left malformed.
         if replaced {
+            self.compact_table(&meta)?;
             self.rebuild_indexes(&meta, &indexes)?;
         }
         Ok(affected)
