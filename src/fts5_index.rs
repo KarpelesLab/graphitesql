@@ -93,6 +93,7 @@ fn put_varint(out: &mut Vec<u8>, v: u64) {
 /// positions and its poslist is written as `size2 = 1` (content length 0 with the
 /// low delete-flag bit set), shadowing an older segment's entry for `rowid` when
 /// the segments are later merged. See [`poslist`].
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Posting {
     pub rowid: i64,
     pub cols: Vec<Vec<u32>>,
@@ -233,6 +234,14 @@ struct SegWriter {
     /// True while the next rowid is the FIRST of the current doclist (sqlite's
     /// `bFirstRowidInDoclist`). A first-in-doclist rowid is stored ABSOLUTE.
     first_rowid_in_doclist: bool,
+    /// When true, use sqlite's INCREMENTAL-MERGE writer semantics
+    /// (`fts5WriteAppendRowid`/`fts5WriteAppendPoslistData`) rather than the bulk
+    /// `fts5FlushOneHash` writer: a leaf-full check runs BEFORE each rowid, and the
+    /// poslist-spill loop copies whole varints until the page is full (rather than
+    /// stopping just short). These diverge from the bulk writer only when a merge
+    /// output spans multiple leaves, but then they are byte-exact vs sqlite's
+    /// `fts5IndexMergeLevel`. See [`build_merged_segment_block`].
+    merge_mode: bool,
 }
 
 impl SegWriter {
@@ -255,6 +264,7 @@ impl SegWriter {
             span_pages: Vec::new(),
             first_rowid_in_page: true,
             first_rowid_in_doclist: true,
+            merge_mode: false,
         }
     }
 
@@ -333,6 +343,14 @@ impl SegWriter {
     /// flush-check before the rowid — a fresh leaf is only ever reached from the
     /// poslist-spill loop below, which flushes and re-arms `first_rowid_in_page`.
     fn append_rowid(&mut self, rowid: i64, term_start_leaf: i64) {
+        // Incremental-merge writer only: `fts5WriteAppendRowid` flushes a full leaf
+        // BEFORE the rowid — `if( (buf.n + pgidx.n) >= pgsz )`. The bulk writer has
+        // no such check (it only flushes while streaming a poslist), so a rowid can
+        // ride along on a leaf the merge writer would already have closed. This is
+        // the sole difference for merge outputs whose per-doc poslists fit a leaf.
+        if self.merge_mode && 4 + self.body.len() + self.pgidx_len() >= self.pgsz {
+            self.flush();
+        }
         if self.first_rowid_in_page {
             self.first_rowid_off = 4 + self.body.len();
             if self.pgno != term_start_leaf {
@@ -357,6 +375,32 @@ impl SegWriter {
     /// flush whenever the page reaches `pgsz`.
     fn append_poslist_data(&mut self, data: &[u8]) {
         let n_copy = data.len();
+        if self.merge_mode {
+            // Port of `fts5WriteAppendPoslistData`: while the poslist would overflow
+            // the page, copy the largest run of WHOLE varints that reaches the page
+            // limit (`nCopy` accumulates until `nCopy >= nReq`), then flush.
+            let mut a = data;
+            while 4 + self.body.len() + self.pgidx_len() + a.len() >= self.pgsz {
+                let n_req = self.pgsz as isize - (4 + self.body.len() + self.pgidx_len()) as isize;
+                let mut n_c = 0usize;
+                while (n_c as isize) < n_req {
+                    match varint::decode(&a[n_c..]) {
+                        Some((_, len)) => n_c += len,
+                        None => break,
+                    }
+                }
+                if n_c == 0 || n_c > a.len() {
+                    break;
+                }
+                self.body.extend_from_slice(&a[..n_c]);
+                a = &a[n_c..];
+                self.flush();
+            }
+            if !a.is_empty() {
+                self.body.extend_from_slice(a);
+            }
+            return;
+        }
         if 4 + self.body.len() + self.pgidx_len() + n_copy <= self.pgsz {
             self.body.extend_from_slice(data);
             return;
@@ -639,7 +683,7 @@ pub(crate) struct StructSeg {
 
 impl StructSeg {
     /// Segment size in leaf pages (`fts5SegmentSize`).
-    fn size(&self) -> i64 {
+    pub(crate) fn size(&self) -> i64 {
         1 + self.pgno_last - self.pgno_first
     }
 }
@@ -1067,6 +1111,42 @@ pub(crate) fn build_segment_block(
         data,
         idx,
         docsize: build_docsize(doc_sizes),
+        n_leaves: leaves.len() as i64,
+    }
+}
+
+/// Build the merged-output segment of an automerge/crisis `fts5IndexMergeLevel`
+/// step, using sqlite's INCREMENTAL-MERGE writer semantics (see
+/// [`SegWriter::merge_mode`]). Main-index terms only (no `prefixes`) and no
+/// `%_docsize` (merges do not touch per-doc sizes). The leaf CONTENT is identical
+/// to [`build_segment_block`] for single-leaf outputs but diverges — matching
+/// sqlite — at leaf boundaries when the merged segment spans several leaves.
+pub(crate) fn build_merged_segment_block(
+    terms: &[(Vec<u8>, Vec<Posting>)],
+    pgsz: usize,
+    segid: i64,
+) -> SegmentBlock {
+    let (leaves, idx, dlidx) = {
+        let mut w = SegWriter::new(pgsz.max(16), segid);
+        w.merge_mode = true;
+        for (term, postings) in terms {
+            w.add_term(term, postings);
+        }
+        if terms.is_empty() {
+            (Vec::new(), Vec::new(), Vec::new())
+        } else {
+            w.finish()
+        }
+    };
+    let mut data: Vec<(i64, Vec<u8>)> = Vec::new();
+    for (i, leaf) in leaves.iter().enumerate() {
+        data.push((segment_leaf_rowid(segid, i as i64 + 1), leaf.clone()));
+    }
+    data.extend(dlidx);
+    SegmentBlock {
+        data,
+        idx,
+        docsize: Vec::new(),
         n_leaves: leaves.len() as i64,
     }
 }
@@ -1674,6 +1754,175 @@ fn merge_segments(
     all.sort_by_key(|p| p.rowid);
     all.dedup_by_key(|p| p.rowid);
     Some(all)
+}
+
+// ---------------------------------------------------------------------------
+// Tombstone-PRESERVING reader + merge (D2e-1 automerge).
+//
+// The reader above ([`decode_poslist`], [`merge_segments`]) BAILS on a DELETE
+// marker (poslist low bit set) because the query paths cannot resolve layering
+// precedence. The automerge/crisis WRITE path, by contrast, must reproduce
+// sqlite's `fts5IndexMergeLevel` byte-for-byte, which means it must READ every
+// posting (tombstones included), MERGE the input segments in term+rowid order
+// with newest-segment-wins precedence, and re-apply sqlite's key-annihilation
+// rule. These variants keep the delete flag instead of bailing.
+
+/// Like [`decode_poslist`] but returns the DELETE flag (`size2 & 1`) rather than
+/// bailing on a tombstone. The inverse of [`poslist`] including its low bit.
+fn decode_poslist_keepdel(buf: &[u8], pos: &mut usize) -> Option<(Vec<Vec<u32>>, bool)> {
+    let size2 = read_varint(buf, pos)?;
+    let del = (size2 & 1) != 0;
+    let content_len = (size2 / 2) as usize;
+    let end = pos.checked_add(content_len)?;
+    if end > buf.len() {
+        return None;
+    }
+    let mut cols: Vec<Vec<u32>> = Vec::new();
+    let mut col = 0usize;
+    let mut p = *pos;
+    cols.push(Vec::new());
+    while p < end {
+        if buf[p] == 0x01 {
+            p += 1;
+            let c = read_varint(buf, &mut p)? as usize;
+            col = c;
+            while cols.len() <= col {
+                cols.push(Vec::new());
+            }
+        } else {
+            let raw = read_varint(buf, &mut p)?;
+            if raw < 2 {
+                return None;
+            }
+            let delta = (raw - 2) as u32;
+            let next = if cols[col].is_empty() {
+                delta
+            } else {
+                cols[col].last().copied()?.checked_add(delta)?
+            };
+            cols[col].push(next);
+        }
+    }
+    *pos = end;
+    Some((cols, del))
+}
+
+/// Like [`decode_spanning_doclist`] but builds [`Posting`]s (carrying the DELETE
+/// flag via [`decode_poslist_keepdel`]) instead of position-only [`DecodedPosting`]s.
+fn decode_doclist_keepdel(runs: &[DoclistRun]) -> Option<Vec<Posting>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut abs_at: Vec<usize> = Vec::new();
+    for run in runs {
+        if run.abs_start && !run.bytes.is_empty() {
+            abs_at.push(buf.len());
+        }
+        buf.extend_from_slice(run.bytes);
+    }
+    let end = buf.len();
+    let mut pos = 0usize;
+    let mut out = Vec::new();
+    let mut rowid = 0i64;
+    let mut first = true;
+    while pos < end {
+        let absolute = first || abs_at.contains(&pos);
+        let d = read_varint(&buf, &mut pos)? as i64;
+        rowid = if absolute { d } else { rowid.wrapping_add(d) };
+        first = false;
+        let (cols, del) = decode_poslist_keepdel(&buf, &mut pos)?;
+        if pos > end {
+            return None;
+        }
+        out.push(Posting { rowid, cols, del });
+    }
+    if pos != end {
+        return None;
+    }
+    Some(out)
+}
+
+/// Parse EVERY term of a simple main-index segment into `(term, postings)` with
+/// the term's `MAIN_PREFIX` byte stripped (ready to feed back to
+/// [`build_segment_block`]). `None` (bail) on an interior/doclist-index page (an
+/// unparseable leaf) or a non-`MAIN_PREFIX` term (a prefix-index key) — the
+/// automerge path only services the main index. Postings preserve DELETE markers.
+pub(crate) fn read_segment_postings(leaves: &[&[u8]]) -> Option<Vec<(Vec<u8>, Vec<Posting>)>> {
+    let mut views: Vec<LeafView> = Vec::with_capacity(leaves.len());
+    for leaf in leaves {
+        views.push(parse_leaf(leaf)?);
+    }
+    let mut out: Vec<(Vec<u8>, Vec<Posting>)> = Vec::new();
+    for (li, view) in views.iter().enumerate() {
+        for (ti, rec) in view.terms.iter().enumerate() {
+            // Only main-index terms (key '0'…). A prefix-index term ('1'…) means
+            // this is a prefixed segment the automerge path does not service.
+            if rec.key.first() != Some(&MAIN_PREFIX) {
+                return None;
+            }
+            let term = rec.key.get(1..)?.to_vec();
+            let runs = gather_doclist_runs(leaves, li, ti, rec.doclist_start, &views)?;
+            let postings = decode_doclist_keepdel(&runs)?;
+            out.push((term, postings));
+        }
+    }
+    Some(out)
+}
+
+/// Merge already-parsed segments (`segs[0]` OLDEST … `segs.last()` NEWEST — the
+/// `pLvl->aSeg[]` order) into one ascending-term / ascending-rowid stream,
+/// newest-segment-wins per rowid, applying sqlite's key-annihilation rule.
+///
+/// Port of the entry-emitting core of `fts5IndexMergeLevel`: for each distinct
+/// `(term, rowid)` only the newest segment's posting survives (older duplicates
+/// are shadowed). That surviving posting is then DROPPED
+/// (`if( pSegIter->nPos==0 && (bOldest || pSegIter->bDel==0) ) continue;`) when it
+/// carries no positions AND (`b_oldest` OR it is not a delete) — so a pure
+/// tombstone is annihilated in the oldest output segment but PRESERVED otherwise,
+/// where it must still shadow un-merged higher levels.
+fn merge_level_postings(
+    segs: &[Vec<(Vec<u8>, Vec<Posting>)>],
+    b_oldest: bool,
+) -> Vec<(Vec<u8>, Vec<Posting>)> {
+    use alloc::collections::BTreeMap;
+    // term -> (rowid -> Posting); iterating segments oldest→newest and inserting
+    // unconditionally lets the newest write win each (term, rowid).
+    let mut map: BTreeMap<Vec<u8>, BTreeMap<i64, Posting>> = BTreeMap::new();
+    for seg in segs {
+        for (term, postings) in seg {
+            let e = map.entry(term.clone()).or_default();
+            for p in postings {
+                e.insert(p.rowid, p.clone());
+            }
+        }
+    }
+    let mut out: Vec<(Vec<u8>, Vec<Posting>)> = Vec::new();
+    for (term, by_rowid) in map {
+        let mut ps: Vec<Posting> = Vec::new();
+        for (_rowid, p) in by_rowid {
+            let empty = p.cols.iter().all(|c| c.is_empty());
+            if empty && (b_oldest || !p.del) {
+                continue;
+            }
+            ps.push(p);
+        }
+        if !ps.is_empty() {
+            out.push((term, ps));
+        }
+    }
+    out
+}
+
+/// Read each segment's leaves ([`read_segment_postings`]) then
+/// [`merge_level_postings`] them. `seg_leaves[0]` is the OLDEST segment on the
+/// level. `None` if any segment is unservable (interior/dlidx page, prefix term).
+pub(crate) fn merge_segments_keepdel(
+    seg_leaves: &[Vec<&[u8]>],
+    b_oldest: bool,
+) -> Option<Vec<(Vec<u8>, Vec<Posting>)>> {
+    let mut segs: Vec<Vec<(Vec<u8>, Vec<Posting>)>> = Vec::with_capacity(seg_leaves.len());
+    for leaves in seg_leaves {
+        segs.push(read_segment_postings(leaves)?);
+    }
+    Some(merge_level_postings(&segs, b_oldest))
 }
 
 /// Look up `term` in an FTS5 index given its `%_data` rows, returning the rowids
@@ -4056,5 +4305,69 @@ mod tests {
         ];
         assert_eq!(lookup_phrase_rowids_k(&data, &[b"a", b"b"]), None);
         assert_eq!(lookup_near_rowids(&data, b"a", b"b", 5), None);
+    }
+
+    // ---- tombstone-preserving reader / merge (automerge) ----------------------
+
+    /// A delete-marker posting (positionless tombstone).
+    fn tomb(rowid: i64) -> Posting {
+        Posting {
+            rowid,
+            cols: vec![Vec::new()],
+            del: true,
+        }
+    }
+
+    /// The leaf blobs of a segment built by `build_segment_block`.
+    fn seg_leaves_of(terms: &[(Vec<u8>, Vec<Posting>)], segid: i64) -> Vec<Vec<u8>> {
+        let block = build_segment_block(terms, &[], 4050, segid, &[]);
+        block
+            .data
+            .into_iter()
+            .filter(|(id, _)| (*id & (1 << 36)) == 0) // leaf pages only (no dlidx)
+            .map(|(_, b)| b)
+            .collect()
+    }
+
+    #[test]
+    fn read_segment_postings_roundtrips_with_tombstone() {
+        // A segment with a normal posting, a multi-position posting, and a
+        // tombstone must decode back to exactly the input postings (del flags
+        // preserved), terms with the '0' prefix stripped.
+        let terms = vec![
+            (b"apple".to_vec(), vec![p(1, &[&[0, 3]]), tomb(4)]),
+            (b"banana".to_vec(), vec![p(2, &[&[1]]), p(5, &[&[0]])]),
+        ];
+        let leaves = seg_leaves_of(&terms, 7);
+        let refs: Vec<&[u8]> = leaves.iter().map(|l| l.as_slice()).collect();
+        let got = read_segment_postings(&refs).expect("servable");
+        assert_eq!(got, terms);
+    }
+
+    #[test]
+    fn merge_precedence_and_annihilation() {
+        // Oldest segment inserts docs 1,2 for "x"; newer segment tombstones doc 1
+        // and inserts doc 3. Merge (NOT oldest) keeps the tombstone for doc 1 (it
+        // must shadow un-merged levels) and the live docs 2,3.
+        let old = vec![(b"x".to_vec(), vec![p(1, &[&[0]]), p(2, &[&[0]])])];
+        let new = vec![(b"x".to_vec(), vec![tomb(1), p(3, &[&[0]])])];
+        let old_l = seg_leaves_of(&old, 1);
+        let new_l = seg_leaves_of(&new, 2);
+        let segs: Vec<Vec<&[u8]>> = vec![
+            old_l.iter().map(|l| l.as_slice()).collect(),
+            new_l.iter().map(|l| l.as_slice()).collect(),
+        ];
+        // Not oldest: tombstone survives, newest wins per rowid.
+        let merged = merge_segments_keepdel(&segs, false).expect("servable");
+        assert_eq!(
+            merged,
+            vec![(b"x".to_vec(), vec![tomb(1), p(2, &[&[0]]), p(3, &[&[0]])])]
+        );
+        // Oldest output: the tombstone (and the doc it shadows) is annihilated.
+        let merged_oldest = merge_segments_keepdel(&segs, true).expect("servable");
+        assert_eq!(
+            merged_oldest,
+            vec![(b"x".to_vec(), vec![p(2, &[&[0]]), p(3, &[&[0]])])]
+        );
     }
 }

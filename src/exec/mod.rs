@@ -33993,17 +33993,6 @@ impl Connection {
         }
 
         structure.append_level0(segid, block.n_leaves);
-        // Crisis-merge: while a level holds >= 16 segments, merge it into one
-        // segment at the next level (fresh segid), then promote. The merged
-        // segment's leaf bytes equal a full rebuild over that level's documents;
-        // since every level-0 doc is live here (pure inserts), rebuild from the
-        // whole live corpus with the merged segid.
-        let did_crisis =
-            self.fts5_crisis_merge(name, &mut structure, ncols, tok, &prefixes, &docs)?;
-
-        // Global averages: nRow + per-column token totals over the WHOLE live
-        // corpus (sqlite keeps this running; recompute from all live docs).
-        let (_all_terms, col_totals, _all_sizes) = self.fts5_tokenize_docs(&docs, ncols, tok);
 
         let q = |s: &str| sql::print::ident(s);
         let pv = |vals: Vec<Value>| Params {
@@ -34011,6 +34000,51 @@ impl Connection {
             named: Vec::new(),
         };
         let data_t = q(&format!("{name}_data"));
+        let idx_t = q(&format!("{name}_idx"));
+
+        // Non-prefix tables take the faithful incremental-merge path: persist the
+        // level-0 block, then run automerge + crisismerge as real `%_data` merges
+        // (byte-identical to sqlite). Prefix tables are not serviced by the
+        // tombstone-preserving reader, so they keep the legacy rebuild-from-corpus
+        // crisis (and no automerge) — unchanged behavior.
+        let block_persisted;
+        if prefixes.is_empty() {
+            // Persist the level-0 block so the merges read it uniformly from %_data.
+            for (id, block_bytes) in &block.data {
+                self.execute_params(
+                    &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
+                    &pv(alloc::vec![
+                        Value::Integer(*id),
+                        Value::Blob(block_bytes.clone())
+                    ]),
+                )?;
+            }
+            for IdxRow { segid, term, pgno } in &block.idx {
+                self.execute_params(
+                    &format!("INSERT INTO {idx_t} VALUES(?1,?2,?3)"),
+                    &pv(alloc::vec![
+                        Value::Integer(*segid),
+                        Value::Blob(term.clone()),
+                        Value::Integer(*pgno)
+                    ]),
+                )?;
+            }
+            block_persisted = true;
+            if !self.fts5_automerge(name, &mut structure, block.n_leaves, ncols, tok, &prefixes)? {
+                return Ok(false);
+            }
+            if !self.fts5_crisismerge(name, &mut structure, ncols, tok, &prefixes)? {
+                return Ok(false);
+            }
+        } else {
+            let did_crisis =
+                self.fts5_crisis_merge(name, &mut structure, ncols, tok, &prefixes, &docs)?;
+            block_persisted = did_crisis;
+        }
+
+        // Global averages: nRow + per-column token totals over the WHOLE live
+        // corpus (sqlite keeps this running; recompute from all live docs).
+        let (_all_terms, col_totals, _all_sizes) = self.fts5_tokenize_docs(&docs, ncols, tok);
 
         // Averages (id 1): nRow + per-column token totals over the whole corpus.
         let avg = fts5_index::encode_averages(docs.len() as u64, &col_totals);
@@ -34030,8 +34064,10 @@ impl Connection {
             ]),
         )?;
 
-        if !did_crisis {
-            // Append the new segment's leaf/dlidx `%_data` rows and `%_idx` rows.
+        // Append the new segment's leaf/dlidx `%_data` rows and `%_idx` rows —
+        // unless they were already persisted (non-prefix path) or a crisis merge
+        // consumed them (prefix path rewrote every segment row).
+        if !block_persisted {
             for (id, block_bytes) in &block.data {
                 self.execute_params(
                     &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
@@ -34041,7 +34077,6 @@ impl Connection {
                     ]),
                 )?;
             }
-            let idx_t = q(&format!("{name}_idx"));
             for IdxRow { segid, term, pgno } in &block.idx {
                 self.execute_params(
                     &format!("INSERT INTO {idx_t} VALUES(?1,?2,?3)"),
@@ -34053,8 +34088,8 @@ impl Connection {
                 )?;
             }
         }
-        // `_docsize` gains one row per new document (crisis-merge leaves docsize
-        // rows untouched — they are per-doc, not per-segment).
+        // `_docsize` gains one row per new document (merges leave docsize rows
+        // untouched — they are per-doc, not per-segment).
         let docsize_t = q(&format!("{name}_docsize"));
         for (rowid, sz) in &block.docsize {
             self.execute_params(
@@ -34095,8 +34130,16 @@ impl Connection {
         // fall back to the bulk rebuild to stay correct.
         let merged_segid = structure.allocate_segid();
         let (terms, _totals, doc_sizes) = self.fts5_tokenize_docs(docs, ncols, tok);
-        let block =
-            fts5_index::build_segment_block(&terms, &doc_sizes, 4050, merged_segid, prefixes);
+        // A crisis merge is a `fts5IndexMergeLevel`, so its output uses the
+        // INCREMENTAL-MERGE writer (byte-exact vs sqlite for multi-leaf outputs).
+        // Prefix tables still take the bulk writer — the merge writer services the
+        // main index only, and prefix crises produce single-leaf outputs where the
+        // two writers agree byte-for-byte.
+        let block = if prefixes.is_empty() {
+            fts5_index::build_merged_segment_block(&terms, 4050, merged_segid)
+        } else {
+            fts5_index::build_segment_block(&terms, &doc_sizes, 4050, merged_segid, prefixes)
+        };
 
         // Mutate a COPY of the structure and only commit it on success, so a bail
         // leaves the caller's `structure` untouched (it then rebuilds from
@@ -34166,6 +34209,287 @@ impl Connection {
                     Value::Integer(*pgno)
                 ]),
             )?;
+        }
+        Ok(true)
+    }
+
+    /// Read a segment's leaf `%_data` blobs (`pgno_first..=pgno_last`) in page
+    /// order. Used by the incremental-merge machinery to reconstruct a level's
+    /// input segments. `None` if any leaf row is missing (a corrupt/unexpected
+    /// shape → the caller bails to the bulk rebuild).
+    #[cfg(feature = "fts5")]
+    fn fts5_read_segment_leaves(
+        &mut self,
+        name: &str,
+        seg: &crate::fts5_index::StructSeg,
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        use crate::fts5_index;
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for pgno in seg.pgno_first..=seg.pgno_last {
+            let rid = fts5_index::segment_leaf_rowid(seg.segid, pgno);
+            let blob = self
+                .query(&format!(
+                    "SELECT block FROM {} WHERE id={}",
+                    sql::print::ident(&format!("{name}_data")),
+                    rid
+                ))?
+                .rows
+                .into_iter()
+                .next()
+                .and_then(|r| match r.into_iter().next() {
+                    Some(Value::Blob(b)) => Some(b),
+                    _ => None,
+                });
+            match blob {
+                Some(b) => out.push(b),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// Port of `fts5IndexMergeLevel` for the ATOMIC (non-partial) case: merge ALL
+    /// segments of input level `i_lvl` into ONE fresh-segid segment at `i_lvl+1`,
+    /// in term+rowid order, newest-segment-wins, with sqlite's key-annihilation.
+    /// Rewrites the affected `%_data`/`%_idx` rows and mutates `structure`.
+    ///
+    /// Returns `Ok(Some(n_leaves))` (leaves written to the merged segment) on
+    /// success, or `Ok(None)` to bail the whole incremental write to the bulk
+    /// rebuild (an unservable segment shape, or a merge whose output would exceed
+    /// the incremental page budget `n_rem` — the partial-merge case this atomic
+    /// port does not reproduce). `n_rem` is the remaining page budget; a merge is
+    /// only performed if the input level's total leaf count fits within it.
+    #[cfg(feature = "fts5")]
+    #[allow(clippy::too_many_arguments)]
+    fn fts5_merge_level(
+        &mut self,
+        name: &str,
+        structure: &mut crate::fts5_index::SegStructure,
+        i_lvl: usize,
+        n_rem: i64,
+        ncols: usize,
+        tok: crate::vtab::Fts5Tok,
+        prefixes: &[usize],
+    ) -> Result<Option<i64>> {
+        use crate::fts5_index::{self, IdxRow, StructLevel, StructSeg};
+
+        // Allocate the output segid over the CURRENT structure (before removing
+        // the input segments) — matches sqlite's fts5AllocateSegid ordering.
+        let out_segid = structure.allocate_segid();
+        // Ensure the output level exists.
+        if i_lvl + 1 >= structure.levels.len() {
+            structure.levels.push(StructLevel {
+                n_merge: 0,
+                segs: Vec::new(),
+            });
+        }
+        // bOldest: the (about-to-be-added) output segment is the ONLY segment on
+        // the LAST level. sqlite tests `pLvlOut->nSeg==1 && nLevel==iLvl+2` AFTER
+        // adding the empty output segment — equivalently the output level is
+        // currently empty and is the last level.
+        let b_oldest =
+            structure.levels[i_lvl + 1].segs.is_empty() && structure.levels.len() == i_lvl + 2;
+
+        // Read the input segments' leaves, OLDEST first (structure/aSeg order).
+        let input_segs: Vec<StructSeg> = structure.levels[i_lvl].segs.clone();
+        // Refuse a merge whose input would overflow the page budget: that is the
+        // incremental/partial-merge case (nMerge>0), which this atomic port does
+        // not reproduce byte-for-byte. Falling back keeps the index correct.
+        let input_leaves: i64 = input_segs.iter().map(|s| s.size()).sum();
+        if input_leaves > n_rem {
+            return Ok(None);
+        }
+        let mut owned: Vec<Vec<Vec<u8>>> = Vec::with_capacity(input_segs.len());
+        for seg in &input_segs {
+            match self.fts5_read_segment_leaves(name, seg)? {
+                Some(leaves) => owned.push(leaves),
+                None => return Ok(None),
+            }
+        }
+        let seg_leaves: Vec<Vec<&[u8]>> = owned
+            .iter()
+            .map(|s| s.iter().map(|l| l.as_slice()).collect())
+            .collect();
+        let terms = match fts5_index::merge_segments_keepdel(&seg_leaves, b_oldest) {
+            Some(t) => t,
+            None => return Ok(None), // unservable (prefix/dlidx/interior) → rebuild
+        };
+
+        // Build the merged output segment with the incremental-merge writer.
+        let block = fts5_index::build_merged_segment_block(&terms, 4050, out_segid);
+        let _ = (ncols, tok, prefixes);
+
+        let q = |s: &str| sql::print::ident(s);
+        let pv = |vals: Vec<Value>| Params {
+            positional: vals,
+            named: Vec::new(),
+        };
+        let data_t = q(&format!("{name}_data"));
+        let idx_t = q(&format!("{name}_idx"));
+
+        // Remove every input segment's `%_data` rows (leaf + any dlidx pages, i.e.
+        // the whole segid<<37 range) and its `%_idx` rows.
+        for seg in &input_segs {
+            let lo = fts5_index::segment_leaf_rowid(seg.segid, 0);
+            let hi = fts5_index::segment_leaf_rowid(seg.segid + 1, 0);
+            self.execute(&format!("DELETE FROM {data_t} WHERE id>={lo} AND id<{hi}"))?;
+            self.execute(&format!("DELETE FROM {idx_t} WHERE segid={}", seg.segid))?;
+        }
+        // Write the merged segment's rows.
+        for (id, block_bytes) in &block.data {
+            self.execute_params(
+                &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
+                &pv(alloc::vec![
+                    Value::Integer(*id),
+                    Value::Blob(block_bytes.clone())
+                ]),
+            )?;
+        }
+        for IdxRow { segid, term, pgno } in &block.idx {
+            self.execute_params(
+                &format!("INSERT INTO {idx_t} VALUES(?1,?2,?3)"),
+                &pv(alloc::vec![
+                    Value::Integer(*segid),
+                    Value::Blob(term.clone()),
+                    Value::Integer(*pgno)
+                ]),
+            )?;
+        }
+
+        // Update the structure: clear the input level, add the merged segment to
+        // the output level (unless it is empty — an all-annihilated merge yields
+        // pgnoLast==0, which sqlite drops).
+        structure.levels[i_lvl].segs.clear();
+        structure.levels[i_lvl].n_merge = 0;
+        if block.n_leaves > 0 {
+            structure.levels[i_lvl + 1].segs.push(StructSeg {
+                segid: out_segid,
+                pgno_first: 1,
+                pgno_last: block.n_leaves,
+            });
+        }
+        Ok(Some(block.n_leaves))
+    }
+
+    /// Port of `fts5IndexMerge`: perform up to `n_rem` pages of merge work,
+    /// repeatedly merging the level with the most segments (>= `n_min`) into the
+    /// next level and promoting, until no level qualifies or the budget is spent.
+    /// For content (non-`contentless_delete`) tables `fts5IndexFindDeleteMerge`
+    /// always returns -1, so the sole merge trigger is the segment count.
+    ///
+    /// Returns `Ok(false)` to bail the whole incremental write to the bulk rebuild.
+    #[cfg(feature = "fts5")]
+    #[allow(clippy::too_many_arguments)]
+    fn fts5_index_merge(
+        &mut self,
+        name: &str,
+        structure: &mut crate::fts5_index::SegStructure,
+        mut n_rem: i64,
+        n_min: i64,
+        ncols: usize,
+        tok: crate::vtab::Fts5Tok,
+        prefixes: &[usize],
+    ) -> Result<bool> {
+        while n_rem > 0 {
+            // Select the input level: the one already merging (nMerge>0, taken
+            // first), else the level with the most segments.
+            let mut i_best: isize = 0;
+            let mut n_best: i64 = 0;
+            for i_lvl in 0..structure.levels.len() {
+                let lvl = &structure.levels[i_lvl];
+                if lvl.n_merge != 0 {
+                    if lvl.n_merge > n_best {
+                        i_best = i_lvl as isize;
+                        n_best = n_min;
+                    }
+                    break;
+                }
+                if (lvl.segs.len() as i64) > n_best {
+                    n_best = lvl.segs.len() as i64;
+                    i_best = i_lvl as isize;
+                }
+            }
+            // fts5IndexFindDeleteMerge is a no-op for content tables → -1.
+            if n_best < n_min {
+                break;
+            }
+            if i_best < 0 {
+                break;
+            }
+            let written = match self.fts5_merge_level(
+                name,
+                structure,
+                i_best as usize,
+                n_rem,
+                ncols,
+                tok,
+                prefixes,
+            )? {
+                Some(w) => w,
+                None => return Ok(false),
+            };
+            n_rem -= written;
+            if structure.levels[i_best as usize].n_merge == 0 {
+                structure.promote_after_merge(i_best as usize + 1);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Port of `fts5IndexAutomerge` (the `fts5FlushOneHash` tail). Called AFTER the
+    /// level-0 segment has been appended to `structure` (so `write_counter` already
+    /// includes this write's `n_leaf`) AND after that segment's `%_data`/`%_idx`
+    /// rows have been persisted (so [`Self::fts5_merge_level`] reads it uniformly).
+    /// Computes the work quanta unlocked by crossing a `FTS5_WORK_UNIT` (64-leaf)
+    /// boundary and runs the incremental merge. Returns `Ok(false)` to bail the
+    /// whole write to the bulk rebuild (a merge over an unservable/oversized shape).
+    #[cfg(feature = "fts5")]
+    fn fts5_automerge(
+        &mut self,
+        name: &str,
+        structure: &mut crate::fts5_index::SegStructure,
+        n_leaf: i64,
+        ncols: usize,
+        tok: crate::vtab::Fts5Tok,
+        prefixes: &[usize],
+    ) -> Result<bool> {
+        const WORK_UNIT: i64 = 64;
+        const AUTOMERGE: i64 = 4;
+        // nWork = (wc/64) - ((wc - nLeaf)/64), with wc already advanced by nLeaf.
+        let wc = structure.write_counter as i64;
+        let n_work = (wc / WORK_UNIT) - ((wc - n_leaf) / WORK_UNIT);
+        if n_work <= 0 {
+            return Ok(true); // no work this write
+        }
+        let n_rem = WORK_UNIT * n_work * structure.levels.len() as i64;
+        self.fts5_index_merge(name, structure, n_rem, AUTOMERGE, ncols, tok, prefixes)
+    }
+
+    /// Port of `fts5IndexCrisismerge`: while a level holds >= `FTS5_DEFAULT_CRISISMERGE`
+    /// (16) segments, merge it FULLY into the next level (no page budget — sqlite
+    /// passes `pnRem=0`) and promote. Reads/rewrites `%_data`/`%_idx` via
+    /// [`Self::fts5_merge_level`]. Returns `Ok(false)` to bail to the bulk rebuild.
+    #[cfg(feature = "fts5")]
+    fn fts5_crisismerge(
+        &mut self,
+        name: &str,
+        structure: &mut crate::fts5_index::SegStructure,
+        ncols: usize,
+        tok: crate::vtab::Fts5Tok,
+        prefixes: &[usize],
+    ) -> Result<bool> {
+        const CRISIS: usize = 16;
+        let mut i_lvl = 0;
+        while i_lvl < structure.levels.len() && structure.levels[i_lvl].segs.len() >= CRISIS {
+            // Crisis merges are unbounded (`i64::MAX` budget → never partial).
+            if self
+                .fts5_merge_level(name, structure, i_lvl, i64::MAX, ncols, tok, prefixes)?
+                .is_none()
+            {
+                return Ok(false);
+            }
+            structure.promote_after_merge(i_lvl + 1);
+            i_lvl += 1;
         }
         Ok(true)
     }
@@ -34327,43 +34651,7 @@ impl Connection {
             return Ok(false);
         }
 
-        const CRISIS: usize = 16;
         structure.append_level0(segid, block.n_leaves);
-        // Crisis-merge: while a level holds >= 16 segments, merge it into one
-        // segment at the next level (sqlite's `fts5IndexCrisismerge`). When the
-        // merge collapses the WHOLE index into the single oldest level
-        // (`bOldest`), sqlite's `fts5IndexMergeLevel` ANNIHILATES every DELETE
-        // marker together with the older posting it shadows (the key-annihilation
-        // `if( pSegIter->nPos==0 && (bOldest || pSegIter->bDel==0) ) continue;`) —
-        // so the merged segment is exactly a clean rebuild over the LIVE corpus,
-        // with no tombstone entries and no deleted rowids. `docs` is the
-        // post-mutation live corpus, so the shared `fts5_crisis_merge` (which
-        // rebuilds from `docs`) produces sqlite's byte-exact merged structure. It
-        // rewrites the `%_data`/`%_idx` segment rows itself; when it fires we must
-        // NOT also append this tombstone block (it was consumed by the merge).
-        //
-        // The rebuild-from-live shortcut is only VALID when the crisis is
-        // `bOldest`: the merge must collapse the ENTIRE index into a single
-        // segment, so no tombstone needs to survive to shadow a posting in a
-        // segment that is NOT part of the merge. That holds iff level 0 is the
-        // only populated level as it reaches the threshold (every higher level
-        // empty) — then merging level 0 yields the sole segment at the last level.
-        // If any higher level already holds a segment, a delete-crisis would be
-        // `bOldest=false` (tombstones must be carried, not dropped): bail to the
-        // bulk rebuild, which is always correct.
-        let level0_at_crisis = structure
-            .levels
-            .first()
-            .is_some_and(|l| l.segs.len() >= CRISIS);
-        let higher_populated = structure.levels.iter().skip(1).any(|l| !l.segs.is_empty());
-        if level0_at_crisis && higher_populated {
-            return Ok(false);
-        }
-        let did_crisis =
-            self.fts5_crisis_merge(name, &mut structure, ncols, tok, &prefixes, &docs)?;
-
-        // Global averages over the WHOLE live corpus (nRow + per-column totals).
-        let (_all_terms, col_totals, _all_sizes) = self.fts5_tokenize_docs(&docs, ncols, tok);
 
         let q = |s: &str| sql::print::ident(s);
         let pv = |vals: Vec<Value>| Params {
@@ -34371,6 +34659,42 @@ impl Connection {
             named: Vec::new(),
         };
         let data_t = q(&format!("{name}_data"));
+        let idx_t = q(&format!("{name}_idx"));
+
+        // Persist the appended tombstone/mixed block, then run automerge +
+        // crisismerge as real `%_data` merges. The tombstone-aware merge reads every
+        // input posting (delete markers included) and reproduces sqlite's
+        // key-annihilation exactly: a tombstone is annihilated only when the output
+        // is the OLDEST segment (`bOldest`), otherwise it is preserved to shadow the
+        // un-merged higher levels — correct regardless of `bOldest`.
+        for (id, block_bytes) in &block.data {
+            self.execute_params(
+                &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
+                &pv(alloc::vec![
+                    Value::Integer(*id),
+                    Value::Blob(block_bytes.clone())
+                ]),
+            )?;
+        }
+        for IdxRow { segid, term, pgno } in &block.idx {
+            self.execute_params(
+                &format!("INSERT INTO {idx_t} VALUES(?1,?2,?3)"),
+                &pv(alloc::vec![
+                    Value::Integer(*segid),
+                    Value::Blob(term.clone()),
+                    Value::Integer(*pgno)
+                ]),
+            )?;
+        }
+        if !self.fts5_automerge(name, &mut structure, block.n_leaves, ncols, tok, &prefixes)? {
+            return Ok(false);
+        }
+        if !self.fts5_crisismerge(name, &mut structure, ncols, tok, &prefixes)? {
+            return Ok(false);
+        }
+
+        // Global averages over the WHOLE live corpus (nRow + per-column totals).
+        let (_all_terms, col_totals, _all_sizes) = self.fts5_tokenize_docs(&docs, ncols, tok);
 
         // Averages (id 1). Unlike a fresh empty index (which carries an EMPTY
         // averages record), a table deleted down to zero rows via tombstones keeps
@@ -34393,31 +34717,8 @@ impl Connection {
                 Value::Blob(structure.encode())
             ]),
         )?;
-        // Append the new segment's leaf `%_data` rows and `%_idx` rows — unless a
-        // crisis merge fired, in which case it already rewrote every segment row
-        // and this tombstone block was consumed by (annihilated in) the merge.
-        if !did_crisis {
-            for (id, block_bytes) in &block.data {
-                self.execute_params(
-                    &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
-                    &pv(alloc::vec![
-                        Value::Integer(*id),
-                        Value::Blob(block_bytes.clone())
-                    ]),
-                )?;
-            }
-            let idx_t = q(&format!("{name}_idx"));
-            for IdxRow { segid, term, pgno } in &block.idx {
-                self.execute_params(
-                    &format!("INSERT INTO {idx_t} VALUES(?1,?2,?3)"),
-                    &pv(alloc::vec![
-                        Value::Integer(*segid),
-                        Value::Blob(term.clone()),
-                        Value::Integer(*pgno)
-                    ]),
-                )?;
-            }
-        }
+        // The appended block was already persisted before the merges (which may
+        // have rewritten it), so there is nothing more to write here.
         // `_docsize`: delete each mutated rowid's old row, then (for UPDATEs) write
         // the new one. A pure delete leaves the rowid absent.
         let docsize_t = q(&format!("{name}_docsize"));
