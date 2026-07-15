@@ -127,3 +127,47 @@ fn plain_multi_statement_batches_over_stdin_still_split() {
         "1,2,3"
     );
 }
+
+#[test]
+fn comments_do_not_break_statement_splitting() {
+    // The statement splitter must skip `--` and `/* */` comments: a comment
+    // before a transaction `BEGIN` (or containing a `;`, or an apostrophe) used
+    // to make the splitter treat `BEGIN` as a trigger body — swallowing the
+    // transaction and raising `expected a single statement`.
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "comment before BEGIN",
+            "CREATE TABLE t(a);\n-- a comment\nBEGIN;\nINSERT INTO t VALUES(1);\nCOMMIT;\n",
+            "1",
+        ),
+        (
+            "apostrophe in line comment",
+            "CREATE TABLE t(a);\n-- don't break on this\nINSERT INTO t VALUES(2);\n",
+            "2",
+        ),
+        (
+            "semicolon in block comment",
+            "CREATE TABLE t(a);\n/* has ; inside */\nINSERT INTO t VALUES(3);\n",
+            "3",
+        ),
+        (
+            "block comment before BEGIN",
+            "CREATE TABLE t(a);\n/* note */ BEGIN;\nINSERT INTO t VALUES(4);\nCOMMIT;\n",
+            "4",
+        ),
+    ];
+    for (name, script, expected) in cases {
+        assert_eq!(
+            &stdin_then_query(g, script, "SELECT group_concat(a) FROM t"),
+            expected,
+            "case: {name}"
+        );
+    }
+
+    // A comment inside a trigger body must not end the body early.
+    let trig = "CREATE TABLE t(a);\nCREATE TABLE log(x);\n\
+        CREATE TRIGGER tr AFTER INSERT ON t BEGIN\n  -- record it\n  INSERT INTO log VALUES(NEW.a);\nEND;\n\
+        INSERT INTO t VALUES(7);\n";
+    assert_eq!(stdin_then_query(g, trig, "SELECT x FROM log"), "7");
+}

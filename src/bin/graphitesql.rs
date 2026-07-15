@@ -2988,20 +2988,21 @@ fn split_statements(sql: &str) -> Vec<String> {
     let mut in_str = false;
     // Block nesting for `BEGIN … END` (trigger bodies) and `CASE … END`: a `;`
     // inside one does not end the statement. A *transaction* `BEGIN`/`END` is a
-    // standalone statement (the first word, or with `depth == 0`), so it does not
-    // open/close a block — only a mid-statement `BEGIN`/`CASE` does.
+    // standalone statement, so it does not open/close a block — only a
+    // mid-statement `BEGIN`/`CASE` (one preceded by real SQL content in the same
+    // statement) does. `--`/`/* */` comments carry no content and are copied
+    // through untokenized, so a `-- note` (or a `;`/`'` inside it) before a
+    // `BEGIN` transaction does not confuse the split.
     let mut depth: u32 = 0;
     let mut word = String::new();
+    // Real (non-comment, non-whitespace) content in the current statement before
+    // the current word — decides whether a `BEGIN` opens a trigger body.
+    let mut has_content = false;
     let mut chars = sql.chars().peekable();
-    let flush_word = |word: &mut String, cur: &str, depth: &mut u32| {
+    let flush_word = |word: &mut String, has_content: bool, depth: &mut u32| {
         match word.to_ascii_uppercase().as_str() {
-            // A mid-statement BEGIN (content precedes it, e.g. `CREATE TRIGGER …
-            // BEGIN`) opens a trigger body; a *leading* BEGIN is a transaction
-            // statement. `cur` already ends with this word, so look at what comes
-            // before it.
             "BEGIN" => {
-                let before = &cur[..cur.len().saturating_sub(word.len())];
-                if !before.trim().is_empty() {
+                if has_content {
                     *depth += 1;
                 }
             }
@@ -3023,18 +3024,52 @@ fn split_statements(sql: &str) -> Vec<String> {
             }
             continue;
         }
+        // A `--` line comment or `/* */` block comment carries no SQL: copy it
+        // verbatim (byte-preservation) but tokenize nothing inside it.
+        if c == '-' && chars.peek() == Some(&'-') {
+            if !word.is_empty() {
+                flush_word(&mut word, has_content, &mut depth);
+                has_content = true;
+            }
+            cur.push(c);
+            while let Some(&n) = chars.peek() {
+                cur.push(chars.next().unwrap());
+                if n == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == '/' && chars.peek() == Some(&'*') {
+            if !word.is_empty() {
+                flush_word(&mut word, has_content, &mut depth);
+                has_content = true;
+            }
+            cur.push(c);
+            cur.push(chars.next().unwrap()); // the `*`
+            while let Some(cc) = chars.next() {
+                cur.push(cc);
+                if cc == '*' && chars.peek() == Some(&'/') {
+                    cur.push(chars.next().unwrap());
+                    break;
+                }
+            }
+            continue;
+        }
         if c.is_alphabetic() || c == '_' {
             word.push(c);
             cur.push(c);
             continue;
         }
-        // Word boundary: classify the keyword just read.
+        // Word boundary: classify the keyword just read; it then counts as content.
         if !word.is_empty() {
-            flush_word(&mut word, &cur, &mut depth);
+            flush_word(&mut word, has_content, &mut depth);
+            has_content = true;
         }
         match c {
             '\'' => {
                 in_str = true;
+                has_content = true;
                 cur.push(c);
             }
             ';' if depth == 0 => {
@@ -3047,12 +3082,17 @@ fn split_statements(sql: &str) -> Vec<String> {
                     cur.push(';');
                 }
                 out.push(std::mem::take(&mut cur));
+                has_content = false; // a new statement starts
             }
-            _ => cur.push(c),
+            c if c.is_whitespace() => cur.push(c),
+            _ => {
+                has_content = true;
+                cur.push(c);
+            }
         }
     }
     if !word.is_empty() {
-        flush_word(&mut word, &cur, &mut depth);
+        flush_word(&mut word, has_content, &mut depth);
     }
     if !cur.trim().is_empty() {
         out.push(cur);
@@ -3076,16 +3116,17 @@ fn input_is_complete(buffer: &str) -> bool {
     }
     let mut in_str = false;
     let mut depth: u32 = 0;
-    // `cur` is the current statement's text since the last depth-0 `;`, used only
-    // to tell a leading `BEGIN` (transaction) from a mid-statement one (trigger).
-    let mut cur = String::new();
+    // Real (non-comment, non-whitespace) content in the current statement before
+    // the current word — decides whether a `BEGIN` opens a trigger body. Reset at
+    // each depth-0 `;`. Comments are skipped so a `-- note` before a transaction
+    // `BEGIN` (or a `'`/`;` inside that comment) does not mislead the classifier.
+    let mut has_content = false;
     let mut word = String::new();
     let mut chars = buffer.chars().peekable();
-    let classify = |word: &mut String, cur: &str, depth: &mut u32| {
+    let classify = |word: &mut String, has_content: bool, depth: &mut u32| {
         match word.to_ascii_uppercase().as_str() {
             "BEGIN" => {
-                let before = &cur[..cur.len().saturating_sub(word.len())];
-                if !before.trim().is_empty() {
+                if has_content {
                     *depth += 1;
                 }
             }
@@ -3097,35 +3138,62 @@ fn input_is_complete(buffer: &str) -> bool {
     };
     while let Some(c) = chars.next() {
         if in_str {
-            cur.push(c);
             if c == '\'' {
                 if chars.peek() == Some(&'\'') {
-                    cur.push(chars.next().unwrap());
+                    chars.next();
                 } else {
                     in_str = false;
                 }
             }
             continue;
         }
+        // Skip `--` line and `/* */` block comments (no tokens inside them).
+        if c == '-' && chars.peek() == Some(&'-') {
+            if !word.is_empty() {
+                classify(&mut word, has_content, &mut depth);
+                has_content = true;
+            }
+            for n in chars.by_ref() {
+                if n == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == '/' && chars.peek() == Some(&'*') {
+            if !word.is_empty() {
+                classify(&mut word, has_content, &mut depth);
+                has_content = true;
+            }
+            chars.next(); // the `*`
+            while let Some(cc) = chars.next() {
+                if cc == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    break;
+                }
+            }
+            continue;
+        }
         if c.is_alphabetic() || c == '_' {
             word.push(c);
-            cur.push(c);
             continue;
         }
         if !word.is_empty() {
-            classify(&mut word, &cur, &mut depth);
+            classify(&mut word, has_content, &mut depth);
+            has_content = true;
         }
         match c {
             '\'' => {
                 in_str = true;
-                cur.push(c);
+                has_content = true;
             }
-            ';' if depth == 0 => cur.clear(),
-            _ => cur.push(c),
+            ';' if depth == 0 => has_content = false,
+            c if c.is_whitespace() => {}
+            _ => has_content = true,
         }
     }
     if !word.is_empty() {
-        classify(&mut word, &cur, &mut depth);
+        classify(&mut word, has_content, &mut depth);
     }
     // The buffer ends with `;` (checked above); it terminates a statement only
     // when no trigger/CASE block is still open.
