@@ -258,8 +258,9 @@ impl Shell {
                 group_start_line = input_line;
             }
             buffer.push_str(&line);
-            // Execute once the accumulated input contains a complete statement.
-            if buffer.trim_end().ends_with(';') {
+            // Execute once the accumulated input forms a complete statement — a `;`
+            // that is not inside a trigger `BEGIN … END` / `CASE … END` block.
+            if input_is_complete(&buffer) {
                 let sql = std::mem::take(&mut buffer);
                 self.run_group(conn, &sql, group_start_line);
             }
@@ -311,7 +312,7 @@ impl Shell {
                 group_start_line = input_line;
             }
             buffer.push_str(&line);
-            if buffer.trim_end().ends_with(';') {
+            if input_is_complete(&buffer) {
                 let sql = std::mem::take(&mut buffer);
                 self.run_group(conn, &sql, group_start_line);
             }
@@ -3043,4 +3044,76 @@ fn split_statements(sql: &str) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// Whether the accumulated line-reader `buffer` ends with a *complete* statement:
+/// a `;` terminator that is not inside a `BEGIN … END` trigger body or `CASE …
+/// END` block. The interactive/piped line reader uses this to decide when to hand
+/// the buffer to the engine, so a multi-line `CREATE TRIGGER … BEGIN INSERT …;
+/// … END;` is not cut at the first `;` in its body (which produced an
+/// `incomplete input` error when loading a schema via `graphitesql db < file`).
+///
+/// Mirrors the block-nesting rules of `split_statements` — they must stay in
+/// sync: a *leading* `BEGIN`/`END` is a transaction statement (depth unchanged),
+/// only a mid-statement `BEGIN`/`CASE` opens a block.
+fn input_is_complete(buffer: &str) -> bool {
+    if !buffer.trim_end().ends_with(';') {
+        return false;
+    }
+    let mut in_str = false;
+    let mut depth: u32 = 0;
+    // `cur` is the current statement's text since the last depth-0 `;`, used only
+    // to tell a leading `BEGIN` (transaction) from a mid-statement one (trigger).
+    let mut cur = String::new();
+    let mut word = String::new();
+    let mut chars = buffer.chars().peekable();
+    let classify = |word: &mut String, cur: &str, depth: &mut u32| {
+        match word.to_ascii_uppercase().as_str() {
+            "BEGIN" => {
+                let before = &cur[..cur.len().saturating_sub(word.len())];
+                if !before.trim().is_empty() {
+                    *depth += 1;
+                }
+            }
+            "CASE" => *depth += 1,
+            "END" => *depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        word.clear();
+    };
+    while let Some(c) = chars.next() {
+        if in_str {
+            cur.push(c);
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    cur.push(chars.next().unwrap());
+                } else {
+                    in_str = false;
+                }
+            }
+            continue;
+        }
+        if c.is_alphabetic() || c == '_' {
+            word.push(c);
+            cur.push(c);
+            continue;
+        }
+        if !word.is_empty() {
+            classify(&mut word, &cur, &mut depth);
+        }
+        match c {
+            '\'' => {
+                in_str = true;
+                cur.push(c);
+            }
+            ';' if depth == 0 => cur.clear(),
+            _ => cur.push(c),
+        }
+    }
+    if !word.is_empty() {
+        classify(&mut word, &cur, &mut depth);
+    }
+    // The buffer ends with `;` (checked above); it terminates a statement only
+    // when no trigger/CASE block is still open.
+    depth == 0
 }
