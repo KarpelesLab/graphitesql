@@ -15,10 +15,12 @@
 //!   * graphite's own `PRAGMA integrity_check` returns `ok`,
 //!   * `MATCH` returns the same rows (respecting each mode's query limits).
 //!
-//! A delete on a `detail=none` table is checked for correctness (valid file +
-//! matching MATCH), not byte-parity — graphite rebuilds rather than reproducing
-//! sqlite's multi-segment tombstone history. Skipped when `sqlite3` w/ FTS5 is not
-//! on PATH.
+//! A DELETE/UPDATE on a `detail=none`/`detail=column` table appends a
+//! detail-aware incremental TOMBSTONE (delete-marker) segment — byte-identical to
+//! sqlite's `fts5FlushOneHash` delete path — so the delete/update shapes are
+//! asserted for byte-parity as well (delete-one/many/all, update-one/many,
+//! delete-then-reinsert, multi-column, second-segment, and post-crisis-merge).
+//! Skipped when `sqlite3` w/ FTS5 is not on PATH.
 
 #![cfg(feature = "std")]
 #![cfg(feature = "fts5")]
@@ -259,9 +261,9 @@ fn detail_none_crisis_merge_byte_identical() {
 
 #[test]
 fn detail_none_delete_is_valid_and_correct() {
-    // A delete on a detail=none table: graphite falls back to a full rebuild (a
-    // valid, integrity-clean detail=none segment) rather than reproducing sqlite's
-    // tombstone history byte-for-byte. Assert the file is valid and MATCH is right.
+    // A delete on a detail=none table now appends a byte-identical tombstone
+    // segment (see the byte-parity tests below); this one keeps the historical
+    // validity+correctness assertions.
     if !have_fts5_sqlite() {
         return;
     }
@@ -290,6 +292,190 @@ fn detail_none_delete_is_valid_and_correct() {
             "MATCH {q:?} after delete"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// detail=none / detail=column DELETE + UPDATE byte-parity
+//
+// A DELETE/UPDATE on a detail=none/column table appends an incremental
+// detail-aware TOMBSTONE (delete-marker) segment — byte-identical to sqlite's
+// `fts5FlushOneHash` delete path — rather than rebuilding the index. The
+// delete-marker encoding is detail-aware: detail=none writes a positionless
+// `0x00` delete marker (size2=1 collapsed), detail=column writes the
+// column-marker poslist with the delete flag.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn detail_none_delete_one_byte_identical() {
+    if !have_fts5_sqlite() {
+        return;
+    }
+    assert_identical(
+        "none-del-one",
+        "CREATE VIRTUAL TABLE f USING fts5(a, detail='none')",
+        &[
+            String::from(
+                "INSERT INTO f(rowid,a) VALUES(1,'hello world'),(2,'foo hello'),(3,'world foo')",
+            ),
+            String::from("DELETE FROM f WHERE rowid=2"),
+        ],
+        &["hello", "foo", "world"],
+    );
+}
+
+#[test]
+fn detail_none_delete_many_byte_identical() {
+    if !have_fts5_sqlite() {
+        return;
+    }
+    assert_identical(
+        "none-del-many",
+        "CREATE VIRTUAL TABLE f USING fts5(a, detail='none')",
+        &[
+            String::from(
+                "INSERT INTO f(rowid,a) VALUES(1,'hello world'),(2,'foo hello'),(3,'world foo'),(4,'a b c')",
+            ),
+            String::from("DELETE FROM f WHERE rowid IN (2,4)"),
+        ],
+        &["hello", "foo", "world", "a"],
+    );
+}
+
+#[test]
+fn detail_none_update_one_byte_identical() {
+    if !have_fts5_sqlite() {
+        return;
+    }
+    assert_identical(
+        "none-upd-one",
+        "CREATE VIRTUAL TABLE f USING fts5(a, detail='none')",
+        &[
+            String::from("INSERT INTO f(rowid,a) VALUES(1,'hello world'),(2,'foo bar')"),
+            String::from("UPDATE f SET a='changed text' WHERE rowid=1"),
+        ],
+        &["hello", "changed", "text", "foo"],
+    );
+}
+
+#[test]
+fn detail_none_update_many_byte_identical() {
+    if !have_fts5_sqlite() {
+        return;
+    }
+    assert_identical(
+        "none-upd-many",
+        "CREATE VIRTUAL TABLE f USING fts5(a, detail='none')",
+        &[
+            String::from(
+                "INSERT INTO f(rowid,a) VALUES(1,'hello world'),(2,'foo bar'),(3,'baz qux')",
+            ),
+            String::from("UPDATE f SET a='new one' WHERE rowid=1"),
+            String::from("UPDATE f SET a='new three' WHERE rowid=3"),
+        ],
+        &["hello", "new", "one", "three", "foo"],
+    );
+}
+
+#[test]
+fn detail_none_delete_then_reinsert_byte_identical() {
+    if !have_fts5_sqlite() {
+        return;
+    }
+    assert_identical(
+        "none-del-reins",
+        "CREATE VIRTUAL TABLE f USING fts5(a, detail='none')",
+        &[
+            String::from("INSERT INTO f(rowid,a) VALUES(1,'hello world'),(2,'foo hello')"),
+            String::from("DELETE FROM f WHERE rowid=2"),
+            String::from("INSERT INTO f(rowid,a) VALUES(2,'new text')"),
+        ],
+        &["hello", "new", "foo", "world"],
+    );
+}
+
+#[test]
+fn detail_none_delete_all_byte_identical() {
+    if !have_fts5_sqlite() {
+        return;
+    }
+    assert_identical(
+        "none-del-all",
+        "CREATE VIRTUAL TABLE f USING fts5(a, detail='none')",
+        &[
+            String::from("INSERT INTO f(rowid,a) VALUES(1,'hello world'),(2,'foo hello')"),
+            String::from("DELETE FROM f"),
+        ],
+        &["hello", "foo"],
+    );
+}
+
+#[test]
+fn detail_none_delete_crosses_second_segment_byte_identical() {
+    if !have_fts5_sqlite() {
+        return;
+    }
+    // Three autocommit inserts → three level-0 segments; deleting a middle rowid
+    // appends a tombstone segment (the term `shared` spans all three).
+    assert_identical(
+        "none-multiseg-del",
+        "CREATE VIRTUAL TABLE f USING fts5(a, detail='none')",
+        &[
+            String::from("INSERT INTO f(rowid,a) VALUES(1,'word1 shared alpha')"),
+            String::from("INSERT INTO f(rowid,a) VALUES(2,'word2 shared alpha')"),
+            String::from("INSERT INTO f(rowid,a) VALUES(3,'word3 shared alpha')"),
+            String::from("DELETE FROM f WHERE rowid=2"),
+        ],
+        &["shared", "alpha", "word2", "word3"],
+    );
+}
+
+#[test]
+fn detail_none_crisis_then_delete_byte_identical() {
+    if !have_fts5_sqlite() {
+        return;
+    }
+    // 20 level-0 segments → a crisis merge, then a delete/update over the merged
+    // structure — exercises the tombstone-preserving merge readers.
+    let mut inserts: Vec<String> = (1..=20)
+        .map(|i| {
+            format!(
+                "INSERT INTO f(rowid,a) VALUES({i},'word{i} shared beta gamma{}')",
+                i % 5
+            )
+        })
+        .collect();
+    inserts.push(String::from("DELETE FROM f WHERE rowid IN (3,7,15,19)"));
+    inserts.push(String::from(
+        "UPDATE f SET a='replaced totally new' WHERE rowid=10",
+    ));
+    assert_identical(
+        "none-crisis-del",
+        "CREATE VIRTUAL TABLE f USING fts5(a, detail='none')",
+        &inserts,
+        &["shared", "gamma0", "replaced", "word10", "word3"],
+    );
+}
+
+#[test]
+fn detail_none_multi_column_delete_byte_identical() {
+    if !have_fts5_sqlite() {
+        return;
+    }
+    assert_identical(
+        "none-multicol-del",
+        "CREATE VIRTUAL TABLE f USING fts5(a, b, c, detail='none')",
+        &[
+            String::from(
+                "INSERT INTO f(rowid,a,b,c) VALUES\
+                 (1,'hello world','foo bar','x y z'),\
+                 (2,'a b c','d e','f g'),\
+                 (3,'quick brown','fox jumps','over lazy')",
+            ),
+            String::from("DELETE FROM f WHERE rowid=2"),
+            String::from("UPDATE f SET b='new middle' WHERE rowid=1"),
+        ],
+        &["hello", "fox", "z", "new", "middle"],
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -399,4 +585,159 @@ fn detail_column_delete_is_valid_and_correct() {
             "MATCH {q:?} after delete"
         );
     }
+}
+
+#[test]
+fn detail_column_delete_one_byte_identical() {
+    if !have_fts5_sqlite() {
+        return;
+    }
+    assert_identical(
+        "col-del-one",
+        "CREATE VIRTUAL TABLE f USING fts5(a, b, detail='column')",
+        &[
+            String::from(
+                "INSERT INTO f(rowid,a,b) VALUES(1,'hello','world'),(2,'foo','hello world'),(3,'bar','baz')",
+            ),
+            String::from("DELETE FROM f WHERE rowid=2"),
+        ],
+        &["hello", "world", "bar", "b:hello", "a:foo"],
+    );
+}
+
+#[test]
+fn detail_column_update_one_byte_identical() {
+    if !have_fts5_sqlite() {
+        return;
+    }
+    assert_identical(
+        "col-upd-one",
+        "CREATE VIRTUAL TABLE f USING fts5(a, b, detail='column')",
+        &[
+            String::from(
+                "INSERT INTO f(rowid,a,b) VALUES(1,'hello world','x y'),(2,'foo bar','p q')",
+            ),
+            String::from("UPDATE f SET a='changed text' WHERE rowid=1"),
+        ],
+        &["hello", "changed", "a:changed", "b:x", "foo"],
+    );
+}
+
+#[test]
+fn detail_column_update_both_columns_byte_identical() {
+    if !have_fts5_sqlite() {
+        return;
+    }
+    assert_identical(
+        "col-upd-both",
+        "CREATE VIRTUAL TABLE f USING fts5(a, b, detail='column')",
+        &[
+            String::from(
+                "INSERT INTO f(rowid,a,b) VALUES(1,'hello world','x y'),(2,'foo bar','p q')",
+            ),
+            String::from("UPDATE f SET a='new one', b='new two' WHERE rowid=1"),
+        ],
+        &["hello", "new", "a:new", "b:new", "a:one", "b:two"],
+    );
+}
+
+#[test]
+fn detail_column_delete_many_byte_identical() {
+    if !have_fts5_sqlite() {
+        return;
+    }
+    assert_identical(
+        "col-del-many",
+        "CREATE VIRTUAL TABLE f USING fts5(a, b, detail='column')",
+        &[
+            String::from(
+                "INSERT INTO f(rowid,a,b) VALUES(1,'hello','world'),(2,'foo','hello'),(3,'world','foo'),(4,'a','b')",
+            ),
+            String::from("DELETE FROM f WHERE rowid IN (2,4)"),
+        ],
+        &["hello", "world", "foo", "a:hello", "b:foo"],
+    );
+}
+
+#[test]
+fn detail_column_delete_then_reinsert_byte_identical() {
+    if !have_fts5_sqlite() {
+        return;
+    }
+    assert_identical(
+        "col-del-reins",
+        "CREATE VIRTUAL TABLE f USING fts5(a, b, detail='column')",
+        &[
+            String::from("INSERT INTO f(rowid,a,b) VALUES(1,'hello','world'),(2,'foo','baz')"),
+            String::from("DELETE FROM f WHERE rowid=2"),
+            String::from("INSERT INTO f(rowid,a,b) VALUES(2,'new','text')"),
+        ],
+        &["hello", "new", "b:text", "a:new", "world"],
+    );
+}
+
+#[test]
+fn detail_column_delete_all_byte_identical() {
+    if !have_fts5_sqlite() {
+        return;
+    }
+    assert_identical(
+        "col-del-all",
+        "CREATE VIRTUAL TABLE f USING fts5(a, b, detail='column')",
+        &[
+            String::from("INSERT INTO f(rowid,a,b) VALUES(1,'hello','world'),(2,'foo','baz')"),
+            String::from("DELETE FROM f"),
+        ],
+        &["hello", "world", "foo"],
+    );
+}
+
+#[test]
+fn detail_column_delete_crosses_second_segment_byte_identical() {
+    if !have_fts5_sqlite() {
+        return;
+    }
+    assert_identical(
+        "col-multiseg-del",
+        "CREATE VIRTUAL TABLE f USING fts5(a, b, detail='column')",
+        &[
+            String::from("INSERT INTO f(rowid,a,b) VALUES(1,'word1 shared','common tail1')"),
+            String::from("INSERT INTO f(rowid,a,b) VALUES(2,'word2 shared','common tail2')"),
+            String::from("INSERT INTO f(rowid,a,b) VALUES(3,'word3 shared','common tail3')"),
+            String::from("DELETE FROM f WHERE rowid=2"),
+        ],
+        &["shared", "common", "word3", "a:shared", "b:common"],
+    );
+}
+
+#[test]
+fn detail_column_crisis_then_delete_update_byte_identical() {
+    if !have_fts5_sqlite() {
+        return;
+    }
+    let mut inserts: Vec<String> = (1..=20)
+        .map(|i| {
+            format!(
+                "INSERT INTO f(rowid,a,b) VALUES({i},'word{i} shared','common g{}')",
+                i % 4
+            )
+        })
+        .collect();
+    inserts.push(String::from("DELETE FROM f WHERE rowid IN (3,7,15,19)"));
+    inserts.push(String::from(
+        "UPDATE f SET a='mutated word', b='other col' WHERE rowid=10",
+    ));
+    assert_identical(
+        "col-crisis-del",
+        "CREATE VIRTUAL TABLE f USING fts5(a, b, detail='column')",
+        &inserts,
+        &[
+            "shared",
+            "common",
+            "mutated",
+            "a:mutated",
+            "b:other",
+            "word3",
+        ],
+    );
 }

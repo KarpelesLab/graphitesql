@@ -35653,13 +35653,12 @@ impl Connection {
         // the bulk rebuild below.
         let prefixes = crate::vtab::fts5_prefix_lengths(&arg_refs);
         let tok = crate::vtab::fts5_tok_config(&arg_refs);
-        // detail=none/columns deletes produce doclist tombstones whose merge
-        // annihilation this incremental slice does not reproduce byte-for-byte;
-        // fall back to the bulk rebuild (a valid, integrity-clean detail-aware
-        // segment) so the index is always correct.
-        if tok.detail != crate::fts5_index::Fts5Detail::Full {
-            return Ok(false);
-        }
+        // detail=none/column tables append a DETAIL-AWARE tombstone/mixed segment
+        // too: `poslist`/`build_segment_block` and the tombstone-preserving merge
+        // readers all take `tok.detail`, so a delete marker is encoded per mode
+        // (detail=none → a positionless `0x00`; detail=column → the column-marker
+        // poslist with the delete flag) exactly like sqlite's `fts5FlushOneHash`
+        // delete path. No mode is special-cased here.
 
         // The current live corpus (post-mutation content) drives the averages and
         // the docsize set; the segment we append is derived purely from `changes`.
