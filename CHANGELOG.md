@@ -7,6 +7,292 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/KarpelesLab/graphitesql/compare/v0.1.0...v0.2.0) - 2026-07-15
+
+### Added
+
+- *(fts5)* byte-identical spanning (doclist-index) segments from incremental merge
+- *(fts5)* byte-identical savepoint and prefix-index writes inside transactions
+- *(fts5)* integrity_check detects a malformed inverted index
+- *(fts5)* byte-identical delete/update and out-of-order writes inside transactions
+- *(fts5)* incremental writes inside explicit transactions
+- *(fts5)* implement automerge incremental merge scheduling
+- *(fts5)* incremental prefix-index writes (D2e-3 prefix half)
+- *(vdbe)* run a join DISTINCT with explicit COLLATE on the VDBE (B7b)
+- *(vdbe)* run a plain-scan DISTINCT with explicit COLLATE on the VDBE (B7b)
+- *(vdbe)* run a constant GROUP BY aggregate query on the VDBE (B7b)
+- *(vdbe)* run a bare-aggregate HAVING on the VDBE (B7b)
+- *(vdbe)* run main.-qualified sources on the VDBE (B7b)
+- *(vdbe)* run a NOT INDEXED single-table SELECT on the VDBE (B5b-2)
+- *(vdbe)* live-scan WITHOUT ROWID tables on the VDBE (B5b-2)
+- *(value)* non-UTF-8 text — || / CAST(blob AS TEXT) yield byte-backed text
+- *(vdbe)* run an explicit-COLLATE aggregate argument on the VDBE
+- *(vdbe)* run a GROUP BY on an explicit-COLLATE key on the VDBE
+- *(vdbe)* collation-aware bare-aggregate fold (min/max, count DISTINCT)
+- *(vdbe)* collation-aware aggregate fold (min/max, count DISTINCT) in a grouped query
+- *(vdbe)* run a collation-aware GROUP BY on the VDBE
+- *(vdbe)* extend collation-aware DISTINCT to the nested-loop join path
+- *(vdbe)* run a collation-aware single-table DISTINCT on the VDBE
+- *(cli)* [**breaking**] exact caret for a repeated function-name arity/unknown error
+- *(planner)* skip sort for a full UNIQUE-index equality (matches one row)
+- *(planner)* skip sort for inner-rowid ORDER BY over a single-col join-seek index
+- *(planner)* credit inner-rowid ORDER BY when the inner has an unrelated index
+- *(capi)* sqlite3_error_offset (D7)
+- *(cli)* exact caret for a repeated syntax token via a parser byte offset
+- *(planner)* skip sort for an inner-rowid ORDER BY over a 1-row-driver join
+- *(planner)* skip the sort for an all-constant ORDER BY over a 1-row-driver join
+- *(planner)* drop constant ORDER BY terms on a plain scan too (B9h)
+- *(planner)* drop equality-constant leading ORDER BY terms (B9h)
+- *(planner)* a rowid=const driver seek beats the index-inner swap (B1b)
+- *(planner)* seek a join driver by a single-column secondary index (B1b)
+- *(planner)* seek a join driver by its own rowid equality (B1b)
+- *(vdbe)* run the N-table plain-projection join reorder on the VDBE (B1b)
+- *(vdbe)* run order-independent aggregate joins under a cost swap (B1b)
+- *(vdbe)* run the single-column-unique index-inner swap on the VDBE (B1b)
+- *(vdbe)* run the two-table rowid-inner swap on the VDBE (B1b)
+- *(cli)* window long error lines like the sqlite shell
+- *(cli)* sqlite-style "near line N" errors in script/piped mode
+- *(tvf)* drive a bare generate_series from its WHERE clause
+- *(planner)* walk the ORDER-BY index for a single open-ended range (B9h)
+- *(planner)* credit a collation seek's ORDER BY (completes B9j)
+- *(planner)* collation-aware range index selection (B9j WHERE range slice)
+- *(planner)* collation-aware equality index selection (B9j WHERE slice)
+- *(planner)* match ORDER BY term collation to the index in order_index_scan (B9j)
+- *(planner)* walk the ORDER-BY index to avoid a sort when WHERE is not seekable (B9h)
+- *(vdbe)* seek-drive a two-table FULL join via a compound rewrite (B1c)
+- *(vdbe)* seek-drive a SELECT * two-table RIGHT join too (B1c)
+- *(vdbe)* seek-drive a two-table RIGHT join via a LEFT-join rewrite (B1c)
+- statement-level authorizer (sqlite3_set_authorizer)
+- online backup API (sqlite3_backup_*) via Connection::restore_from
+- commit and rollback hooks (sqlite3_commit_hook / sqlite3_rollback_hook)
+- *(vdbe)* run json_group_object / jsonb_group_object on the VDBE aggregate path
+- *(vdbe)* run json_group_array / jsonb_group_array on the VDBE aggregate path
+- *(vdbe)* run a group-key-correlated subquery in HAVING / ORDER BY (B5c-2)
+- *(vdbe)* run a group-key-correlated subquery over a GROUP BY join (B5c-2)
+- *(vdbe)* run a correlated IN (SELECT) on the VDBE (B5c-2)
+- *(vdbe)* run correlated subqueries over materialized single sources (B5c-2)
+- *(vdbe)* run a group-key-correlated subquery in a GROUP BY projection (B5c-2)
+- *(vdbe)* correlated subqueries over outer/NATURAL/USING joins (B5c-2)
+- *(vdbe)* correlated subqueries over inner joins on the VDBE (B5c-2)
+- *(vdbe)* correlated subqueries on the VDBE with compile-time validation (B5c-2)
+- *(vdbe)* fold a constant-function LIMIT/OFFSET onto the VDBE (B-limit-fold)
+- *(capi)* sqlite3_complete + sqlite3_stmt_readonly
+- *(capi)* incremental BLOB I/O (sqlite3_blob_open/read/write/reopen/close)
+- *(capi)* sqlite3_update_hook
+- *(exec)* data-change notification hook (register_update_hook)
+- *(capi)* UTF-16 entry points (open16/prepare16_v2/bind_text16/column_text16/errmsg16)
+- *(capi)* sqlite3_create_window_function
+- *(exec)* allow a user-registered aggregate as a window function
+- *(capi)* sqlite3_create_collation for custom collating sequences
+- *(collation)* user-registered custom collating sequences
+- *(capi)* prepare_v3, autocommit/total_changes, sql/db_handle, errstr (D7)
+- *(capi)* aggregate user-defined functions via xStep/xFinal (D7)
+- *(capi)* scalar user-defined functions via sqlite3_create_function (D7)
+- *(capi)* named/numbered bind parameters + data_count (D7)
+- *(capi)* route INSERT/UPDATE/DELETE … RETURNING through the row path (D7)
+- *(capi)* libsqlite3-compatible C ABI in the graphitesql-capi sibling crate (D7)
+- *(wasm)* browser bindings + OPFS VFS in the graphitesql-wasm sibling crate (D6)
+- *(cli)* render one-shot errors in the sqlite3 shell's format (CLI-2)
+- *(join)* support lateral (correlated) table-valued functions
+- [**breaking**] honour the schema qualifier on introspection PRAGMAs
+- [**breaking**] table_info reproduces a column DEFAULT's verbatim source text
+- *(vfs)* autocommit reads take a transient cross-process shared lock (C9b-3)
+- *(alter)* reject a RENAME COLUMN that breaks a dependent trigger body
+- *(alter)* reject and roll back a RENAME COLUMN that breaks a dependent view
+- span-precise RENAME COLUMN rewrite closes the alias-collision + source-named-old gaps
+- *(cli)* .echo on echoes dot-command input lines too (CLI-3)
+- *(cli)* exit non-zero on any error in a non-interactive batch (CLI-2 part)
+- propagate RENAME COLUMN through derived-table (FROM subquery) sources (A-alter-1)
+- *(cli)* .bail on — stop the batch at the first error (CLI-1)
+- OS-level cross-process file locks in the std VFS (C9b-1, C9b-2)
+- resolve CTE-column provenance so a CTE consumed in a compound arm rewrites
+- propagate RENAME COLUMN through a compound view's ORDER BY
+- propagate RENAME COLUMN into WITH (CTE) view and trigger bodies
+- propagate RENAME COLUMN into compound (UNION/INTERSECT/EXCEPT) view bodies
+- extend RENAME COLUMN mixed-scope span rewrite to trigger bodies
+- [**breaking**] rewrite RENAME COLUMN mixed-scope view bodies via Expr::Column spans
+- *(cli)* control-char escaping in the width-aligned display modes
+- *(cli)* escape control characters in list/tabs output like sqlite
+- *(cli)* add .show
+- *(exec)* expose is_autocommit() (sqlite3_get_autocommit)
+- *(exec)* expose last_insert_rowid()/changes()/total_changes()
+- *(exec)* add Connection::deserialize (sqlite3_deserialize)
+- *(exec)* add Connection::serialize() and the shell's .backup/.save
+- *(cli)* add .mode tcl (completes the .mode family)
+- *(cli)* add .mode ascii and .mode html
+- *(cli)* add .mode markdown/box/table and .print
+- *(session)* changeset rebase (D5)
+- *(session)* indirect changes and FK-action recording (D5)
+- *(session)* per-table attach via Session::attach_table (D5)
+- *(session)* custom conflict handlers for changeset apply (D5)
+- *(fts5)* tombstone-reconciling crisis merge on DELETE
+- *(pager)* shared wal-index for multi-connection WAL readers
+- *(session)* patchset generation
+- *(session)* changeset invert and concat
+- *(session)* composite / WITHOUT ROWID / non-integer primary keys
+- *(session)* apply a changeset
+- *(session)* byte-compatible changeset generation
+- *(fts5)* incremental DELETE/UPDATE via tombstone segments
+- *(fts5)* incremental multi-segment writes + automerge
+- *(vdbe)* run correlated subqueries on the VDBE
+- *(pager)* coherent read cache for read-only connections
+- *(vdbe)* live storage cursor for single-table scans
+- *(planner)* cost-based join order via a bounded path solver
+- *(exec)* acquire the C9a read lock at first read in a transaction
+- *(planner)* stat4 range selectivity via whereRangeScanEst
+- *(pager)* persistent read locks so readers block a writer across a read txn
+- *(planner)* full-scan low-selectivity predicates via stat estimates
+- *(planner)* use sqlite_stat4 samples for equality selectivity
+- *(analyze)* generate byte-compatible sqlite_stat4
+- *(cli)* add .mode/.output/.once/.import and more shell dot-commands
+- *(vtab)* writable sqlite_dbpage (UPDATE + delete rejection)
+
+### Documentation
+
+- mark D2e-2 FTS5 in-transaction incremental DONE (f009693)
+- mark the delete-heavy FTS5 malformed-file bug FIXED (369d8bf)
+- mark D2e-1 automerge DONE + record the delete-heavy malformed-file bug
+- definitively resolve dbpage-2 INSERT-grow via oracle + source
+- pinpoint the automerge trigger (FTS5_WORK_UNIT=64) for D2e-1
+- root-cause the FTS5 delete/scale divergence as missing automerge
+- characterize D2e-1 divergence as a data-sensitive cascade, deprioritize
+- correct D2e-1 — the observed delete-crisis divergence is not the higher-populated case
+- pin the exact D2e-1 delete-crisis target and its scope
+- update roadmap summary for the D2e-3 prefix and B9h min/max wins
+- *(fts5)* record that the spanning-dlidx incremental append is byte-identical
+- record why FTS5 D2e-2 (in-txn incremental) is a subsystem port
+- record that the VDBE interpreter-seek item is behaviourally redundant
+- correct ROADMAP — D6 wasm and D7 C-API are done, B5b-2 advanced
+- note replace/instr/trim non-UTF-8 as the remaining residual
+- refine Value::Text residual note (char-semantic fns on non-UTF-8)
+- record A-alter-3 trigger multi-source body RENAME/DROP propagation
+- *(roadmap)* collation on the VDBE complete (explicit-COLLATE keys + args)
+- *(roadmap)* collation on the VDBE complete (bare-aggregate fold)
+- *(roadmap)* note collation-aware aggregate fold in grouped VDBE
+- *(roadmap)* record collation-aware GROUP BY on the VDBE (B-groupby-collate)
+- *(roadmap)* note join path in collation-aware VDBE DISTINCT
+- *(roadmap)* record collation-aware VDBE DISTINCT (B-distinct-collate)
+- *(roadmap)* function-call resolution carets done (CLI-2)
+- *(roadmap)* record the ORDER-BY sort-elision family under B9h
+- record the driver-seek B1b sub-case probed 2026-07-11
+- *(test)* correct the compound-arm IN-SELECT test doc after B5c-2
+- A-alter-2 attempt + finding — blanket re-validation false-rejects niche shapes
+- clean up ROADMAP — drop completed items, chunk remaining work
+- record concrete CTE/compound RENAME COLUMN rewrite rules for A-alter-rollback
+- precisely scope A-alter-rollback's remaining blocker (CTE/compound propagation)
+- A-rn3-edge span side-channel is unreliable (parser backtracks)
+- A-rn3-edge also has a public-API/semver constraint
+- quantify the A-rn3-edge refactor scope (unblocks A-alter-rollback)
+- note the -0x8000000000000000 hex-literal parse quirk
+- A-alter-rollback is blocked on A-rn3-edge (attempt + finding)
+- record the concrete A-alter-rollback reproduction
+- C9d thread-safe Connection via documented per-thread model
+- *(exec)* document Connection's per-thread model (C9d)
+- FTS5 delete-crisis tombstone-reconciling merge done
+- C9c shared wal-index for multi-connection WAL readers done
+- D5 patchset generation + apply done
+- D5 changeset invert + concat done
+- D5 session gen+apply broadened to composite/WITHOUT ROWID/non-int PKs
+- D5 changeset apply done (generate->apply round-trip)
+- D5 sqlite3_session changeset generation done (first slice)
+- FTS5 incremental DELETE/UPDATE via tombstones done
+- FTS5 incremental multi-segment writes + automerge done
+- record B5c-2 correlated-subquery revert and the redo requirement
+- correlated subqueries on the VDBE done (B5c-2)
+- C8c read cache for read-only connections done
+- VDBE single-table live-scan cursor done (B5b-2 slice)
+- FTS5 doclist spill keeps varints whole; interior-pages premise corrected
+- cost-based join-order path solver done
+- FTS5 prefix-index segments done
+- C9a persistent read locks done end-to-end
+- B4 planner-use scan-vs-search and range selectivity done
+- record FTS5 multi-term leaf-fill and stat4 range selectivity
+- record scan-vs-search cost decision and C9a read-lock primitive
+- record stat4 equality planner-use and FTS5 doclist-index
+- mark sqlite_stat4 generation and CLI dot-commands done
+- correct dbpage-2 status in ROADMAP (UPDATE done; oracle was never the blocker)
+- prune completed work from ROADMAP and refresh the forward plan
+
+### Fixed
+
+- *(pager)* restore committed header on rollback so post-rollback reads don't fail
+- *(btree)* robust index-page splitting for large-key churn
+- *(btree)* robust page splitting so churn cannot overflow or corrupt a page
+- *(fts5)* tombstone old terms on INSERT OR REPLACE / REPLACE so the index stays valid
+- *(fts5)* compact backing b-tree after vtab-store deletes so files stay sqlite-valid
+- *(eqp)* min/max covering-scan needs an index narrower than the table (B9h)
+- *(func)* printf %c emits the first character, not the first byte
+- *(func)* printf %c emits the first byte of its argument
+- *(func)* printf %q/%Q/%w SQL-escape non-UTF-8 bytes
+- *(eval)* GLOB/LIKE match non-UTF-8 text on lenient codepoints
+- *(func)* printf/format %s emits non-UTF-8 argument bytes verbatim
+- *(func)* concat/concat_ws concatenate non-UTF-8 text bytes
+- *(func)* replace/instr/trim are byte-aware for non-UTF-8 text
+- *(func)* upper/lower fold non-UTF-8 text byte-wise
+- *(func)* octet_length() counts raw bytes of non-UTF-8 text
+- *(func)* char() emits raw WTF-8 for surrogate code points
+- *(func)* quote() preserves non-UTF-8 text bytes
+- *(func)* length/unicode/substr are byte-aware for non-UTF-8 text
+- *(eval)* CAST(...AS TEXT) keeps a text value's exact bytes
+- *(vdbe)* preserve non-UTF-8 text through Op::Func literal reconstruction
+- *(exec)* read non-UTF-8 text bytes in hex/CAST-to-blob/concat/fts5
+- *(value)* export Text from the crate root
+- *(exec)* reject DML on the temp schema catalog like SQLite
+- *(exec)* bound an unbounded generate_series consumed by a LIMIT
+- *(cli)* restore quoted-identifier caret; add likelihood constant-check parity
+- *(cli)* correct prepare/step class for generate_series and nth_value errors
+- *(cli)* draw the error caret for a quoted `no such column: "x"` message
+- match sqlite on schema-catalog write message and AUTOINCREMENT error class
+- *(cli)* classify STRICT invalid-datatype as a prepare-time error
+- *(cli)* run an unterminated final statement at EOF; ignore comment-only chunks
+- *(parser)* accept RETURNING after an INSERT … SELECT source
+- *(alter)* propagate RENAME/DROP COLUMN into trigger row-assign & upsert subqueries
+- *(alter)* propagate RENAME/DROP COLUMN into a trigger's UPDATE…FROM
+- *(cli)* classify DROP <wrong-kind> errors as prepare errors
+- *(parser)* reject a qualified CREATE TEMP object name like sqlite
+- *(pragma)* list collation_list in sqlite's order (BINARY, NOCASE, RTRIM)
+- *(params)* an unbound parameter reads as NULL, like sqlite
+- *(cli)* classify "no such module" by statement (CREATE VIRTUAL = step)
+- *(lexer)* bound ?N parameters to sqlite's ?1..?32766 range
+- *(error)* a too-big string/blob carries SQLITE_TOOBIG (18)
+- *(error)* a datatype mismatch carries SQLITE_MISMATCH (20)
+- *(cli)* classify DROP COLUMN validation errors as prepare errors
+- *(cli)* classify REINDEX and USING-column resolution errors as prepare errors
+- *(cli)* classify compound/VALUES arity errors as prepare errors
+- *(cli)* classify "HAVING clause on a non-aggregate query" as a prepare error
+- *(parser)* near_msg must handle the new ParseAt syntax-error variant
+- *(planner)* do not claim ORDER BY satisfaction with no ORDER BY
+- *(pragma)* echo journal_size_limit / analysis_limit on set
+- *(pragma)* echo secure_delete / soft_heap_limit / wal_autocheckpoint on set
+- *(pragma)* round-trip synchronous / temp_store / threads like SQLite
+- *(tvf)* expose an implicit rowid on the built-in table-valued functions
+- *(pragma)* index_info/index_xinfo for a WITHOUT ROWID PRIMARY KEY auto-index
+- *(pragma)* table_info reports standard type names in SQLite's canonical case
+- *(parser)* an unparenthesized column DEFAULT is a single literal, not an expression
+- *(func)* unicode() truncates its argument at the first embedded NUL
+- *(vfs)* keep StdFile Send+Sync+RefUnwindSafe (atomic lock level)
+- *(exec)* satisfy clippy::question_mark on rust 1.97 (CI toolchain bump)
+- *(fts5)* segment doclist spill keeps varints whole across leaves
+- *(fts5)* emit prefix-index segments for prefix= indexes
+- *(exec)* don't panic decoding a row against a corrupt schema
+- *(fts5)* match sqlite's multi-term leaf-fill boundary
+- *(fts5)* emit doclist-index pages for large spanning doclists
+- *(btree)* WITHOUT ROWID secondary index over a PK-overlapping column
+- *(exec)* resolve schema-qualified subquery refs in a cross-database write
+
+### Refactor
+
+- *(value)* back Value::Text with bytes (Text) instead of String
+- migrate to the Rust 2024 edition
+
+### Testing
+
+- *(func)* assert printf %c over non-UTF-8 leading bytes
+- *(eval)* concat of non-UTF-8 now yields text, not blob
+- *(planner)* fix empty-join fixture in the all-constant ORDER BY test
+- *(planner)* fix column count in the secondary-index driver-seek setup
+- *(planner)* split the driver-seek EQP setups (rowid vs secondary index)
+
 ## [0.1.0](https://github.com/KarpelesLab/graphitesql/compare/v0.0.16...v0.1.0) - 2026-07-08
 
 ### Added
