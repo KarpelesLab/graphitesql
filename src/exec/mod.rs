@@ -179,6 +179,13 @@ pub struct Connection {
     /// cascade/set-null/set-default runs, so a session records those writes as
     /// *indirect* (mirroring SQLite's preupdate-hook depth for FK actions).
     fk_depth: core::cell::Cell<usize>,
+    /// Names of tables whose b-tree had rows removed by a cascading delete
+    /// (`delete_row_cascade`) during the current statement. Each such delete can
+    /// leave an empty non-root leaf that SQLite's balancer would merge away, but
+    /// the per-row cascade path can't compact eagerly without O(rows²) rebuilds.
+    /// The top-level DML that started the statement drains this set and compacts
+    /// each table once, exactly as it already compacts its own target table.
+    cascade_compact: core::cell::RefCell<alloc::collections::BTreeSet<String>>,
     /// Set by an `OR FAIL` conflict before it raises: tells the statement-level
     /// atomicity wrapper to keep the rows changed before the failure (rather than
     /// rolling the statement back, which is the `OR ABORT` default).
@@ -596,6 +603,7 @@ impl Connection {
             ignore_check_constraints: false,
             trigger_depth: core::cell::Cell::new(0),
             fk_depth: core::cell::Cell::new(0),
+            cascade_compact: core::cell::RefCell::new(alloc::collections::BTreeSet::new()),
             stmt_keep_partial: core::cell::Cell::new(false),
             stmt_rollback_tx: core::cell::Cell::new(false),
             raise_ignore: core::cell::Cell::new(false),
@@ -661,6 +669,7 @@ impl Connection {
             ignore_check_constraints: false,
             trigger_depth: core::cell::Cell::new(0),
             fk_depth: core::cell::Cell::new(0),
+            cascade_compact: core::cell::RefCell::new(alloc::collections::BTreeSet::new()),
             stmt_keep_partial: core::cell::Cell::new(false),
             stmt_rollback_tx: core::cell::Cell::new(false),
             raise_ignore: core::cell::Cell::new(false),
@@ -8616,6 +8625,10 @@ impl Connection {
             self.enforce_parent_change(table, old, None, params)?;
         }
         delete_table(self.backend.writer()?, meta.root, rowid)?;
+        // This delete can leave an empty leaf in the child b-tree; the top-level
+        // DML compacts it once the statement finishes (per-row compaction here
+        // would be O(rows²)).
+        self.cascade_compact.borrow_mut().insert(table.to_string());
         let indexes = self.indexes_of(table)?;
         if !indexes.is_empty() {
             self.rebuild_indexes(meta, &indexes)?;
@@ -10759,6 +10772,8 @@ impl Connection {
             self.compact_table(&meta)?;
             self.rebuild_indexes(&meta, &indexes)?;
         }
+        // An OR REPLACE conflict-delete may have cascaded into child tables.
+        self.drain_cascade_compact()?;
         Ok(affected)
     }
 
@@ -11612,6 +11627,8 @@ impl Connection {
             self.compact_table(&meta)?;
             self.rebuild_indexes(&meta, &indexes)?;
         }
+        // A cascading delete may have emptied leaves in child tables too.
+        self.drain_cascade_compact()?;
         Ok(deleted)
     }
 
@@ -11638,6 +11655,24 @@ impl Connection {
         clear_table(w, meta.root)?;
         for (rowid, payload) in &rows {
             insert_table(w, meta.root, *rowid, payload)?;
+        }
+        Ok(())
+    }
+
+    /// Compact every table whose b-tree had rows removed by a cascading delete
+    /// during the statement just finished (see `cascade_compact`). Called from
+    /// each top-level DML tail; a no-op when nothing cascaded.
+    fn drain_cascade_compact(&mut self) -> Result<()> {
+        if self.cascade_compact.borrow().is_empty() {
+            return Ok(());
+        }
+        let tables: Vec<String> = self.cascade_compact.borrow_mut().iter().cloned().collect();
+        self.cascade_compact.borrow_mut().clear();
+        for name in tables {
+            // The table may have been dropped by a later cascade; skip if gone.
+            if let Ok(meta) = self.table_meta(&name, None) {
+                self.compact_table(&meta)?;
+            }
         }
         Ok(())
     }
@@ -12059,6 +12094,9 @@ impl Connection {
             self.compact_table(&meta)?;
             self.rebuild_indexes(&meta, &indexes)?;
         }
+        // An UPDATE OR REPLACE / FK action may have cascaded deletes into
+        // child tables; compact any that were left with empty leaves.
+        self.drain_cascade_compact()?;
         Ok(affected)
     }
 
