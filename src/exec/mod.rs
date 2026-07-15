@@ -35205,44 +35205,41 @@ impl Connection {
         let data_t = q(&format!("{name}_data"));
         let idx_t = q(&format!("{name}_idx"));
 
-        // Non-prefix tables take the faithful incremental-merge path: persist the
-        // level-0 block, then run automerge + crisismerge as real `%_data` merges
-        // (byte-identical to sqlite). Prefix tables are not serviced by the
-        // tombstone-preserving reader, so they keep the legacy rebuild-from-corpus
-        // crisis (and no automerge) — unchanged behavior.
-        let block_persisted;
-        if prefixes.is_empty() {
-            // Persist the level-0 block so the merges read it uniformly from %_data.
-            for (id, block_bytes) in &block.data {
-                self.execute_params(
-                    &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
-                    &pv(alloc::vec![
-                        Value::Integer(*id),
-                        Value::Blob(block_bytes.clone())
-                    ]),
-                )?;
-            }
-            for IdxRow { segid, term, pgno } in &block.idx {
-                self.execute_params(
-                    &format!("INSERT INTO {idx_t} VALUES(?1,?2,?3)"),
-                    &pv(alloc::vec![
-                        Value::Integer(*segid),
-                        Value::Blob(term.clone()),
-                        Value::Integer(*pgno)
-                    ]),
-                )?;
-            }
-            block_persisted = true;
-            if !self.fts5_automerge(name, &mut structure, block.n_leaves, ncols, tok, &prefixes)? {
-                return Ok(false);
-            }
-            if !self.fts5_crisismerge(name, &mut structure, ncols, tok, &prefixes)? {
-                return Ok(false);
-            }
-        } else {
-            let did_crisis =
-                self.fts5_crisis_merge(name, &mut structure, ncols, tok, &prefixes, &docs)?;
-            block_persisted = did_crisis;
+        // Both main and prefix tables take the faithful incremental-merge path:
+        // persist the level-0 block, then run automerge + crisismerge as real
+        // `%_data` merges (byte-identical to sqlite). For prefix tables the merge
+        // reads/rewrites the FULL keys (main `'0'` + prefix `'1'`/`'2'`… streams
+        // together) via `merge_segments_keepdel_full` / `build_merged_segment_block_full`,
+        // so a level-0 crisis merges only that level's segments into a NEW segment at
+        // the next level — keeping earlier merged segments intact — exactly like a
+        // double crisis cascade in sqlite (which produces two level-1 segments, not
+        // one collapsed rebuild).
+        //
+        // Persist the level-0 block so the merges read it uniformly from %_data.
+        for (id, block_bytes) in &block.data {
+            self.execute_params(
+                &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
+                &pv(alloc::vec![
+                    Value::Integer(*id),
+                    Value::Blob(block_bytes.clone())
+                ]),
+            )?;
+        }
+        for IdxRow { segid, term, pgno } in &block.idx {
+            self.execute_params(
+                &format!("INSERT INTO {idx_t} VALUES(?1,?2,?3)"),
+                &pv(alloc::vec![
+                    Value::Integer(*segid),
+                    Value::Blob(term.clone()),
+                    Value::Integer(*pgno)
+                ]),
+            )?;
+        }
+        if !self.fts5_automerge(name, &mut structure, block.n_leaves, ncols, tok, &prefixes)? {
+            return Ok(false);
+        }
+        if !self.fts5_crisismerge(name, &mut structure, ncols, tok, &prefixes)? {
+            return Ok(false);
         }
 
         // Global averages: nRow + per-column token totals over the WHOLE live
@@ -35267,30 +35264,9 @@ impl Connection {
             ]),
         )?;
 
-        // Append the new segment's leaf/dlidx `%_data` rows and `%_idx` rows —
-        // unless they were already persisted (non-prefix path) or a crisis merge
-        // consumed them (prefix path rewrote every segment row).
-        if !block_persisted {
-            for (id, block_bytes) in &block.data {
-                self.execute_params(
-                    &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
-                    &pv(alloc::vec![
-                        Value::Integer(*id),
-                        Value::Blob(block_bytes.clone())
-                    ]),
-                )?;
-            }
-            for IdxRow { segid, term, pgno } in &block.idx {
-                self.execute_params(
-                    &format!("INSERT INTO {idx_t} VALUES(?1,?2,?3)"),
-                    &pv(alloc::vec![
-                        Value::Integer(*segid),
-                        Value::Blob(term.clone()),
-                        Value::Integer(*pgno)
-                    ]),
-                )?;
-            }
-        }
+        // The level-0 block's `%_data`/`%_idx` rows were already persisted above (the
+        // merges read them back uniformly); a crisis/automerge may since have rewritten
+        // them into a merged segment, but nothing to append here.
         // `_docsize` gains one row per new document (merges leave docsize rows
         // untouched — they are per-doc, not per-segment).
         let docsize_t = q(&format!("{name}_docsize"));
@@ -35298,136 +35274,6 @@ impl Connection {
             self.execute_params(
                 &format!("INSERT INTO {docsize_t} VALUES(?1,?2)"),
                 &pv(alloc::vec![Value::Integer(*rowid), Value::Blob(sz.clone())]),
-            )?;
-        }
-        Ok(true)
-    }
-
-    /// While any level of `structure` holds >= 16 segments (the crisis threshold),
-    /// merge that level's segments into a single fresh-segid segment at the next
-    /// level and promote — the port of `fts5IndexCrisismerge`. The merged segment's
-    /// leaves are rebuilt from `docs` (the whole live corpus; valid because the
-    /// incremental path only runs for pure inserts, so every level-0 doc is live).
-    /// Rewrites the `%_data`/`%_idx` segment rows in place. Returns whether a merge
-    /// occurred (in which case the caller must NOT also append the level-0 block —
-    /// it was consumed by the merge).
-    #[cfg(feature = "fts5")]
-    fn fts5_crisis_merge(
-        &mut self,
-        name: &str,
-        structure: &mut crate::fts5_index::SegStructure,
-        ncols: usize,
-        tok: crate::vtab::Fts5Tok,
-        prefixes: &[usize],
-        docs: &[(i64, Vec<Value>)],
-    ) -> Result<bool> {
-        use crate::fts5_index::{self, IdxRow};
-        const CRISIS: usize = 16;
-        if structure.levels.is_empty() || structure.levels[0].segs.len() < CRISIS {
-            return Ok(false);
-        }
-        // A crisis merge at level 0 with 16 single-page segments collapses the
-        // whole corpus into ONE segment. Higher-level cascades (a merged segment
-        // itself triggering another crisis) do not arise for the 1-page-per-insert
-        // shape this slice targets; if the merged level would still be in crisis,
-        // fall back to the bulk rebuild to stay correct.
-        let merged_segid = structure.allocate_segid();
-        // A merge does not touch `%_docsize` (per-doc sizes are unchanged), so the
-        // tokenizer's `doc_sizes` output is discarded here.
-        let (terms, _totals, _doc_sizes) = self.fts5_tokenize_docs(docs, ncols, tok);
-        // A crisis merge is a `fts5IndexMergeLevel`, so its output uses the
-        // INCREMENTAL-MERGE writer (byte-exact vs sqlite for multi-leaf outputs).
-        // Prefix tables derive the prefix (`'1'`/`'2'`…) streams from the same
-        // re-tokenized main terms but ALSO go through the merge writer, so a
-        // spanning main OR prefix term's doclist splits across leaves exactly as
-        // sqlite does (the two writers agree only for single-leaf outputs).
-        let block = if prefixes.is_empty() {
-            fts5_index::build_merged_segment_block(&terms, 4050, merged_segid)
-        } else {
-            fts5_index::build_merged_segment_block_prefixed(&terms, 4050, merged_segid, prefixes)
-        };
-
-        // Mutate a COPY of the structure and only commit it on success, so a bail
-        // leaves the caller's `structure` untouched (it then rebuilds from
-        // scratch, discarding this attempt).
-        let mut merged = structure.clone();
-        // This crisis merge REBUILDS the entire live corpus (`docs`) into a single
-        // fresh segment, and the `%_data`/`%_idx` rewrite below WIPES every existing
-        // segment row. So every pre-existing segment — at any level, not just the
-        // level-0 inputs — is now subsumed by the rebuilt segment and its backing
-        // data is gone; drop them ALL, then add the one merged segment at level 1
-        // and promote.
-        //
-        // For the SINGLE-crisis case (level 1 was empty before) this is byte-
-        // identical to sqlite: exactly one segment ends up at level 1. For a DOUBLE
-        // crisis (a second level-0 crisis while level 1 already holds a merged
-        // segment) it diverges structurally — sqlite keeps the older level-1 segment
-        // and produces two via its incremental automerge (not ported) — but the file
-        // stays VALID. Retaining the older segment here (as the code used to) left it
-        // referenced in the structure with no `%_data` backing, which sqlite and the
-        // integrity checker both reject as a malformed inverted index.
-        for lvl in merged.levels.iter_mut() {
-            lvl.segs.clear();
-            lvl.n_merge = 0;
-        }
-        if merged.levels.len() < 2 {
-            merged.levels.push(crate::fts5_index::StructLevel {
-                n_merge: 0,
-                segs: Vec::new(),
-            });
-        }
-        // When the merged live corpus is EMPTY (a delete-crisis that deleted the
-        // last live row), the output segment has no leaves. sqlite's
-        // `fts5IndexMergeLevel` writes it, sees `pSeg->pgnoLast==0`, and REMOVES
-        // it (`pLvlOut->nSeg--; pStruct->nSegment--`) — so no phantom segment is
-        // recorded. Match that: only add the merged segment when it has leaves.
-        if block.n_leaves > 0 {
-            merged.levels[1].segs.push(crate::fts5_index::StructSeg {
-                segid: merged_segid,
-                pgno_first: 1,
-                pgno_last: block.n_leaves,
-            });
-            merged.promote_after_merge(1);
-        }
-        // If the promote did not clear a subsequent crisis, bail to rebuild.
-        if merged.levels.iter().any(|l| l.segs.len() >= CRISIS) {
-            return Ok(false);
-        }
-        *structure = merged;
-
-        // Rewrite all segment `%_data`/`%_idx` rows: clear existing leaf/idx rows,
-        // write the single merged segment.
-        let q = |s: &str| sql::print::ident(s);
-        let pv = |vals: Vec<Value>| Params {
-            positional: vals,
-            named: Vec::new(),
-        };
-        // Delete every leaf/dlidx `%_data` row (id > STRUCTURE_ROWID) and all idx.
-        self.execute(&format!(
-            "DELETE FROM {} WHERE id>{}",
-            q(&format!("{name}_data")),
-            fts5_index::STRUCTURE_ROWID
-        ))?;
-        self.execute(&format!("DELETE FROM {}", q(&format!("{name}_idx"))))?;
-        let data_t = q(&format!("{name}_data"));
-        for (id, block_bytes) in &block.data {
-            self.execute_params(
-                &format!("INSERT INTO {data_t} VALUES(?1,?2)"),
-                &pv(alloc::vec![
-                    Value::Integer(*id),
-                    Value::Blob(block_bytes.clone())
-                ]),
-            )?;
-        }
-        let idx_t = q(&format!("{name}_idx"));
-        for IdxRow { segid, term, pgno } in &block.idx {
-            self.execute_params(
-                &format!("INSERT INTO {idx_t} VALUES(?1,?2,?3)"),
-                &pv(alloc::vec![
-                    Value::Integer(*segid),
-                    Value::Blob(term.clone()),
-                    Value::Integer(*pgno)
-                ]),
             )?;
         }
         Ok(true)

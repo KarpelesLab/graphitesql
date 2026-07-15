@@ -1207,34 +1207,6 @@ pub(crate) fn build_merged_segment_block(
     }
 }
 
-/// The prefix-DERIVING sibling of [`build_merged_segment_block`]: `terms` are the
-/// re-tokenized MAIN `'0'` terms (no prefix byte); the prefix indexes are derived
-/// from them exactly as [`build_segment_leaves`] does, but the whole segment (both
-/// the main and the prefix term streams) is written with the INCREMENTAL-MERGE
-/// writer ([`SegWriter::merge_mode`]) so a spanning prefix (or main) term's doclist
-/// splits across leaves byte-identically to sqlite's `fts5IndexMergeLevel`. Used by
-/// the crisis/automerge rebuild of a PREFIX-configured index (which reconstructs the
-/// merged corpus from the live docs). No `%_docsize` (merges do not touch it).
-pub(crate) fn build_merged_segment_block_prefixed(
-    terms: &[(Vec<u8>, Vec<Posting>)],
-    pgsz: usize,
-    segid: i64,
-    prefixes: &[usize],
-) -> SegmentBlock {
-    let (leaves, idx, dlidx) = build_segment_leaves_mode(terms, pgsz, segid, prefixes, true);
-    let mut data: Vec<(i64, Vec<u8>)> = Vec::new();
-    for (i, leaf) in leaves.iter().enumerate() {
-        data.push((segment_leaf_rowid(segid, i as i64 + 1), leaf.clone()));
-    }
-    data.extend(dlidx);
-    SegmentBlock {
-        data,
-        idx,
-        docsize: Vec::new(),
-        n_leaves: leaves.len() as i64,
-    }
-}
-
 /// The prefix-aware sibling of [`build_merged_segment_block`]: the input `terms`
 /// carry FULL stored keys (the `'0'`/`'1'`/`'2'`… index-prefix byte included, as
 /// produced by [`merge_segments_keepdel_full`]), so they are written verbatim with
