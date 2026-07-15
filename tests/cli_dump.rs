@@ -92,3 +92,59 @@ fn dump_matches_sqlite() {
         let _ = std::fs::remove_file(db);
     }
 }
+
+/// Run a dot-command as a trailing ARGUMENT (`bin db .dump`), the form
+/// `sqlite3 db .dump > backup.sql` uses, rather than piping it on stdin.
+fn arg_out(bin: &str, db: &str, cmd: &str) -> String {
+    let out = Command::new(bin).arg(db).arg(cmd).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn dot_command_as_trailing_argument() {
+    // A trailing arg starting with `.` must run as a dot-command, not be handed
+    // to the SQL parser (which rejected it with `near ".": syntax error`, so a
+    // scripted `graphitesql db .dump > backup.sql` silently produced no data).
+    let g = env!("CARGO_BIN_EXE_graphitesql");
+    let dir = std::env::temp_dir();
+    let db = dir
+        .join(format!("gsql_dumparg_{}.db", std::process::id()))
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let _ = std::fs::remove_file(&db);
+    // Build a small db (SQL as a trailing arg still works).
+    assert!(
+        Command::new(g)
+            .arg(&db)
+            .arg(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);\
+                  INSERT INTO t VALUES(1,'a'),(2,'b');\
+                  CREATE INDEX ix ON t(v);"
+            )
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    // `.dump` as an argument equals `.dump` piped on stdin (both non-empty).
+    let via_arg = arg_out(g, &db, ".dump");
+    assert_eq!(via_arg, dump(g, &db), ".dump arg vs stdin");
+    assert!(
+        via_arg.contains("INSERT INTO t VALUES(1,'a')"),
+        "arg .dump had no data"
+    );
+
+    // `.schema` and `.tables` as arguments also produce output, not a parse error.
+    assert!(arg_out(g, &db, ".schema").contains("CREATE TABLE t"));
+    assert!(arg_out(g, &db, ".tables").contains('t'));
+
+    if sqlite3_available() {
+        assert_eq!(
+            via_arg,
+            arg_out("sqlite3", &db, ".dump"),
+            "arg .dump vs sqlite3"
+        );
+    }
+    let _ = std::fs::remove_file(&db);
+}

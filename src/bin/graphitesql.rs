@@ -82,12 +82,26 @@ fn main() {
 
     if !scripts.is_empty() {
         // One-shot mode: run each argument batch, exiting non-zero on the first
-        // error (like the `sqlite3` shell).
+        // error (like the `sqlite3` shell). A trailing argument that starts with
+        // `.` is a dot-command (`sqlite3 db .dump`, `.schema`, `.tables`), not
+        // SQL — route it to the dot-command handler rather than the parser, which
+        // would otherwise reject it with `near ".": syntax error`.
         for sql in scripts {
+            if sql.trim_start().starts_with('.') {
+                if shell.dot_command(&mut conn, sql.trim()) {
+                    return; // `.quit` / `.exit`
+                }
+                continue;
+            }
             if let Err((e, stmt, _line)) = shell.run_sql_batch(&mut conn, sql, 1) {
                 eprintln!("{}", render_cli_error(&stmt, &e));
                 std::process::exit(1);
             }
+        }
+        // Non-interactive: a dot-command (or SQL) error exits non-zero, matching
+        // the piped-input path.
+        if shell.had_error {
+            std::process::exit(1);
         }
         return;
     }
