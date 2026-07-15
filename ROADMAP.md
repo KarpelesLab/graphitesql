@@ -785,9 +785,22 @@ history / `CHANGELOG.md`. Remaining:
     with the most segments ≥ `automerge`. graphite tracks the same write counter
     (`SegStructure.write_counter`) already — the port is the merge scheduling on top
     of it. Implementation start point for a focused session.*
-  - **D2e-2 — incremental writes inside explicit `BEGIN`/`SAVEPOINT`** (autocommit
-    is incremental; explicit txns rebuild). *Not a small change (code-verified
-    2026-07-13):* the gate is `fts5_maybe_rebuild` (`src/exec/mod.rs` ~33370) —
+  - **D2e-2 — incremental writes inside explicit transactions — DONE 2026-07-14
+    (`f009693`).** In a transaction the FTS5 index is left untouched (doc rows still
+    land in `_content`), the table is recorded dirty, in-transaction `MATCH` scans
+    live `_content` for read-your-writes visibility, and at COMMIT / outermost RELEASE
+    (and before a nested SAVEPOINT, per `xSavepoint`) the pending changes flush in one
+    shot via the incremental path; ROLLBACK discards. BYTE-IDENTICAL to sqlite for
+    insert-only transactions (single/multi/mixed/prefix/merge-crossing/SAVEPOINT),
+    autocommit unchanged (automerge preserved), corpus green
+    (`tests/fts5_transaction.rs`). **Residual (correct + integrity-clean +
+    MATCH-identical, but consolidated-to-one-rebuild, NOT byte-identical):** a txn
+    that deletes/updates a previously-committed doc, and out-of-order-rowid inserts
+    within a txn — these need the full `Fts5Hash` incremental-flush model (flush on
+    `iRowid < iWriteRowid`, same-rowid re-insert, hash overflow; tombstone postings in
+    the flushed segment). *Superseded analysis below:*
+    *(historical)* Not a small change (code-verified
+    2026-07-13): the gate is `fts5_maybe_rebuild` (`src/exec/mod.rs` ~33370) —
     autocommit appends one level-0 segment per INSERT; inside a txn it bulk-rebuilds
     because SQLite instead accumulates the *whole* transaction's postings in an
     in-memory hash (`Fts5Hash`), flushes them as **one** segment at COMMIT, *and
