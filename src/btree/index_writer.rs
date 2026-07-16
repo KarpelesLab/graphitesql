@@ -450,7 +450,7 @@ pub fn insert_index(
     descs: &[bool],
 ) -> Result<()> {
     let rcell = build_index_rcell(wp, record)?;
-    match insert_rec(wp, root, record, rcell, colls, descs)? {
+    match insert_rec(wp, root, record, rcell, colls, descs, 0)? {
         IdxUp::Fit => {}
         IdxUp::Split(split) => grow_root(wp, root, split)?,
         // The root itself is a leaf that overflowed: deepen the tree and
@@ -563,6 +563,7 @@ enum IdxUp {
     Split(IdxSplit),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_rec(
     wp: &mut WritePager,
     page_no: u32,
@@ -570,7 +571,14 @@ fn insert_rec(
     rcell: Vec<u8>,
     colls: &[Collation],
     descs: &[bool],
+    depth: u32,
 ) -> Result<IdxUp> {
+    // SQLite caps cursor descent at BTCURSOR_MAX_DEPTH (20) and reports
+    // SQLITE_CORRUPT beyond it (`moveToChild`); a deeper "tree" here means a
+    // page cycle, which must surface as an error, not unbounded recursion.
+    if depth >= 20 {
+        return Err(Error::Corrupt("b-tree depth limit exceeded".into()));
+    }
     let enc = wp.header().text_encoding;
     let page = wp.page(page_no)?;
     let body = page.body_offset();
@@ -636,7 +644,7 @@ fn insert_rec(
                 }
             }
 
-            match insert_rec(wp, children[p], target, rcell, colls, descs)? {
+            match insert_rec(wp, children[p], target, rcell, colls, descs, depth + 1)? {
                 IdxUp::Fit => return Ok(IdxUp::Fit), // this page is unchanged
                 IdxUp::LeafOverfull(child_entries) => {
                     balance_leaf_into(wp, &mut children, &mut dividers, p, child_entries)?;

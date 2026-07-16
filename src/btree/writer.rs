@@ -60,7 +60,7 @@ pub fn create_table_root(wp: &mut WritePager) -> Result<u32> {
 /// Insert (or replace) a row `(rowid, payload)` into the table b-tree at `root`.
 pub fn insert_table(wp: &mut WritePager, root: u32, rowid: i64, payload: &[u8]) -> Result<()> {
     let cell = build_leaf_cell(wp, rowid, payload)?;
-    match insert_rec(wp, root, rowid, cell)? {
+    match insert_rec(wp, root, rowid, cell, 0)? {
         Up::Fit => {}
         Up::Split(split) => grow_root(wp, root, split)?,
         // The root itself is a leaf that overflowed: deepen the tree (SQLite's
@@ -249,7 +249,19 @@ enum Up {
     Split(Split),
 }
 
-fn insert_rec(wp: &mut WritePager, page_no: u32, rowid: i64, cell: Vec<u8>) -> Result<Up> {
+fn insert_rec(
+    wp: &mut WritePager,
+    page_no: u32,
+    rowid: i64,
+    cell: Vec<u8>,
+    depth: u32,
+) -> Result<Up> {
+    // SQLite caps cursor descent at BTCURSOR_MAX_DEPTH (20) and reports
+    // SQLITE_CORRUPT beyond it (`moveToChild`); a deeper "tree" here means a
+    // page cycle, which must surface as an error, not unbounded recursion.
+    if depth >= 20 {
+        return Err(Error::Corrupt("b-tree depth limit exceeded".into()));
+    }
     let page = wp.page(page_no)?;
     let body = page.body_offset();
     let bt = BtreePage::parse(page)?;
@@ -296,7 +308,7 @@ fn insert_rec(wp: &mut WritePager, page_no: u32, rowid: i64, cell: Vec<u8>) -> R
                 }
             }
 
-            match insert_rec(wp, children[p], rowid, cell)? {
+            match insert_rec(wp, children[p], rowid, cell, depth + 1)? {
                 Up::Fit => return Ok(Up::Fit), // this page is unchanged
                 Up::LeafOverfull(child_cells) => {
                     balance_leaf_into(wp, &mut children, &mut dividers, p, child_cells)?;

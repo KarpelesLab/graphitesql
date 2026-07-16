@@ -5845,6 +5845,13 @@ impl Connection {
     pub fn execute_params(&mut self, sql: &str, params: &Params) -> Result<usize> {
         let stmt = sql::parse_one(sql)?;
         self.run_authorizer(&stmt)?;
+        // Statement boundary: like the read path (`query_params`), drop any read
+        // cache a foreign commit has made stale and refresh the durable page
+        // bound before this statement touches pages — SQLite re-checks the file
+        // version on every transaction start, reads and writes alike
+        // (`pagerSharedLock`). A no-op mid-transaction (the write lock owns
+        // coherency then).
+        self.revalidate_read_caches();
         // Transaction control is handled directly (no autocommit around it).
         match &stmt {
             Statement::Begin => {

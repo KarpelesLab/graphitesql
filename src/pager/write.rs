@@ -108,10 +108,15 @@ pub struct WritePager {
     /// [`rollback`](Self::rollback).
     committed_header: DatabaseHeader,
     page_size: usize,
-    /// Pages currently on disk (the durable page count).
-    disk_pages: u32,
-    /// Logical page count including not-yet-flushed allocations.
-    page_count: u32,
+    /// Pages currently on disk (the durable page count). A `Cell` because the
+    /// `&self` read path refreshes it at a statement boundary when a *foreign*
+    /// connection's commit has grown the file (SQLite re-derives the page count
+    /// from the fresh page 1 whenever the change counter moves —
+    /// `pagerSharedLock`); see [`revalidate_read_cache`](Self::revalidate_read_cache).
+    disk_pages: Cell<u32>,
+    /// Logical page count including not-yet-flushed allocations. A `Cell` for
+    /// the same statement-boundary refresh reason as [`disk_pages`](Self::disk_pages).
+    page_count: Cell<u32>,
     overlay: BTreeMap<u32, Vec<u8>>,
     /// The `-wal` file handle, when one was supplied (file-backed databases).
     wal_file: Option<Box<dyn File>>,
@@ -289,8 +294,8 @@ impl WritePager {
             committed_header: header.clone(),
             header,
             page_size,
-            disk_pages: pages,
-            page_count,
+            disk_pages: Cell::new(pages),
+            page_count: Cell::new(page_count),
             overlay: BTreeMap::new(),
             wal_file,
             wal,
@@ -378,8 +383,8 @@ impl WritePager {
             committed_header: header.clone(),
             header,
             page_size: page_size as usize,
-            disk_pages: 0,
-            page_count: 1,
+            disk_pages: Cell::new(0),
+            page_count: Cell::new(1),
             overlay: BTreeMap::new(),
             wal_file,
             wal: None,
@@ -473,7 +478,7 @@ impl WritePager {
                 .read_exact_at(&mut buf, (number as u64 - 1) * self.page_size as u64)?;
             return Ok(buf);
         }
-        if number == 0 || number > self.disk_pages {
+        if number == 0 || number > self.disk_pages.get() {
             return Err(Error::Corrupt(format!("page {number} out of range")));
         }
         // Trust the cache under a write lock (we are the only writer) or on the
@@ -546,7 +551,7 @@ impl WritePager {
                     .index
                     .with(|ix| ix.snapshot_db_size(snap.mx_frame))
                     .or_else(|| self.main_file_page_count())
-                    .unwrap_or(self.disk_pages);
+                    .unwrap_or(self.disk_pages.get());
                 w.db_size.set(db);
             }
             return;
@@ -570,6 +575,15 @@ impl WritePager {
             // cached clean pages may be stale, so drop them and re-stamp.
             self.read_cache.borrow_mut().clear();
             self.read_cache_token.set(Some(current));
+            // A foreign commit may also have grown (or shrunk) the file, so the
+            // page bound this pager derived at open is stale — SQLite re-derives
+            // nPage from the fresh page 1 whenever the file version moves. No
+            // staged state can exist here (no write lock is held), so the
+            // logical count tracks the durable one.
+            if let Some(pages) = self.main_file_page_count() {
+                self.disk_pages.set(pages);
+                self.page_count.set(pages);
+            }
         }
     }
 
@@ -589,7 +603,7 @@ impl WritePager {
     /// Read the database change counter (page 1, bytes 24–27, big-endian) straight
     /// from disk, bypassing the cache. Returns `None` if page 1 cannot be read.
     fn disk_change_counter(&self) -> Option<u32> {
-        if self.disk_pages == 0 {
+        if self.disk_pages.get() == 0 {
             return None;
         }
         let mut hdr = [0u8; 28];
@@ -693,7 +707,7 @@ impl WritePager {
                 w.index
                     .with(|ix| ix.snapshot_db_size(snap.mx_frame))
                     .or_else(|| self.main_file_page_count())
-                    .unwrap_or(self.disk_pages),
+                    .unwrap_or(self.disk_pages.get()),
             );
             w.registered_mark.set(Some(snap.mx_frame));
         }
@@ -822,8 +836,104 @@ impl WritePager {
             // shadow the write-lock regime while the lock is held.
             self.read_cache.borrow_mut().clear();
             self.read_cache_token.set(None);
+            // …and, like SQLite's `pagerSharedLock` file-version check, the
+            // header snapshot (freelist head/count, page count, …) this pager
+            // parsed at open may predate that foreign commit. Writing with a
+            // stale freelist head clobbers what is now a live b-tree page, so
+            // re-derive the committed state before the first staged change.
+            if let Err(e) = self.refresh_foreign_state() {
+                if entry == LockLevel::Unlocked {
+                    self.release_locks();
+                }
+                return Err(e);
+            }
         }
         Ok(())
+    }
+
+    /// Re-derive this pager's committed-state snapshot (the parsed header —
+    /// freelist head/count, auto-vacuum flags, schema cookie — and the page
+    /// count) from the database itself, when a **foreign** connection's commit
+    /// has changed the file since the snapshot was taken.
+    ///
+    /// This is the graphite analog of SQLite's `pagerSharedLock` stale-file
+    /// detection: SQLite compares the file-version bytes of page 1 on every
+    /// transaction start and, on a change, drops its page cache and re-reads
+    /// page 1, from which `lockBtree`/`allocateBtreePage`/`freePage2` then read
+    /// the freelist head and page count fresh. graphite instead caches those
+    /// fields in [`header`](Self::header) at open, so without this refresh a
+    /// second connection writes with a **stale freelist head / page count** —
+    /// `free_page` then appends leaf entries into what is now a live b-tree
+    /// page (clobbering its cell-pointer array), and `allocate_page` hands out
+    /// page numbers another connection's tree already owns.
+    ///
+    /// Called on the transition into a write transaction (`Reserved`), before
+    /// the first staged change. No-op while staged state exists (mid
+    /// transaction) or when this pager holds uncommitted header-only edits
+    /// (`header != committed_header`, e.g. a pending `PRAGMA user_version`),
+    /// which must not be clobbered.
+    fn refresh_foreign_state(&mut self) -> Result<()> {
+        if !self.overlay.is_empty() || self.header != self.committed_header {
+            return Ok(());
+        }
+        if let Some(w) = &self.wal {
+            // A pinned read transaction keeps its snapshot (matching the
+            // pre-existing WAL upgrade semantics); refresh only unpinned.
+            if w.registered_mark.get().is_some() {
+                return Ok(());
+            }
+            // Adopt the newest committed WAL state, then re-read page 1
+            // *through the WAL* so the parsed header matches it.
+            let snap = w.index.with(|ix| ix.snapshot());
+            w.snapshot.set(snap);
+            let db = w
+                .index
+                .with(|ix| ix.snapshot_db_size(snap.mx_frame))
+                .or_else(|| self.main_file_page_count())
+                .unwrap_or(self.disk_pages.get());
+            w.db_size.set(db);
+            if let Some(mf) = self.main_file_page_count() {
+                self.disk_pages.set(mf);
+            }
+            self.page_count.set(db);
+            let p1 = self.read_page(1)?;
+            let hdr = DatabaseHeader::parse(&p1)?;
+            if hdr.change_counter != self.header.change_counter {
+                self.adopt_committed_header(hdr);
+            }
+        } else {
+            let Some(current) = self.disk_change_counter() else {
+                return Ok(());
+            };
+            if current == self.header.change_counter {
+                return Ok(()); // no foreign commit since our snapshot
+            }
+            let mut head = [0u8; HEADER_LEN];
+            self.file.read_exact_at(&mut head, 0)?;
+            let hdr = DatabaseHeader::parse(&head)?;
+            let pages = self.main_file_page_count().unwrap_or(self.disk_pages.get());
+            self.disk_pages.set(pages);
+            self.page_count.set(pages);
+            self.adopt_committed_header(hdr);
+        }
+        Ok(())
+    }
+
+    /// Install `hdr` as both the live and the committed header snapshot, and
+    /// re-stamp any savepoints opened before the first write of this
+    /// transaction (their staged state is empty, so they represent exactly
+    /// this committed state — a `ROLLBACK TO` must not resurrect the stale
+    /// pre-refresh header).
+    fn adopt_committed_header(&mut self, hdr: DatabaseHeader) {
+        self.header = hdr.clone();
+        self.committed_header = hdr;
+        let pc = self.page_count.get();
+        for sp in &mut self.savepoints {
+            if sp.overlay.is_empty() {
+                sp.header = self.header.clone();
+                sp.page_count = pc;
+            }
+        }
     }
 
     /// Upgrade to the `EXCLUSIVE` lock for the flush phase of a commit.
@@ -870,14 +980,19 @@ impl WritePager {
     /// next page would be a ptrmap page (or the lock-byte page), we allocate and
     /// zero it in place and advance to the following page.
     pub fn allocate_page(&mut self) -> Result<u32> {
+        // Open the write transaction (and refresh a stale committed-state
+        // snapshot) *before* consulting the freelist head or page count —
+        // SQLite's allocateBtreePage likewise runs only inside an open write
+        // transaction, over a freshly-read page 1.
+        self.acquire_write_intent()?;
         if self.header.freelist_count > 0 && self.header.freelist_trunk != 0 {
             return self.alloc_from_freelist();
         }
         let auto_vacuum = self.auto_vacuum_on();
         let usable = self.usable_size() as u32;
         loop {
-            self.page_count += 1;
-            let n = self.page_count;
+            self.page_count.set(self.page_count.get() + 1);
+            let n = self.page_count.get();
             if auto_vacuum && self.is_reserved_layout_page(n, usable) {
                 // Materialize the ptrmap (or lock-byte) page zeroed and keep
                 // going; its contents are filled in by `rebuild_ptrmap` at commit.
@@ -943,9 +1058,18 @@ impl WritePager {
     /// Return `page` to the freelist (appending it as a leaf of the first trunk
     /// if there is room, else making it a new trunk page).
     pub fn free_page(&mut self, page: u32) -> Result<()> {
+        // Open the write transaction (and refresh a stale committed-state
+        // snapshot) *before* reading the freelist head: appending a leaf entry
+        // through a stale trunk pointer would clobber what a foreign commit
+        // has since turned into a live b-tree page (SQLite's freePage2 runs
+        // over a freshly-read page 1 for the same reason).
+        self.acquire_write_intent()?;
         let trunk = self.header.freelist_trunk;
-        // SQLite caps trunk leaves at usable/4 - 2 (integrity_check enforces it).
-        let max_leaves = (self.usable_size() / 4).saturating_sub(2) as u32;
+        // SQLite's freePage2 adds a leaf only while nLeaf < usableSize/4 - 8:
+        // although the format tolerates usable/4 - 2 entries, newer SQLite
+        // deliberately avoids the last six so files stay readable by pre-3.6.0
+        // versions. Match it so graphite's freelist trunks fill like SQLite's.
+        let max_leaves = (self.usable_size() / 4).saturating_sub(8) as u32;
         if trunk != 0 {
             let mut tbytes = self.read_page(trunk)?;
             let leaf_count = be32(&tbytes, 4);
@@ -1059,12 +1183,12 @@ impl WritePager {
         }
         let saved_overlay = self.overlay.clone();
         let saved_header = self.header.clone();
-        let saved_count = self.page_count;
+        let saved_count = self.page_count.get();
         // `limit == 0` ⇒ reclaim as much as possible (full compaction).
         if self.autovacuum_truncate(0).is_err() {
             self.overlay = saved_overlay;
             self.header = saved_header;
-            self.page_count = saved_count;
+            self.page_count.set(saved_count);
         }
     }
 
@@ -1089,17 +1213,17 @@ impl WritePager {
         } else {
             n.min(u32::MAX as i64) as u32
         };
-        let before = self.page_count;
+        let before = self.page_count.get();
         let saved_overlay = self.overlay.clone();
         let saved_header = self.header.clone();
-        let saved_count = self.page_count;
+        let saved_count = self.page_count.get();
         if self.autovacuum_truncate(limit).is_err() {
             self.overlay = saved_overlay;
             self.header = saved_header;
-            self.page_count = saved_count;
+            self.page_count.set(saved_count);
             return Ok(0);
         }
-        Ok(before - self.page_count)
+        Ok(before - self.page_count.get())
     }
 
     /// FULL `auto_vacuum` commit-time truncation (SQLite's `autoVacuumCommit`).
@@ -1163,8 +1287,8 @@ impl WritePager {
         let lock_page = (PENDING_BYTE / self.page_size as u64) as u32 + 1;
         let is_lock = |p: u32| lock_page > 1 && p == lock_page;
 
-        let start = self.page_count;
-        let mut last = self.page_count;
+        let start = self.page_count.get();
+        let mut last = self.page_count.get();
         while last > 1 {
             // Stop once `limit` trailing pages have been truncated (0 = unbounded).
             // Counting pages removed from the *end* of the file, not relocations,
@@ -1231,7 +1355,7 @@ impl WritePager {
         }
 
         // Apply the new page count and drop any overlay pages past the end.
-        self.page_count = last;
+        self.page_count.set(last);
         let stale: Vec<u32> = self.overlay.keys().copied().filter(|&p| p > last).collect();
         for p in stale {
             self.overlay.remove(&p);
@@ -1323,7 +1447,7 @@ impl WritePager {
         {
             return true;
         }
-        n >= 1 && n <= self.disk_pages
+        n >= 1 && n <= self.disk_pages.get()
     }
 
     /// Read the `rootpage` of every object in `sqlite_schema` (the table b-tree
@@ -1474,10 +1598,10 @@ impl WritePager {
         self.header = self.committed_header.clone();
         // The durable page count is the last WAL commit's in WAL mode, else the
         // main file's.
-        self.page_count = match &self.wal {
+        self.page_count.set(match &self.wal {
             Some(w) => w.db_size.get(),
-            None => self.disk_pages,
-        };
+            None => self.disk_pages.get(),
+        });
         self.savepoints.clear();
         self.release_locks();
     }
@@ -1488,7 +1612,7 @@ impl WritePager {
             name: String::from(name),
             overlay: self.overlay.clone(),
             header: self.header.clone(),
-            page_count: self.page_count,
+            page_count: self.page_count.get(),
         });
     }
 
@@ -1525,7 +1649,7 @@ impl WritePager {
                 let snap = &self.savepoints[idx];
                 self.overlay = snap.overlay.clone();
                 self.header = snap.header.clone();
-                self.page_count = snap.page_count;
+                self.page_count.set(snap.page_count);
                 self.savepoints.truncate(idx + 1);
                 Ok(())
             }
@@ -1553,7 +1677,7 @@ impl WritePager {
         }
         // Refresh header bookkeeping and re-stamp page 1.
         self.header.change_counter = self.header.change_counter.wrapping_add(1);
-        self.header.size_in_pages = self.page_count;
+        self.header.size_in_pages = self.page_count.get();
         self.header.version_valid_for = self.header.change_counter;
         let mut page1 = self.overlay.get(&1).cloned().unwrap_or(self.read_page(1)?);
         self.header.write_to(&mut page1)?;
@@ -1571,7 +1695,8 @@ impl WritePager {
         for (n, bytes) in &pages {
             self.file.write_all_at(bytes, (*n as u64 - 1) * page_size)?;
         }
-        self.file.truncate(self.page_count as u64 * page_size)?;
+        self.file
+            .truncate(self.page_count.get() as u64 * page_size)?;
         self.file.sync()?;
 
         // 3. Clear the journal — the commit is now durable.
@@ -1580,7 +1705,7 @@ impl WritePager {
             j.sync()?;
         }
 
-        self.disk_pages = self.page_count;
+        self.disk_pages.set(self.page_count.get());
         // The header just became durable: it is now the committed state a later
         // ROLLBACK must restore to.
         self.committed_header = self.header.clone();
@@ -1621,7 +1746,7 @@ impl WritePager {
     /// no-op until the next `VACUUM`, which we mirror).
     pub fn set_auto_vacuum_if_empty(&mut self, mode: AutoVacuum) -> Result<bool> {
         // "Empty" means a single page whose schema b-tree has no rows.
-        if self.page_count != 1 {
+        if self.page_count.get() != 1 {
             return Ok(false);
         }
         let p1 = self.read_page(1)?;
@@ -1687,7 +1812,7 @@ impl WritePager {
             index,
             snapshot: Cell::new(snapshot),
             registered_mark: Cell::new(None),
-            db_size: Cell::new(self.page_count),
+            db_size: Cell::new(self.page_count.get()),
             salt,
         });
         Ok(true)
@@ -1700,7 +1825,7 @@ impl WritePager {
             self.rebuild_ptrmap()?;
         }
         self.header.change_counter = self.header.change_counter.wrapping_add(1);
-        self.header.size_in_pages = self.page_count;
+        self.header.size_in_pages = self.page_count.get();
         self.header.version_valid_for = self.header.change_counter;
         let mut page1 = self.overlay.get(&1).cloned().unwrap_or(self.read_page(1)?);
         self.header.write_to(&mut page1)?;
@@ -1709,7 +1834,7 @@ impl WritePager {
         let page_size = self.page_size;
         let pages: Vec<(u32, Vec<u8>)> =
             self.overlay.iter().map(|(k, v)| (*k, v.clone())).collect();
-        let new_count = self.page_count;
+        let new_count = self.page_count.get();
         let wal = self.wal.as_mut().expect("wal mode");
         let index = wal.index.clone();
         let file = self.wal_file.as_mut().expect("wal file");
@@ -1818,7 +1943,7 @@ impl WritePager {
         }
         self.file.truncate(full_db_size as u64 * page_size)?;
         self.file.sync()?;
-        self.disk_pages = full_db_size;
+        self.disk_pages.set(full_db_size);
         // The checkpoint rewrote the main file; drop the clean read cache.
         self.read_cache.borrow_mut().clear();
 
@@ -1874,8 +1999,8 @@ impl WritePager {
         self.file.sync()?;
         let count = image.len() as u32;
         self.header = DatabaseHeader::parse(&image[0])?;
-        self.disk_pages = count;
-        self.page_count = count;
+        self.disk_pages.set(count);
+        self.page_count.set(count);
         self.overlay.clear();
         // The whole file was rewritten; drop the clean read cache.
         self.read_cache.borrow_mut().clear();
@@ -2056,7 +2181,7 @@ impl WritePager {
         // Collect originals of pages being overwritten (those already on disk).
         let mut originals: Vec<(u32, Vec<u8>)> = Vec::new();
         for &n in self.overlay.keys() {
-            if n <= self.disk_pages {
+            if n <= self.disk_pages.get() {
                 let mut buf = vec![0u8; self.page_size];
                 self.file
                     .read_exact_at(&mut buf, (n as u64 - 1) * self.page_size as u64)?;
@@ -2068,7 +2193,7 @@ impl WritePager {
         // a previous journal fails this transaction's checksum.
         let nonce = (self.header.change_counter)
             .wrapping_mul(0x9E37_79B1)
-            .wrapping_add(self.disk_pages.wrapping_mul(2_654_435_761));
+            .wrapping_add(self.disk_pages.get().wrapping_mul(2_654_435_761));
         let page_size = self.page_size as u64;
         let j = self.journal.as_mut().unwrap();
         j.truncate(0)?;
@@ -2078,7 +2203,7 @@ impl WritePager {
         hdr[0..8].copy_from_slice(&JOURNAL_MAGIC);
         // Record count is filled in after the records are synced (see below).
         hdr[12..16].copy_from_slice(&nonce.to_be_bytes());
-        hdr[16..20].copy_from_slice(&self.disk_pages.to_be_bytes());
+        hdr[16..20].copy_from_slice(&self.disk_pages.get().to_be_bytes());
         hdr[20..24].copy_from_slice(&(JOURNAL_SECTOR as u32).to_be_bytes());
         hdr[24..28].copy_from_slice(&(page_size as u32).to_be_bytes());
         debug_assert_eq!(JOURNAL_HDR_FIELDS, 28);
@@ -2236,7 +2361,7 @@ impl PageSource for WritePager {
         // pages. Outside WAL, the logical count as before.
         match &self.wal {
             Some(w) if self.overlay.is_empty() => w.db_size.get(),
-            _ => self.page_count,
+            _ => self.page_count.get(),
         }
     }
     fn revalidate_cache(&self) {
