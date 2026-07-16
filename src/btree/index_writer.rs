@@ -432,9 +432,10 @@ fn rowid_of(rec: &[Value]) -> i64 {
 
 /// Allocate an empty index b-tree (a single leaf page) and return its root.
 pub fn create_index_root(wp: &mut WritePager) -> Result<u32> {
-    let page_size = wp.usable_size() + wp.header().reserved_space as usize;
+    let usable = wp.usable_size();
+    let page_size = usable + wp.header().reserved_space as usize;
     let root = wp.allocate_page()?;
-    let buf = serialize_index_leaf(page_size, 0, &[], None)?;
+    let buf = serialize_index_leaf(page_size, usable, 0, &[], None)?;
     wp.write_page(root, buf)?;
     Ok(root)
 }
@@ -518,7 +519,7 @@ pub fn clear_index(wp: &mut WritePager, root: u32) -> Result<()> {
         }
         _ => return Err(Error::Corrupt("clear of a non-index b-tree".into())),
     }
-    let empty = serialize_index_leaf(page_size, 0, &[], None)?;
+    let empty = serialize_index_leaf(page_size, usable, 0, &[], None)?;
     wp.write_page(root, empty)?;
     Ok(())
 }
@@ -592,10 +593,15 @@ fn insert_rec(
                 }
             }
             entries.insert(pos, (target.to_vec(), rcell));
-            if leaf_fits(&entries, body, page_size) {
+            if leaf_fits(&entries, body, usable) {
                 let prefix = page_one_prefix(page_no, &bt);
-                let buf =
-                    serialize_index_leaf(page_size, body, &rcells(&entries), prefix.as_deref())?;
+                let buf = serialize_index_leaf(
+                    page_size,
+                    usable,
+                    body,
+                    &rcells(&entries),
+                    prefix.as_deref(),
+                )?;
                 wp.write_page(page_no, buf)?;
                 Ok(IdxUp::Fit)
             } else {
@@ -638,7 +644,9 @@ fn insert_rec(
                 IdxUp::Split(s) => adopt_split(&mut children, &mut dividers, p, s),
             }
 
-            finish_interior(wp, page_no, body, page_size, &children, &dividers, prefix)
+            finish_interior(
+                wp, page_no, body, page_size, usable, &children, &dividers, prefix,
+            )
         }
         _ => Err(Error::Corrupt("insert into a non-index b-tree".into())),
     }
@@ -673,11 +681,13 @@ fn adopt_split(children: &mut Vec<u32>, dividers: &mut Vec<IdxKey>, p: usize, s:
 
 /// Rebuild an interior page from its `children`/`dividers`, writing it back if it
 /// fits, else performing the (rare) greedy multi-way interior split.
+#[allow(clippy::too_many_arguments)]
 fn finish_interior(
     wp: &mut WritePager,
     page_no: u32,
     body: usize,
     page_size: usize,
+    usable: usize,
     children: &[u32],
     dividers: &[IdxKey],
     prefix: Option<Vec<u8>>,
@@ -688,27 +698,28 @@ fn finish_interior(
     }
     let right = *children.last().expect("interior always has a right child");
 
-    if interior_fits(&cells, body, page_size) {
-        let buf = serialize_index_interior(page_size, body, &cells, right, prefix.as_deref())?;
+    if interior_fits(&cells, body, usable) {
+        let buf =
+            serialize_index_interior(page_size, usable, body, &cells, right, prefix.as_deref())?;
         wp.write_page(page_no, buf)?;
         return Ok(IdxUp::Fit);
     }
-    let (parts, seps) = pack_index_interior(&cells, right, body, page_size);
+    let (parts, seps) = pack_index_interior(&cells, right, body, usable);
     if parts.len() == 1 {
         let (pc, pr) = &parts[0];
-        let buf = serialize_index_interior(page_size, body, pc, *pr, prefix.as_deref())?;
+        let buf = serialize_index_interior(page_size, usable, body, pc, *pr, prefix.as_deref())?;
         wp.write_page(page_no, buf)?;
         return Ok(IdxUp::Fit);
     }
     let first = seps[0].clone();
     let (p0c, p0r) = &parts[0];
-    let lbuf = serialize_index_interior(page_size, body, p0c, *p0r, prefix.as_deref())?;
+    let lbuf = serialize_index_interior(page_size, usable, body, p0c, *p0r, prefix.as_deref())?;
     wp.write_page(page_no, lbuf)?;
     let mut siblings = Vec::with_capacity(parts.len() - 1);
     for k in 1..parts.len() {
         let (pc, pr) = &parts[k];
         let pg = wp.allocate_page()?;
-        let buf = serialize_index_interior(page_size, 0, pc, *pr, None)?;
+        let buf = serialize_index_interior(page_size, usable, 0, pc, *pr, None)?;
         wp.write_page(pg, buf)?;
         let key = if k < seps.len() {
             seps[k].clone()
@@ -796,7 +807,7 @@ fn balance_leaf_pooled(
         // Page i owns pooled entries [start, end); the entry at `end` (when
         // present) is the boundary that is promoted to the parent, not stored.
         let slice = &pooled[start..end];
-        let buf = serialize_index_leaf(page_size, 0, &rcells(slice), None)?;
+        let buf = serialize_index_leaf(page_size, usable, 0, &rcells(slice), None)?;
         wp.write_page(kept[i], buf)?;
         if i < n_new - 1 {
             new_dividers.push(pooled[end].clone());
@@ -810,7 +821,8 @@ fn balance_leaf_pooled(
 /// root's entries across fresh child leaves, keeping the root's page number
 /// stable. (Index roots are never page 1, so no header prefix is involved.)
 fn deepen_leaf_root(wp: &mut WritePager, root: u32, entries: Vec<LeafEntry>) -> Result<()> {
-    let page_size = wp.usable_size() + wp.header().reserved_space as usize;
+    let usable = wp.usable_size();
+    let page_size = usable + wp.header().reserved_space as usize;
     let child0 = wp.allocate_page()?;
     let cnt_old = vec![entries.len()];
     let (pages, dividers) = balance_leaf_pooled(wp, &[child0], &entries, &cnt_old)?;
@@ -820,7 +832,7 @@ fn deepen_leaf_root(wp: &mut WritePager, root: u32, entries: Vec<LeafEntry>) -> 
         icells.push((pages[i], full, rc));
     }
     let right = *pages.last().expect("deepen always yields >= 2 leaves");
-    let buf = serialize_index_interior(page_size, 0, &icells, right, None)?;
+    let buf = serialize_index_interior(page_size, usable, 0, &icells, right, None)?;
     wp.write_page(root, buf)?;
     Ok(())
 }
@@ -843,7 +855,7 @@ fn grow_root(wp: &mut WritePager, root: u32, split: IdxSplit) -> Result<()> {
     for ((full, rc), pg) in sibs {
         cells.push((pg, full, rc));
     }
-    let buf = serialize_index_interior(page_size, 0, &cells, last.1, None)?;
+    let buf = serialize_index_interior(page_size, usable, 0, &cells, last.1, None)?;
     wp.write_page(root, buf)?;
     Ok(())
 }
@@ -902,14 +914,14 @@ fn cmp_records(
     Ok(va.len().cmp(&vb.len()))
 }
 
-fn leaf_fits(entries: &[LeafEntry], body: usize, page_size: usize) -> bool {
+fn leaf_fits(entries: &[LeafEntry], body: usize, usable: usize) -> bool {
     let used: usize = entries.iter().map(|(_, c)| c.len() + 2).sum();
-    used <= page_size - body - 8
+    used <= usable - body - 8
 }
 
-fn interior_fits(cells: &[InteriorEntry], body: usize, page_size: usize) -> bool {
+fn interior_fits(cells: &[InteriorEntry], body: usize, usable: usize) -> bool {
     let used: usize = cells.iter().map(|(_, _, c)| 4 + c.len() + 2).sum();
-    used <= page_size - body - 12
+    used <= usable - body - 12
 }
 
 /// One part of a multi-way interior split: its on-page cells and its right pointer.
@@ -924,7 +936,7 @@ fn pack_index_interior(
     cells: &[InteriorEntry],
     right: u32,
     body0: usize,
-    page_size: usize,
+    usable: usize,
 ) -> (Vec<IdxInteriorPart>, Vec<IdxKey>) {
     let n = cells.len();
     // child(j): the j-th child pointer (j == n is the page's right pointer).
@@ -934,8 +946,8 @@ fn pack_index_interior(
     let mut i = 0usize;
     loop {
         let body = if parts.is_empty() { body0 } else { 0 };
-        // `interior_fits` bound: sum(4 + rcell.len() + 2) <= page_size - body - 12.
-        let cap = page_size.saturating_sub(body + 12);
+        // `interior_fits` bound: sum(4 + rcell.len() + 2) <= usable - body - 12.
+        let cap = usable.saturating_sub(body + 12);
         let mut used = 0usize;
         let mut b = i;
         while b < n {
@@ -968,20 +980,24 @@ fn pack_index_interior(
 
 fn serialize_index_leaf(
     page_size: usize,
+    usable: usize,
     body: usize,
     rcells: &[Vec<u8>],
     header_prefix: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    // Buffer is the full `page_size`; content lays out only within `usable` so the
+    // reserved bytes at the page end stay zero.
     let mut buf = vec![0u8; page_size];
     if let Some(h) = header_prefix {
         buf[..h.len()].copy_from_slice(h);
     }
     let ptr_base = body + 8;
     // The cell-pointer array grows up from `ptr_base`; cell content packs down from
-    // the page end. They must not meet. `leaf_fits`/`balance` guarantees a fitting
-    // list, but check defensively so a violation surfaces as `Corrupt`, not a panic.
+    // the top of the usable area. They must not meet. `leaf_fits`/`balance`
+    // guarantees a fitting list, but check defensively so a violation surfaces as
+    // `Corrupt`, not a panic.
     let ptr_end = ptr_base + 2 * rcells.len();
-    let mut content = page_size;
+    let mut content = usable;
     for (i, cell) in rcells.iter().enumerate() {
         if content < cell.len() || content - cell.len() < ptr_end {
             return Err(Error::Corrupt(
@@ -1002,18 +1018,21 @@ fn serialize_index_leaf(
 
 fn serialize_index_interior(
     page_size: usize,
+    usable: usize,
     body: usize,
     cells: &[InteriorEntry],
     right: u32,
     header_prefix: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    // Buffer is the full `page_size`; content lays out only within `usable` so the
+    // reserved bytes at the page end stay zero.
     let mut buf = vec![0u8; page_size];
     if let Some(h) = header_prefix {
         buf[..h.len()].copy_from_slice(h);
     }
     let ptr_base = body + 12;
     let ptr_end = ptr_base + 2 * cells.len();
-    let mut content = page_size;
+    let mut content = usable;
     for (i, (child, _, rcell)) in cells.iter().enumerate() {
         let mut cell = Vec::with_capacity(4 + rcell.len());
         cell.extend_from_slice(&child.to_be_bytes());
@@ -1117,7 +1136,7 @@ mod tests {
             children.push(*pr); // this part's right pointer
             let _ = k;
             // Each part must fit and serialize.
-            serialize_index_interior(page, 0, pc, *pr, None).unwrap();
+            serialize_index_interior(page, page, 0, pc, *pr, None).unwrap();
         }
         // Simpler invariant: the last part's right pointer is the page's right.
         assert_eq!(parts.last().unwrap().1, right);

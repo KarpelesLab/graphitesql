@@ -49,9 +49,10 @@ struct Split {
 /// Allocate a fresh, empty table b-tree (a single leaf page) and return its
 /// root page number. Use this when creating a table.
 pub fn create_table_root(wp: &mut WritePager) -> Result<u32> {
-    let page_size = wp.usable_size() + wp.header().reserved_space as usize;
+    let usable = wp.usable_size();
+    let page_size = usable + wp.header().reserved_space as usize;
     let root = wp.allocate_page()?;
-    let buf = serialize_leaf(page_size, 0, &[], None)?;
+    let buf = serialize_leaf(page_size, usable, 0, &[], None)?;
     wp.write_page(root, buf)?;
     Ok(root)
 }
@@ -101,7 +102,8 @@ pub fn delete_table(wp: &mut WritePager, root: u32, rowid: i64) -> Result<bool> 
                 }
                 cells.remove(pos);
                 let header_prefix = page_one_prefix(page_no, &bt);
-                let buf = serialize_leaf(page_size, body, &cells, header_prefix.as_deref())?;
+                let buf =
+                    serialize_leaf(page_size, usable, body, &cells, header_prefix.as_deref())?;
                 wp.write_page(page_no, buf)?;
                 free_overflow_chain(wp, overflow)?;
                 return Ok(true);
@@ -151,7 +153,7 @@ pub fn clear_table(wp: &mut WritePager, root: u32) -> Result<()> {
         }
         _ => return Err(Error::Corrupt("clear of a non-table b-tree".into())),
     }
-    let empty = serialize_leaf(page_size, body, &[], prefix.as_deref())?;
+    let empty = serialize_leaf(page_size, usable, body, &[], prefix.as_deref())?;
     wp.write_page(root, empty)?;
     Ok(())
 }
@@ -261,9 +263,10 @@ fn insert_rec(wp: &mut WritePager, page_no: u32, rowid: i64, cell: Vec<u8>) -> R
                 Ok(pos) => cells[pos] = (rowid, cell), // replace existing rowid
                 Err(pos) => cells.insert(pos, (rowid, cell)),
             }
-            if leaf_fits(&cells, body, page_size) {
+            if leaf_fits(&cells, body, usable) {
                 let header_prefix = page_one_prefix(page_no, &bt);
-                let buf = serialize_leaf(page_size, body, &cells, header_prefix.as_deref())?;
+                let buf =
+                    serialize_leaf(page_size, usable, body, &cells, header_prefix.as_deref())?;
                 wp.write_page(page_no, buf)?;
                 Ok(Up::Fit)
             } else {
@@ -301,7 +304,9 @@ fn insert_rec(wp: &mut WritePager, page_no: u32, rowid: i64, cell: Vec<u8>) -> R
                 Up::Split(s) => adopt_split(&mut children, &mut dividers, p, s),
             }
 
-            finish_interior(wp, page_no, body, page_size, &children, &dividers, prefix)
+            finish_interior(
+                wp, page_no, body, page_size, usable, &children, &dividers, prefix,
+            )
         }
         _ => Err(Error::Corrupt("insert into a non-table b-tree".into())),
     }
@@ -345,11 +350,13 @@ fn adopt_split(children: &mut Vec<u32>, dividers: &mut Vec<i64>, p: usize, s: Sp
 /// Rebuild an interior page from its `children`/`dividers` lists, writing it back
 /// if it fits, else performing the (rare) greedy multi-way interior split and
 /// bubbling a [`Split`] up.
+#[allow(clippy::too_many_arguments)]
 fn finish_interior(
     wp: &mut WritePager,
     page_no: u32,
     body: usize,
     page_size: usize,
+    usable: usize,
     children: &[u32],
     dividers: &[i64],
     prefix: Option<Vec<u8>>,
@@ -360,28 +367,28 @@ fn finish_interior(
     }
     let right = *children.last().expect("interior always has a right child");
 
-    if interior_fits(&cells, body, page_size) {
-        let buf = serialize_interior(page_size, body, &cells, right, prefix.as_deref())?;
+    if interior_fits(&cells, body, usable) {
+        let buf = serialize_interior(page_size, usable, body, &cells, right, prefix.as_deref())?;
         wp.write_page(page_no, buf)?;
         return Ok(Up::Fit);
     }
     // Robust multi-way interior split (interiors overflow only in deep trees).
-    let (parts, seps) = pack_interior(&cells, right, body, page_size);
+    let (parts, seps) = pack_interior(&cells, right, body, usable);
     if parts.len() == 1 {
         let (pc, pr) = &parts[0];
-        let buf = serialize_interior(page_size, body, pc, *pr, prefix.as_deref())?;
+        let buf = serialize_interior(page_size, usable, body, pc, *pr, prefix.as_deref())?;
         wp.write_page(page_no, buf)?;
         return Ok(Up::Fit);
     }
     let first_key = seps[0];
     let (p0c, p0r) = &parts[0];
-    let left_buf = serialize_interior(page_size, body, p0c, *p0r, prefix.as_deref())?;
+    let left_buf = serialize_interior(page_size, usable, body, p0c, *p0r, prefix.as_deref())?;
     wp.write_page(page_no, left_buf)?;
     let mut siblings = Vec::with_capacity(parts.len() - 1);
     for k in 1..parts.len() {
         let (pc, pr) = &parts[k];
         let pg = wp.allocate_page()?;
-        let buf = serialize_interior(page_size, 0, pc, *pr, None)?;
+        let buf = serialize_interior(page_size, usable, 0, pc, *pr, None)?;
         wp.write_page(pg, buf)?;
         let key = if k < seps.len() { seps[k] } else { i64::MAX };
         siblings.push((key, pg));
@@ -466,7 +473,7 @@ fn balance_leaf_pooled(
     let mut start = 0usize;
     for (i, &end) in cnt_new.iter().enumerate() {
         let slice = &pooled[start..end];
-        let buf = serialize_leaf(page_size, 0, slice, None)?;
+        let buf = serialize_leaf(page_size, usable, 0, slice, None)?;
         wp.write_page(kept[i], buf)?;
         if i < n_new - 1 {
             dividers.push(slice.last().expect("non-empty new page").0);
@@ -480,7 +487,8 @@ fn balance_leaf_pooled(
 /// `balance_deeper`) and redistribute the root's cells across fresh child leaves,
 /// keeping the root's page number (and, for page 1, its database header) stable.
 fn deepen_leaf_root(wp: &mut WritePager, root: u32, cells: Vec<LeafCell>) -> Result<()> {
-    let page_size = wp.usable_size() + wp.header().reserved_space as usize;
+    let usable = wp.usable_size();
+    let page_size = usable + wp.header().reserved_space as usize;
     let bt = BtreePage::parse(wp.page(root)?)?;
     let body = if root == 1 {
         crate::format::header::HEADER_LEN
@@ -503,7 +511,7 @@ fn deepen_leaf_root(wp: &mut WritePager, root: u32, cells: Vec<LeafCell>) -> Res
         icells.push((pages[i], *d));
     }
     let right = *pages.last().expect("deepen always yields >= 2 leaves");
-    let buf = serialize_interior(page_size, body, &icells, right, prefix.as_deref())?;
+    let buf = serialize_interior(page_size, usable, body, &icells, right, prefix.as_deref())?;
     wp.write_page(root, buf)?;
     Ok(())
 }
@@ -535,7 +543,14 @@ fn grow_root(wp: &mut WritePager, root: u32, split: Split) -> Result<()> {
     for (k, pg) in sibs {
         cells.push((pg, k));
     }
-    let buf = serialize_interior(page_size, body, &cells, last.1, header_prefix.as_deref())?;
+    let buf = serialize_interior(
+        page_size,
+        usable,
+        body,
+        &cells,
+        last.1,
+        header_prefix.as_deref(),
+    )?;
     wp.write_page(root, buf)?;
     Ok(())
 }
@@ -551,7 +566,7 @@ fn reserialize(
     match bt.page_type() {
         PageType::LeafTable => {
             let cells = read_leaf_cells(bt, usable)?;
-            serialize_leaf(page_size, 0, &cells, None)
+            serialize_leaf(page_size, usable, 0, &cells, None)
         }
         PageType::InteriorTable => {
             let n = bt.num_cells();
@@ -559,7 +574,7 @@ fn reserialize(
             for i in 0..n {
                 cells.push((bt.child_pointer(i)?, bt.table_interior_key(i)?));
             }
-            serialize_interior(page_size, 0, &cells, bt.right_pointer(), None)
+            serialize_interior(page_size, usable, 0, &cells, bt.right_pointer(), None)
         }
         _ => {
             let _ = wp;
@@ -588,14 +603,14 @@ pub(crate) fn page_one_prefix(page_no: u32, bt: &BtreePage) -> Option<Vec<u8>> {
     }
 }
 
-fn leaf_fits(cells: &[LeafCell], body: usize, page_size: usize) -> bool {
+fn leaf_fits(cells: &[LeafCell], body: usize, usable: usize) -> bool {
     let used: usize = cells.iter().map(|(_, c)| c.len() + 2).sum();
-    used <= page_size - body - 8
+    used <= usable - body - 8
 }
 
-fn interior_fits(cells: &[(u32, i64)], body: usize, page_size: usize) -> bool {
+fn interior_fits(cells: &[(u32, i64)], body: usize, usable: usize) -> bool {
     let used: usize = cells.iter().map(|(_, k)| interior_cell_len(*k) + 2).sum();
-    used <= page_size - body - 12
+    used <= usable - body - 12
 }
 
 fn interior_cell_len(key: i64) -> usize {
@@ -613,7 +628,7 @@ fn pack_interior(
     cells: &[InteriorCell],
     right: u32,
     body0: usize,
-    page_size: usize,
+    usable: usize,
 ) -> (Vec<InteriorPart>, Vec<i64>) {
     let n = cells.len();
     // child(j): the j-th child pointer (j == n is the page's right pointer).
@@ -623,8 +638,8 @@ fn pack_interior(
     let mut i = 0usize; // first child index of the current group
     loop {
         let body = if parts.is_empty() { body0 } else { 0 };
-        // `interior_fits` bound: sum(cell_len + 2) <= page_size - body - 12.
-        let cap = page_size.saturating_sub(body + 12);
+        // `interior_fits` bound: sum(cell_len + 2) <= usable - body - 12.
+        let cap = usable.saturating_sub(body + 12);
         let mut used = 0usize;
         let mut b = i;
         while b < n {
@@ -658,22 +673,27 @@ fn pack_interior(
 
 fn serialize_leaf(
     page_size: usize,
+    usable: usize,
     body: usize,
     cells: &[LeafCell],
     header_prefix: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    // The on-disk buffer is the full `page_size`; cell content is laid out only in
+    // the `usable = page_size - reserved` region so the reserved bytes at the page
+    // end stay zero (SQLite rejects any cell that extends into the reserved area).
     let mut buf = vec![0u8; page_size];
     if let Some(h) = header_prefix {
         buf[..h.len()].copy_from_slice(h);
     }
     let ptr_base = body + 8;
     // The cell-pointer array grows up from `ptr_base`; cell content is packed down
-    // from the page end. They must not meet — otherwise a content byte would land
-    // in the pointer array (or the pointer offsets would point past the page end).
-    // The caller (`leaf_fits`/`balance`) guarantees a fitting list, but check
-    // defensively so an invariant violation surfaces as `Corrupt`, never a panic.
+    // from the top of the usable area. They must not meet — otherwise a content
+    // byte would land in the pointer array (or the pointer offsets would point past
+    // the usable end). The caller (`leaf_fits`/`balance`) guarantees a fitting list,
+    // but check defensively so an invariant violation surfaces as `Corrupt`, never a
+    // panic.
     let ptr_end = ptr_base + 2 * cells.len();
-    let mut content = page_size;
+    let mut content = usable;
     for (i, (_, cell)) in cells.iter().enumerate() {
         if content < cell.len() || content - cell.len() < ptr_end {
             return Err(Error::Corrupt(
@@ -694,18 +714,21 @@ fn serialize_leaf(
 
 fn serialize_interior(
     page_size: usize,
+    usable: usize,
     body: usize,
     cells: &[(u32, i64)],
     right: u32,
     header_prefix: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    // Buffer is the full `page_size`; content lays out only within `usable` so the
+    // reserved bytes at the page end stay zero.
     let mut buf = vec![0u8; page_size];
     if let Some(h) = header_prefix {
         buf[..h.len()].copy_from_slice(h);
     }
     let ptr_base = body + 12;
     let ptr_end = ptr_base + 2 * cells.len();
-    let mut content = page_size;
+    let mut content = usable;
     for (i, (child, key)) in cells.iter().enumerate() {
         let mut cell = Vec::with_capacity(interior_cell_len(*key));
         cell.extend_from_slice(&child.to_be_bytes());
@@ -755,9 +778,10 @@ mod tests {
 
     fn new_table_root(wp: &mut WritePager) -> u32 {
         // Allocate an empty leaf page to serve as a table root.
-        let page_size = wp.usable_size() + wp.header().reserved_space as usize;
+        let usable = wp.usable_size();
+        let page_size = usable + wp.header().reserved_space as usize;
         let root = wp.allocate_page().unwrap();
-        let buf = serialize_leaf(page_size, 0, &[], None).unwrap();
+        let buf = serialize_leaf(page_size, usable, 0, &[], None).unwrap();
         wp.write_page(root, buf).unwrap();
         root
     }
