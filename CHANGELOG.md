@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/KarpelesLab/graphitesql/compare/v0.1.2...v0.1.3) - 2026-07-16
+
+### Fixed
+
+- *(btree)* honor reserved page bytes so pages aren't written into the reserved region
+- *(btree)* rebalance sibling pages on split so non-sequential inserts don't fragment
+- *(fts5)* detail=none/column delete and update write byte-identical tombstone segments
+- *(fts5)* honor detail=none/detail=column in the segment writer
+- *(fts5)* byte-identical prefix double-cascade merge
+
+### Refactor
+
+- *(api)* mark low-level implementation modules #[doc(hidden)]
+
 ## [0.1.2](https://github.com/KarpelesLab/graphitesql/compare/v0.1.1...v0.1.2) - 2026-07-15
 
 ### Added
