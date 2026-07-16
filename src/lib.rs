@@ -52,6 +52,15 @@ extern crate alloc;
 extern crate std;
 
 pub mod error;
+// Low-level implementation modules are `pub` only so the sibling crates
+// (`graphitesql-capi`, `graphitesql-wasm`) and the test suite can reach them;
+// they are NOT part of graphitesql's stable, SQLite-compatible public API. Mark
+// them `#[doc(hidden)]` so they are excluded from the generated docs and from
+// `cargo-semver-checks` — internal churn (e.g. a new field on `vtab::Fts5Tok`)
+// must not force a version bump. The curated API is the crate-root re-exports
+// below (`Connection`, `Value`, `Error`, the session/changeset types, …), plus
+// `error`, `session`, and `vfs` (a documented custom-VFS extension point).
+#[doc(hidden)]
 pub mod util;
 
 mod value;
@@ -59,17 +68,24 @@ pub use value::{
     Collation, SerialType, Text, Value, ValueRef, cmp_text, cmp_values, cmp_values_coll,
 };
 
+#[doc(hidden)]
 pub mod btree;
+#[doc(hidden)]
 pub mod exec;
+#[doc(hidden)]
 pub mod format;
 #[cfg(feature = "fts5")]
 pub(crate) mod fts5_index;
 pub(crate) mod geopoly;
+#[doc(hidden)]
 pub mod pager;
+#[doc(hidden)]
 pub mod schema;
 pub mod session;
+#[doc(hidden)]
 pub mod sql;
 pub mod vfs;
+#[doc(hidden)]
 pub mod vtab;
 
 pub use error::{Error, Result};
