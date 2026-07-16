@@ -340,10 +340,19 @@ mod registry {
 pub fn cmp_text(x: &str, y: &str, coll: Collation) -> Ordering {
     match coll {
         Collation::Binary => x.as_bytes().cmp(y.as_bytes()),
+        // NOCASE folds ASCII letters to *lower* case, matching SQLite's
+        // `sqlite3UpperToLower[]` (used by `nocaseCollatingFunc`): only bytes
+        // 'A'..='Z' change (`c | 0x20`); everything else — including the
+        // punctuation bytes 0x5B..=0x60 (`[ \ ] ^ _ ` `) — is left as-is.
+        // Rust's `u8::to_ascii_lowercase` is exactly this ASCII table. Folding
+        // to *upper* case (as an earlier version did) inverted the order of
+        // keys mixing letters with those punctuation bytes, and — because
+        // NOCASE builds on-disk index keys — wrote NOCASE indexes in an order
+        // sqlite considers malformed. Equality is unaffected either way.
         Collation::NoCase => x
             .bytes()
-            .map(|b| b.to_ascii_uppercase())
-            .cmp(y.bytes().map(|b| b.to_ascii_uppercase())),
+            .map(|b| b.to_ascii_lowercase())
+            .cmp(y.bytes().map(|b| b.to_ascii_lowercase())),
         Collation::RTrim => x
             .trim_end_matches(' ')
             .as_bytes()
@@ -546,6 +555,28 @@ mod tests {
             SerialType::for_value(&Value::Blob(vec![0u8; 4])),
             SerialType(20) // 12 + 2*4
         );
+    }
+
+    #[test]
+    fn nocase_folds_to_lowercase_like_sqlite() {
+        use core::cmp::Ordering;
+        // SQLite's NOCASE (`sqlite3UpperToLower[]`) folds letters to lower
+        // case: 'A' -> 0x61, which sorts *after* the punctuation bytes
+        // 0x5B..=0x60. Folding to upper case would put 'A' (0x41) *before*
+        // them — the bug this guards against.
+        assert_eq!(cmp_text("A", "[", Collation::NoCase), Ordering::Greater);
+        assert_eq!(cmp_text("A", "_", Collation::NoCase), Ordering::Greater);
+        assert_eq!(cmp_text("A", "`", Collation::NoCase), Ordering::Greater);
+        // '9' (0x39) < '[' (0x5B) < 'a'/'A' either way.
+        assert_eq!(cmp_text("9", "[", Collation::NoCase), Ordering::Less);
+        // Case-insensitive equality is unaffected.
+        assert_eq!(
+            cmp_text("Apple", "apple", Collation::NoCase),
+            Ordering::Equal
+        );
+        assert_eq!(cmp_text("Z", "z", Collation::NoCase), Ordering::Equal);
+        // Non-letter bytes never fold.
+        assert_eq!(cmp_text("[", "[", Collation::NoCase), Ordering::Equal);
     }
 
     #[test]
