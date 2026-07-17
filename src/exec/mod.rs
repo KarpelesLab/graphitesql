@@ -16,14 +16,15 @@
 pub mod datetime;
 pub mod eval;
 pub mod func;
+mod integrity;
 pub mod json;
 mod stat4;
 pub mod vdbe;
 mod window;
 
 use crate::btree::{
-    BtreePage, IndexCursor, PageType, TableCursor, clear_index, clear_table, create_index_root,
-    create_table_root, delete_table, free_tree, insert_index, insert_table, table_has_empty_leaf,
+    IndexCursor, TableCursor, clear_index, clear_table, create_index_root, create_table_root,
+    delete_table, free_tree, insert_index, insert_table, table_has_empty_leaf,
 };
 use crate::error::{Error, Result};
 use crate::format::record::{decode_record, encode_record};
@@ -4076,7 +4077,7 @@ impl Connection {
             }),
             "foreign_key_list" => self.pragma_foreign_key_list(p),
             "foreign_key_check" => self.pragma_foreign_key_check(p),
-            "integrity_check" | "quick_check" => self.pragma_integrity_check(),
+            "integrity_check" | "quick_check" => self.pragma_integrity_check(p),
             "foreign_keys" => Ok(single(
                 "foreign_keys",
                 Value::Integer(self.foreign_keys as i64),
@@ -5297,16 +5298,30 @@ impl Connection {
         })
     }
 
-    /// `PRAGMA integrity_check` / `quick_check`: walk every table and index
-    /// b-tree and verify each index holds exactly the entries its table implies
-    /// (honoring partial-index predicates). Returns the single value `ok` when the
-    /// database is consistent, else one row per detected problem.
-    fn pragma_integrity_check(&self) -> Result<QueryResult> {
+    /// `PRAGMA integrity_check` / `quick_check`: whole-file page accounting
+    /// (every page reachable exactly once — see [`integrity::PageAccounting`]),
+    /// a structural walk of every b-tree, and a verification that each index
+    /// holds exactly the entries its table implies (honoring partial-index
+    /// predicates). Returns the single value `ok` when the database is
+    /// consistent, else one row per detected problem — capped at
+    /// `PRAGMA integrity_check(N)`'s limit (default 100, like sqlite's
+    /// `SQLITE_INTEGRITY_CHECK_ERROR_MAX`).
+    fn pragma_integrity_check(&self, p: &Pragma) -> Result<QueryResult> {
         use crate::schema::ObjectType;
         let single = |v: Value| QueryResult {
             columns: alloc::vec![String::from("integrity_check")],
             rows: alloc::vec![alloc::vec![v]],
         };
+        // `PRAGMA integrity_check(N)` caps the report at N messages; a
+        // non-positive or non-integer argument keeps sqlite's default of 100.
+        let mut max_err: usize = 100;
+        if let Some(e) = &p.value
+            && let Ok(v) = eval::eval(e, &EvalCtx::rowless(&Params::default()))
+            && let Value::Integer(n) = v
+            && n > 0
+        {
+            max_err = n as usize;
+        }
         let tables: Vec<String> = self
             .schema
             .objects()
@@ -5327,38 +5342,73 @@ impl Connection {
 
         let mut problems = Vec::new();
         let src = self.backend.source();
+
+        // Whole-file page accounting, the port of `sqlite3BtreeIntegrityCheck`'s
+        // aPgRef protocol: walk the freelist and every b-tree root — page 1 (the
+        // sqlite_schema tree) plus every object in the catalog, including the
+        // sqlite_* internal tables the logical checks below skip — through one
+        // shared reference bitmap, then sweep for pages never reached. This is
+        // what catches cross-tree damage: a page claimed by two trees, a live
+        // page also on the freelist, or an orphaned (leaked) page.
+        if src.page_count() > 0 {
+            let mut acct = integrity::PageAccounting::new(src, max_err);
+            let mut roots: Vec<(u32, String)> = alloc::vec![(1, String::from("sqlite_schema"))];
+            for o in self.schema.objects() {
+                if o.rootpage > 0 {
+                    roots.push((o.rootpage, o.name.clone()));
+                }
+            }
+            acct.check_freelist(&mut problems);
+            acct.check_rootpage_header(roots.iter().map(|r| r.0).max().unwrap_or(0), &mut problems);
+            for (root, label) in &roots {
+                acct.check_tree(*root, label, &mut problems);
+            }
+            acct.check_never_used(&mut problems);
+        }
+
         for table in &tables {
+            if problems.len() >= max_err {
+                break;
+            }
             let meta = self.table_meta(table, None)?;
-            // Structurally walk the table b-tree: every child page must be in
-            // range, reachable once, and a non-root leaf must never be empty.
-            // (An empty non-root leaf — the shape a delete leaves if the tree is
-            // not compacted — is a malformed sqlite b-tree; without this walk the
-            // count-based checks below would miss it.)
-            check_btree_structure(src, meta.root, table, &mut problems);
             // The rows that physically exist, and how many each index should hold.
-            let rows: Vec<Vec<Value>> = if meta.without_rowid {
-                self.scan_without_rowid(&meta)?
+            // (The structural walk of each b-tree already happened in the
+            // accounting pass above.) A tree too corrupt to scan is skipped —
+            // the accounting pass already reported its structural damage, and
+            // sqlite likewise keeps reporting what it found rather than abort.
+            let rows_scanned = if meta.without_rowid {
+                self.scan_without_rowid(&meta)
             } else {
-                self.scan_table(&meta)?
-                    .into_iter()
-                    .map(|(_, v)| v)
-                    .collect()
+                self.scan_table(&meta)
+                    .map(|rs| rs.into_iter().map(|(_, v)| v).collect())
+            };
+            let rows: Vec<Vec<Value>> = match rows_scanned {
+                Ok(rows) => rows,
+                Err(_) => continue,
             };
             let no_params = Params::default();
             for idx in self.indexes_of(table)? {
-                check_btree_structure(src, idx.root, &idx.name, &mut problems);
                 let expected = rows
                     .iter()
                     .filter_map(|r| self.row_in_index(&idx, &meta, r, None, &no_params).ok())
                     .filter(|&keep| keep)
                     .count();
-                // Count the index b-tree's entries.
+                // Count the index b-tree's entries (an unreadable index tree was
+                // already reported by the accounting pass; skip its count).
                 let mut cur = crate::btree::IndexCursor::new(self.backend.source(), idx.root);
                 let mut got = 0usize;
-                while cur.next()?.is_some() {
-                    got += 1;
+                let mut unreadable = false;
+                loop {
+                    match cur.next() {
+                        Ok(Some(_)) => got += 1,
+                        Ok(None) => break,
+                        Err(_) => {
+                            unreadable = true;
+                            break;
+                        }
+                    }
                 }
-                if got != expected {
+                if !unreadable && got != expected {
                     problems.push(alloc::format!("wrong # of entries in index {}", idx.name));
                 }
             }
@@ -5369,6 +5419,10 @@ impl Connection {
         // index for FTS5 table …"). A no-op without the fts5 feature.
         #[cfg(feature = "fts5")]
         self.fts5_integrity_check(&mut problems)?;
+
+        // Honor the max-error cap for the logical checks above too (the
+        // accounting pass already stopped appending at the limit).
+        problems.truncate(max_err);
 
         if problems.is_empty() {
             Ok(single(Value::Text("ok".into())))
@@ -42745,94 +42799,6 @@ impl VTabStore for ExecVTabStore<'_> {
         crate::btree::delete_table(w, root, rowid)?;
         Ok(())
     }
-}
-
-/// Structurally validate a b-tree rooted at `root`, pushing a human-readable
-/// message onto `problems` for each defect found. Backs `PRAGMA integrity_check`.
-///
-/// Detects the malformations the count-based checks cannot see: a child page
-/// number out of the `1..=page_count` range (a dangling reference), the same
-/// page reached twice (a cycle / shared subtree), an unreadable or wrong-kind
-/// page, and — the shape a non-compacting delete leaves behind — an empty leaf
-/// page below an interior page (sqlite requires every non-root leaf to hold at
-/// least one cell). `label` names the table or index in the message.
-fn check_btree_structure(src: &dyn PageSource, root: u32, label: &str, problems: &mut Vec<String>) {
-    fn walk(
-        src: &dyn PageSource,
-        page_no: u32,
-        is_root: bool,
-        page_count: u32,
-        label: &str,
-        visited: &mut alloc::collections::BTreeSet<u32>,
-        problems: &mut Vec<String>,
-    ) {
-        if page_no < 1 || page_no > page_count {
-            problems.push(alloc::format!(
-                "{label}: child page {page_no} out of range (page_count {page_count})"
-            ));
-            return;
-        }
-        if !visited.insert(page_no) {
-            problems.push(alloc::format!(
-                "{label}: page {page_no} referenced more than once"
-            ));
-            return;
-        }
-        let page = match src.page(page_no) {
-            Ok(p) => p,
-            Err(_) => {
-                problems.push(alloc::format!("{label}: unable to read page {page_no}"));
-                return;
-            }
-        };
-        let bt = match BtreePage::parse(page) {
-            Ok(b) => b,
-            Err(_) => {
-                problems.push(alloc::format!(
-                    "{label}: page {page_no} is not a valid b-tree page"
-                ));
-                return;
-            }
-        };
-        match bt.page_type() {
-            PageType::LeafTable | PageType::LeafIndex => {
-                if !is_root && bt.num_cells() == 0 {
-                    problems.push(alloc::format!(
-                        "{label}: empty non-root leaf page {page_no}"
-                    ));
-                }
-            }
-            PageType::InteriorTable | PageType::InteriorIndex => {
-                for i in 0..bt.num_cells() {
-                    match bt.child_pointer(i) {
-                        Ok(child) => walk(src, child, false, page_count, label, visited, problems),
-                        Err(_) => problems.push(alloc::format!(
-                            "{label}: unreadable child pointer on page {page_no}"
-                        )),
-                    }
-                }
-                walk(
-                    src,
-                    bt.right_pointer(),
-                    false,
-                    page_count,
-                    label,
-                    visited,
-                    problems,
-                );
-            }
-        }
-    }
-    let mut visited = alloc::collections::BTreeSet::new();
-    walk(
-        src,
-        root,
-        true,
-        src.page_count(),
-        label,
-        &mut visited,
-        problems,
-    );
 }
 
 /// Flip a comparison operator for a swapped operand order: `a < b` ⇔ `b > a`.
