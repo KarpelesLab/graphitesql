@@ -370,7 +370,7 @@ fn crash_during_checkpoint(db: &str, plan: Plan) {
     let vfs = FaultVfs::new(db, Some(plan));
     let mut conn = Connection::open_vfs(&vfs, db).unwrap();
     assert!(wal_active(&conn), "checkpoint test db is WAL mode");
-    let r = conn.execute("PRAGMA wal_checkpoint");
+    let r = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)");
     assert!(
         r.is_err(),
         "the injected fault should have failed the checkpoint, got Ok"
@@ -408,7 +408,7 @@ fn reopen_finalize(db: &str) -> Vec<Vec<String>> {
         let got = rows(&c, "SELECT a,b FROM t ORDER BY a");
         // Fold the WAL back into the main file so sqlite3 reads it without needing
         // to replay graphite's WAL (and so the -wal can be removed).
-        let _ = c.execute("PRAGMA wal_checkpoint");
+        let _ = c.execute("PRAGMA wal_checkpoint(TRUNCATE)");
         got
     }
 }
@@ -819,7 +819,7 @@ fn clean_checkpoint_folds_into_main() {
         let mut conn = Connection::open_vfs(&vfs, &db).unwrap();
         conn.execute_batch(&format!("BEGIN;\n{TXN};\nCOMMIT;"))
             .unwrap();
-        conn.execute("PRAGMA wal_checkpoint").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
         drop(conn);
     }
     // After a clean checkpoint the -wal is reset to empty (header-only or 0).
