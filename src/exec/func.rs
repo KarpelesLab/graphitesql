@@ -758,6 +758,38 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             arity(&lname, args, 0)?;
             Value::Text(crate::TARGET_SQLITE_SOURCE_ID.into())
         }
+        // `sqlite_compileoption_used(X)` — 1 if X names one of graphite's
+        // compile-time options, else 0. Faithful port of `compileoptionusedFunc`
+        // / `sqlite3_compileoption_used`: the `SQLITE_` prefix on X is optional,
+        // the match is case-insensitive, and X must span a whole option (the
+        // char after the match must not be an identifier char, so `X=value`
+        // suffixes still match on `X`). A NULL argument yields NULL (sqlite's
+        // wrapper leaves the result unset — a NULL — when `sqlite3_value_text`
+        // returns 0).
+        "sqlite_compileoption_used" => {
+            arity(&lname, args, 1)?;
+            match &v[0] {
+                Value::Null => Value::Null,
+                other => {
+                    let name = eval::to_text(other);
+                    Value::Integer(compileoption_used(&name) as i64)
+                }
+            }
+        }
+        // `sqlite_compileoption_get(N)` — the Nth compile-time option string
+        // (0-indexed, in graphite's own order) or NULL when N is out of range.
+        // Port of `compileoptiongetFunc` / `sqlite3_compileoption_get`; N is read
+        // as an integer (NULL → 0).
+        "sqlite_compileoption_get" => {
+            arity(&lname, args, 1)?;
+            let n = eval::to_int_value(&v[0]);
+            let opts = super::compile_option_names();
+            if n >= 0 && (n as usize) < opts.len() {
+                Value::Text(opts[n as usize].into())
+            } else {
+                Value::Null
+            }
+        }
         "zeroblob" => {
             arity(&lname, args, 1)?;
             // SQLite reads the length via `sqlite3_value_int64`, which maps NULL to
@@ -1591,6 +1623,36 @@ fn unhex(s: &str, ignore: Option<&str>) -> Option<alloc::vec::Vec<u8>> {
         let lo = it.next()?;
         out.push((hexval(hi)? << 4) | hexval(lo)?);
     }
+}
+
+/// Whether an identifier character terminates a compile-option name, per
+/// sqlite's `sqlite3IsIdChar` (`[A-Za-z0-9_$]`). Used to require that
+/// `sqlite_compileoption_used(X)` matches a whole option word.
+fn is_id_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// Port of `sqlite3_compileoption_used`: strip an optional leading `SQLITE_`
+/// prefix (case-insensitive) from `name`, then return true if it matches the
+/// start of one of graphite's compile options such that the option ends there
+/// (the following char, if any, is not an identifier char — so `THREADSAFE=1`
+/// would still match `THREADSAFE`). graphite's options carry no `SQLITE_`
+/// prefix and no `=value` suffix, so in practice this is a case-insensitive
+/// whole-word equality, but the boundary rule is ported verbatim.
+fn compileoption_used(name: &str) -> bool {
+    let stripped = name
+        .get(..7)
+        .filter(|p| p.eq_ignore_ascii_case("SQLITE_"))
+        .map(|_| &name[7..])
+        .unwrap_or(name);
+    let n = stripped.len();
+    let needle = stripped.as_bytes();
+    super::compile_option_names().iter().any(|opt| {
+        let ob = opt.as_bytes();
+        ob.len() >= n
+            && ob[..n].eq_ignore_ascii_case(needle)
+            && ob.get(n).map(|&b| !is_id_char(b)).unwrap_or(true)
+    })
 }
 
 /// Whether `e` is an acceptable `likelihood()` probability: a floating-point
