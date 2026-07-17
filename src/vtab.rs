@@ -935,12 +935,15 @@ impl SeriesModule {
 
 /// Built-in `rtree` module: `USING rtree(id, minX, maxX[, minY, maxY, …])`
 /// declares an integer `id` (which is the rowid) plus 2·N coordinate columns for
-/// an N-dimensional bounding box. Rows persist in the `<name>_data` backing table
-/// ([`persistent`](VTabModule::persistent) is `true`); spatial queries are answered
-/// by scanning that table and re-applying the `WHERE` — functionally correct (D3a).
-/// Efficient node-tree pushdown and byte-compatible `_node`/`_rowid`/`_parent`
-/// shadow formats are later increments (D3b/D3c). Coordinates are stored as 32-bit
-/// floats and the id as an integer, matching sqlite's value semantics.
+/// an N-dimensional bounding box. A plain (no-auxiliary-column) R-Tree persists
+/// in SQLite's byte-compatible `_node`/`_rowid`/`_parent` shadow tables — the
+/// executor writes the node tree and answers spatial queries by walking it with
+/// subtree pruning (D3b/D3c), so a graphite-written R-Tree round-trips through
+/// stock `sqlite3` (and vice versa). An R-Tree with trailing `+name` auxiliary
+/// columns still uses the generic `<name>_data` backing table
+/// ([`persistent`](VTabModule::persistent) is `true`) — functionally correct but
+/// not sqlite-readable. Coordinates are stored as 32-bit floats and the id as an
+/// integer, matching sqlite's value semantics.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RTreeModule {
     /// `true` for the `rtree_i32` variant: coordinates are 32-bit integers
@@ -1043,9 +1046,11 @@ impl RTreeModule {
     /// The stored record: an integer id, then `n_coords` coordinates — for the
     /// float `rtree` each min (odd column index) rounded down and each max (even
     /// index) rounded up; for `rtree_i32` each coordinate truncated toward zero to
-    /// a 32-bit integer — then any auxiliary column values verbatim. Errors like
-    /// sqlite if a coordinate pair has `min > max`.
-    fn record(&self, values: &[Value], n_coords: usize) -> Result<Vec<Value>> {
+    /// a 32-bit integer — then any auxiliary column values verbatim. Like sqlite's
+    /// `rtreeUpdate`, a coordinate pair whose *stored* (rounded/truncated) `min`
+    /// exceeds its `max` is a `SQLITE_CONSTRAINT` error naming the first failing
+    /// pair's columns (`rtree constraint failed: <t>.(<min><=<max>)`).
+    fn record(&self, values: &[Value], args: &[&str], n_coords: usize) -> Result<Vec<Value>> {
         let mut rec = Vec::with_capacity(values.len());
         rec.push(Value::Integer(rtree_i64(
             values.first().unwrap_or(&Value::Null),
@@ -1069,14 +1074,62 @@ impl RTreeModule {
         while k < n_coords && k + 1 < rec.len() {
             let (lo, hi) = (coord_f64(&rec[k]), coord_f64(&rec[k + 1]));
             if lo > hi {
-                return Err(Error::Error(alloc::string::String::from(
-                    "rtree constraint failed",
-                )));
+                return Err(rtree_constraint_error(None, args, k));
             }
             k += 2;
         }
         Ok(rec)
     }
+}
+
+/// The declared name of a `USING rtree(…)` column argument: the argument's
+/// leading SQL token (sqlite's `rtreeTokenLength` = `sqlite3GetToken`), dequoted
+/// — so `minX REAL` names the column `minX` (any trailing type is ignored, sqlite
+/// declares its own) and a quoted `"min x"` / `[min x]` / `` `min x` `` sheds its
+/// quotes (a doubled quote character escaping one literal occurrence).
+pub(crate) fn rtree_col_name(arg: &str) -> String {
+    let a = arg.trim_start();
+    let mut ch = a.chars();
+    match ch.next() {
+        Some(q @ ('"' | '`' | '\'')) => {
+            let mut out = String::new();
+            let mut it = ch.peekable();
+            while let Some(c) = it.next() {
+                if c == q {
+                    if it.peek() == Some(&q) {
+                        it.next();
+                        out.push(q);
+                    } else {
+                        break;
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+        Some('[') => ch.take_while(|&c| c != ']').collect(),
+        _ => a
+            .chars()
+            .take_while(|&c| c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii())
+            .collect(),
+    }
+}
+
+/// SQLite's `rtreeConstraintError` for the coordinate pair whose *min* column is
+/// `args[min_col]`: a `SQLITE_CONSTRAINT` (19) error reading
+/// `rtree constraint failed: <table>.(<min><=<max>)`, the column names taken
+/// from the declared `USING rtree(…)` arguments. The store-backed aux-column
+/// write path does not know its table name and omits the `<table>.` prefix; the
+/// executor's node-format path passes it for the byte-exact message.
+pub(crate) fn rtree_constraint_error(table: Option<&str>, args: &[&str], min_col: usize) -> Error {
+    let c1 = rtree_col_name(args.get(min_col).copied().unwrap_or_default());
+    let c2 = rtree_col_name(args.get(min_col + 1).copied().unwrap_or_default());
+    let loc = match table {
+        Some(t) => alloc::format!("{t}.({c1}<={c2})"),
+        None => alloc::format!("({c1}<={c2})"),
+    };
+    Error::Constraint(alloc::format!("rtree constraint failed: {loc}"))
 }
 
 /// Coerce a value to an `rtree_i32` coordinate: truncate toward zero (the C `int`
@@ -1091,30 +1144,51 @@ impl VTabModule for RTreeModule {
     type Cursor = RTreeCursor;
 
     fn connect(&self, args: &[&str]) -> Result<VTabSchema> {
-        // One id column + an even number (≥ 2) of coordinate columns, optionally
-        // followed by `+name [type]` auxiliary columns.
-        let n_coords = RTreeModule::n_coords(args);
-        if n_coords < 2 || !n_coords.is_multiple_of(2) {
-            return Err(Error::Error(alloc::string::String::from(
-                "rtree requires an odd number of columns (id + 2N coordinates), \
-                 at least 3",
-            )));
+        // One id column + an even number (2·N, 1 ≤ N ≤ 5 dimensions) of
+        // coordinate columns, optionally followed by `+name [type]` auxiliary
+        // columns. The validation order and messages are sqlite's `rtreeInit`:
+        // the raw argument count is bounded first, then every auxiliary column
+        // must come after the coordinates, then the coordinate count is checked.
+        let err = |m: &str| Err(Error::Error(String::from(m)));
+        if args.len() < 3 {
+            return err("Too few columns for an rtree table");
         }
-        // The id column is an integer; every coordinate is a 32-bit float (REAL);
-        // an auxiliary `+name [type]` column keeps its declared type (or none).
+        if args.len() > 100 {
+            return err("Too many columns for an rtree table");
+        }
+        let n_coords = RTreeModule::n_coords(args);
+        if args
+            .iter()
+            .skip(1 + n_coords)
+            .any(|a| !a.trim_start().starts_with('+'))
+        {
+            return err("Auxiliary rtree columns must be last");
+        }
+        if n_coords < 2 {
+            return err("Too few columns for an rtree table");
+        }
+        if n_coords > 10 {
+            return err("Too many columns for an rtree table");
+        }
+        if !n_coords.is_multiple_of(2) {
+            return err("Wrong number of columns for an rtree table");
+        }
+        // Each column is named by its argument's leading SQL token (any declared
+        // type is ignored): the id is an integer and every coordinate a 32-bit
+        // float (REAL) — or INT for `rtree_i32` — exactly as sqlite re-declares
+        // them.
         Ok(VTabSchema::typed(args.iter().enumerate().map(|(i, s)| {
             if i == 0 {
-                (String::from(*s), String::from("INT"))
+                (rtree_col_name(s), String::from("INT"))
             } else if i <= n_coords {
                 let ty = if self.integer { "INT" } else { "REAL" };
-                (String::from(*s), String::from(ty))
+                (rtree_col_name(s), String::from(ty))
             } else {
                 // An auxiliary `+name [type]` column: SQLite reports an empty type
                 // for it (the declared type is not retained), and stores values
                 // verbatim with no affinity.
-                let a = s.trim_start().strip_prefix('+').unwrap_or(s).trim();
-                let name = a.split_once(char::is_whitespace).map_or(a, |(n, _)| n);
-                (String::from(name), String::new())
+                let a = s.trim_start().strip_prefix('+').unwrap_or(s);
+                (rtree_col_name(a), String::new())
             }
         })))
     }
@@ -1139,8 +1213,10 @@ impl VTabModule for RTreeModule {
     /// coordinate comparison is encoded as a two-character pair: an op letter
     /// (`A`=`=`, `B`=`<=`, `C`=`<`, `D`=`>=`, `E`=`>`) followed by the coordinate
     /// column's 0-based digit (`minX`→`0`, `maxX`→`1`, …) — e.g. `minX>=? AND
-    /// maxX<=?` is `idxNum` 2, `idxStr` `D0B1`. (Execution still scans the backing
-    /// table and re-applies the `WHERE`, so this only drives the reported plan.)
+    /// maxX<=?` is `idxNum` 2, `idxStr` `D0B1`. (For a plain R-Tree the executor
+    /// walks the `_node` tree pruning subtrees by these bounds and re-applies the
+    /// `WHERE`; for an aux-column R-Tree it scans the backing table, so there
+    /// this only drives the reported plan.)
     fn best_index(&self, constraints: &[IndexConstraint]) -> Result<IndexPlan> {
         let mut argv_index = alloc::vec![0u32; constraints.len()];
         // A rowid (id, column 0) equality: a one-row lookup, coords dropped.
@@ -1192,7 +1268,7 @@ impl VTabModule for RTreeModule {
         let n_coords = RTreeModule::n_coords(args);
         match change {
             VTabChange::Insert { values, .. } => {
-                let mut rec = self.record(values, n_coords)?;
+                let mut rec = self.record(values, args, n_coords)?;
                 // The id column is the rowid; a NULL id auto-assigns max+1.
                 let id = if matches!(values.first(), Some(Value::Null) | None) {
                     store.rows()?.iter().map(|(r, _)| *r).max().unwrap_or(0) + 1
@@ -1208,7 +1284,7 @@ impl VTabModule for RTreeModule {
                 Ok(rowid)
             }
             VTabChange::Update { rowid, values, .. } => {
-                let mut rec = self.record(values, n_coords)?;
+                let mut rec = self.record(values, args, n_coords)?;
                 let id = rtree_i64(&values[0]);
                 rec[0] = Value::Integer(id);
                 if id != rowid {
@@ -3905,6 +3981,37 @@ impl VTabModule for Fts5VocabModule {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn rtree_col_name_takes_the_leading_token() {
+        // A trailing declared type is ignored (sqlite's rtreeTokenLength).
+        assert_eq!(rtree_col_name("minX"), "minX");
+        assert_eq!(rtree_col_name("minX REAL"), "minX");
+        assert_eq!(rtree_col_name("  id INTEGER PRIMARY KEY"), "id");
+        // Quoted identifiers shed their quotes; a doubled quote escapes one.
+        assert_eq!(rtree_col_name("\"min x\" REAL"), "min x");
+        assert_eq!(rtree_col_name("[min x] REAL"), "min x");
+        assert_eq!(rtree_col_name("`min x`"), "min x");
+        assert_eq!(rtree_col_name("\"a\"\"b\""), "a\"b");
+        assert_eq!(rtree_col_name("'c1' INT"), "c1");
+        // Non-ASCII identifier characters are part of the token.
+        assert_eq!(rtree_col_name("café REAL"), "café");
+    }
+
+    #[test]
+    fn rtree_constraint_error_matches_sqlite_message() {
+        // sqlite's rtreeConstraintError: SQLITE_CONSTRAINT (19), naming the
+        // failing pair. `min_col` is the 1-based arg index of the pair's min.
+        let args = ["id", "x0 REAL", "x1", "y0", "y1"];
+        let e = rtree_constraint_error(Some("t"), &args, 1);
+        assert_eq!(e.code(), 19);
+        assert_eq!(alloc::format!("{e}"), "rtree constraint failed: t.(x0<=x1)");
+        let e = rtree_constraint_error(Some("t"), &args, 3);
+        assert_eq!(alloc::format!("{e}"), "rtree constraint failed: t.(y0<=y1)");
+        // The store-backed aux path has no table name and omits the prefix.
+        let e = rtree_constraint_error(None, &args, 1);
+        assert_eq!(alloc::format!("{e}"), "rtree constraint failed: (x0<=x1)");
+    }
 
     #[test]
     #[cfg(feature = "fts5")]

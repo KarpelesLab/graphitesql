@@ -1,8 +1,10 @@
-//! Roadmap D3a: the built-in `rtree` virtual-table module (on top of the W1/W2
-//! writable+persistent vtab infrastructure). Functionally correct spatial index —
-//! rows persist in the backing table and queries are answered by scan + the
-//! re-applied WHERE. Coordinates are stored as 32-bit floats (min rounded down,
-//! max rounded up) and the id as an integer, byte-for-byte like sqlite3 3.50.4.
+//! Roadmap D3a-c: the built-in `rtree` virtual-table module. A plain (no-aux)
+//! R-Tree persists in SQLite's byte-compatible `_node`/`_rowid`/`_parent` shadow
+//! tables and spatial queries walk that node tree with subtree pruning, so the
+//! file round-trips through stock sqlite3 in both directions; an aux-column
+//! R-Tree still uses the generic `<name>_data` backing table. Coordinates are
+//! stored as 32-bit floats (min rounded down, max rounded up) and the id as an
+//! integer, byte-for-byte like sqlite3 3.50.4.
 
 #![cfg(feature = "std")]
 
@@ -156,6 +158,82 @@ fn rejects_min_greater_than_max_and_bad_arity() {
     assert!(
         c.execute("CREATE VIRTUAL TABLE bad USING rtree(id, a)")
             .is_err()
+    );
+}
+
+/// `CREATE VIRTUAL TABLE … USING rtree(…)` argument validation reproduces
+/// sqlite's `rtreeInit` messages, string-for-string, in sqlite's check order.
+#[test]
+fn ddl_error_messages_match_sqlite() {
+    let mut c = Connection::open_memory().unwrap();
+    // `Error::Error`'s Display adds the generic "error: " prefix (the CLI layer
+    // renders the sqlite-style line); the message itself must be byte-exact.
+    let mut msg = |ddl: &str| -> String {
+        let e = c
+            .execute(&format!("CREATE VIRTUAL TABLE t USING {ddl}"))
+            .unwrap_err();
+        format!("{e}")
+            .strip_prefix("error: ")
+            .expect("an Error::Error")
+            .into()
+    };
+    // Fewer than three arguments (id + at least one min/max pair).
+    assert_eq!(msg("rtree(id)"), "Too few columns for an rtree table");
+    assert_eq!(msg("rtree(id, x0)"), "Too few columns for an rtree table");
+    // An odd coordinate count.
+    assert_eq!(
+        msg("rtree(id, x0, x1, y0)"),
+        "Wrong number of columns for an rtree table"
+    );
+    // More than RTREE_MAX_DIMENSIONS (5) dimensions.
+    assert_eq!(
+        msg("rtree(id,a0,a1,b0,b1,c0,c1,d0,d1,e0,e1,f0,f1)"),
+        "Too many columns for an rtree table"
+    );
+    // An auxiliary (`+name`) column before a coordinate — checked before the
+    // coordinate-count errors, like sqlite.
+    assert_eq!(
+        msg("rtree(id, +a, x0)"),
+        "Auxiliary rtree columns must be last"
+    );
+    // The i32 variant validates identically.
+    assert_eq!(
+        msg("rtree_i32(id, x0)"),
+        "Too few columns for an rtree table"
+    );
+}
+
+/// A declared type on an rtree column argument is ignored: the column is named
+/// by the argument's leading token and re-declared INT/REAL by the module, like
+/// sqlite (`CREATE VIRTUAL TABLE t USING rtree(id INTEGER, x0 REAL, …)` yields
+/// columns `id`/`x0`/… with rtree's own types).
+#[test]
+fn column_names_ignore_declared_types() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE t USING rtree(id INTEGER, x0 REAL, x1 DOUBLE)")
+        .unwrap();
+    c.execute("INSERT INTO t VALUES (1, 1, 2)").unwrap();
+    assert_eq!(
+        rows(&c, "SELECT x0, x1 FROM t WHERE id = 1"),
+        [vec![Value::Real(1.0), Value::Real(2.0)]]
+    );
+    // table_info reports the token names with rtree's re-declared types,
+    // byte-for-byte like sqlite3 3.50.4.
+    let text = |v: &Value| match v {
+        Value::Text(s) => String::from(s.as_str()),
+        o => panic!("not text: {o:?}"),
+    };
+    let info: Vec<(String, String)> = rows(&c, "PRAGMA table_info(t)")
+        .iter()
+        .map(|r| (text(&r[1]), text(&r[2])))
+        .collect();
+    assert_eq!(
+        info,
+        [
+            (String::from("id"), String::from("INT")),
+            (String::from("x0"), String::from("REAL")),
+            (String::from("x1"), String::from("REAL")),
+        ]
     );
 }
 
@@ -612,6 +690,51 @@ fn graphite_written_rtree_is_read_by_sqlite3() {
     assert_eq!(
         chk("SELECT count(*) FROM sqlite_master WHERE name='rt_data'"),
         "0"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// graphite writes an `rtree_i32` R-Tree in the native node format — including
+/// negative coordinates and floats truncated toward zero — and `sqlite3` reads
+/// it back with `rtreecheck` / `integrity_check` ok and correct query results.
+#[test]
+fn graphite_written_rtree_i32_is_read_by_sqlite3() {
+    use std::process::Command;
+    if Command::new("sqlite3").arg("--version").output().is_err() {
+        eprintln!("sqlite3 not found; skipping");
+        return;
+    }
+    let path = std::env::temp_dir().join(format!("gsql-rtree-i32-w-{}.db", std::process::id()));
+    let path = path.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut c = Connection::create(&path).unwrap();
+        c.execute("CREATE VIRTUAL TABLE rt USING rtree_i32(id, x0, x1, y0, y1)")
+            .unwrap();
+        // >51 entries in one INSERT forces a multi-level tree; coordinates mix
+        // negatives and floats (truncated toward zero, like sqlite's int cast).
+        let vals = (0..120)
+            .map(|i| {
+                let a = i * 3 - 180; // negative through positive
+                format!("({i},{a},{},{}.9,{})", a + 5, -i, -i + 2)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        c.execute(&format!("INSERT INTO rt VALUES {vals}")).unwrap();
+    }
+    let chk = |q: &str| {
+        let o = Command::new("sqlite3").arg(&path).arg(q).output().unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    assert_eq!(chk("SELECT rtreecheck('rt')"), "ok", "rtreecheck");
+    assert_eq!(chk("PRAGMA integrity_check"), "ok");
+    assert_eq!(chk("SELECT count(*) FROM rt"), "120");
+    // -12.9 truncates toward zero to -12 (id 4's y0), and the coordinates read
+    // back as integers.
+    assert_eq!(chk("SELECT y0, y1 FROM rt WHERE id=4"), "-4|-2");
+    assert_eq!(
+        chk("SELECT group_concat(id) FROM (SELECT id FROM rt WHERE x0>=-30 AND x1<=0 ORDER BY id)"),
+        "50,51,52,53,54,55,56,57,58"
     );
     let _ = std::fs::remove_file(&path);
 }
