@@ -67,19 +67,28 @@ pub enum StrSrc {
     TextJ(String),
     /// `TEXT5`: at least one JSON5-only escape; body converted on text render.
     Text5(String),
-}
-
-impl StrSrc {
-    /// The verbatim escaped body, regardless of escape class. This is the JSONB
-    /// payload for both `TEXTJ` and `TEXT5`.
-    fn body(&self) -> &str {
-        match self {
-            StrSrc::TextJ(b) | StrSrc::Text5(b) => b,
-        }
-    }
+    /// `TEXTRAW`: raw SQL text stored verbatim (unescaped) in JSONB, needing
+    /// JSON escaping only when rendered as text. SQLite produces this for a
+    /// plain (non-JSON-subtype) SQL text *value* argument to
+    /// `json_set`/`json_insert`/`json_replace` (`jsonFunctionArgToBlob`), and
+    /// for a *new* object key those functions create from a bare (or
+    /// backslash-free quoted) path label (`jsonLookupStep`, `rawKey`). Unlike
+    /// `TextJ`/`Text5`, the JSONB payload is the decoded string itself (there
+    /// is no separate escaped body), so this variant carries no body — the
+    /// enclosing [`Json::Str`] value (or the object key it tags) *is* the
+    /// payload.
+    Raw,
 }
 
 impl Json {
+    /// A JSONB **TEXTRAW** string: the given text stored verbatim (unescaped),
+    /// as sqlite's `json_set`/`json_insert`/`json_replace` store a plain SQL
+    /// text *value* argument (`jsonFunctionArgToBlob`). It renders as a
+    /// normally escaped JSON string in text output but encodes to a `TEXTRAW`
+    /// element in JSONB.
+    pub fn text_raw(s: &str) -> Json {
+        Json::Str(String::from(s), Some(StrSrc::Raw))
+    }
     /// SQLite's `json_type` label for this value.
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -396,7 +405,9 @@ fn str_jsonb_payload_len(s: &str) -> usize {
 /// plain string. Shared by string *values* and object *keys*.
 fn str_prov_payload_len(s: &str, raw: &Option<StrSrc>) -> usize {
     match raw {
-        Some(src) => src.body().len(),
+        Some(StrSrc::TextJ(body) | StrSrc::Text5(body)) => body.len(),
+        // TEXTRAW stores the decoded string verbatim; there is no escaped body.
+        Some(StrSrc::Raw) => s.len(),
         None => str_jsonb_payload_len(s),
     }
 }
@@ -415,6 +426,8 @@ fn write_str_jsonb(s: &str, raw: &Option<StrSrc>, out: &mut Vec<u8>) {
     match raw {
         Some(StrSrc::TextJ(body)) => push_jsonb(out, JSONB_TEXTJ, body.as_bytes()),
         Some(StrSrc::Text5(body)) => push_jsonb(out, JSONB_TEXT5, body.as_bytes()),
+        // TEXTRAW: the decoded string is stored verbatim (unescaped).
+        Some(StrSrc::Raw) => push_jsonb(out, JSONB_TEXTRAW, s.as_bytes()),
         None if json_needs_escape(s) => {
             push_jsonb(out, JSONB_TEXTJ, json_escape_body(s).as_bytes());
         }
@@ -437,7 +450,11 @@ fn write_str_text(s: &str, raw: &Option<StrSrc>, out: &mut String) {
             out.push_str(&json5_to_json_text(body));
             out.push('"');
         }
-        None => write_json_string(s, out),
+        // TEXTRAW is raw SQL text that needs escaping for JSON: render the
+        // decoded value with canonical escaping, exactly like a plain string
+        // (sqlite's `jsonTranslateBlobToText` runs TEXTRAW through
+        // `jsonAppendString`).
+        Some(StrSrc::Raw) | None => write_json_string(s, out),
     }
 }
 
@@ -509,7 +526,12 @@ fn decode_jsonb(b: &[u8]) -> Option<(Json, &[u8])> {
                 _ => return None,
             }
         }
-        JSONB_TEXT | JSONB_TEXTRAW => Json::Str(text()?, None),
+        JSONB_TEXT => Json::Str(text()?, None),
+        // TEXT stores bytes that are already valid JSON string content; TEXTRAW
+        // stores raw SQL text that needs escaping on render. Tag TEXTRAW as
+        // `Raw` so it re-encodes to a byte-identical TEXTRAW element
+        // (round-trip), rather than collapsing to TEXT/TEXTJ.
+        JSONB_TEXTRAW => Json::Str(text()?, Some(StrSrc::Raw)),
         JSONB_TEXTJ | JSONB_TEXT5 => {
             // Reparse the escaped body as a quoted JSON string.
             let body = core::str::from_utf8(payload).ok()?;
@@ -517,22 +539,26 @@ fn decode_jsonb(b: &[u8]) -> Option<(Json, &[u8])> {
             quoted.push('"');
             quoted.push_str(body);
             quoted.push('"');
-            match parse(&quoted)? {
-                // Preserve the verbatim body so it round-trips to the same JSONB
-                // bytes, tagged by the stored escape class. (A re-encode of a
-                // `\v`/control-byte TEXT5 body that the parser would otherwise
-                // refuse to retain still round-trips, since the body came from
-                // valid JSONB.)
-                Json::Str(s, _) => {
-                    let raw = if ty == JSONB_TEXTJ {
-                        Some(StrSrc::TextJ(String::from(body)))
-                    } else {
-                        Some(StrSrc::Text5(String::from(body)))
-                    };
-                    Json::Str(s, raw)
-                }
-                _ => return None,
-            }
+            // Preserve the verbatim body so it round-trips to the same JSONB
+            // bytes, tagged by the stored escape class. (A re-encode of a
+            // `\v`/control-byte TEXT5 body that the parser would otherwise
+            // refuse to retain still round-trips, since the body came from
+            // valid JSONB.) A body the strict parser rejects — e.g. an unknown
+            // escape like `\q`, which `json_set('…','$."a\qb"',…)` stores
+            // verbatim in a TEXT5 label — is decoded leniently the way
+            // sqlite's `jsonReturnFromBlob` does (bad escapes silently
+            // dropped), still keeping the verbatim body for text rendering.
+            let s = match parse(&quoted) {
+                Some(Json::Str(s, _)) => s,
+                Some(_) => return None,
+                None => lenient_unescape(body),
+            };
+            let raw = if ty == JSONB_TEXTJ {
+                Some(StrSrc::TextJ(String::from(body)))
+            } else {
+                Some(StrSrc::Text5(String::from(body)))
+            };
+            Json::Str(s, raw)
         }
         JSONB_ARRAY => {
             let mut items = Vec::new();
@@ -562,6 +588,128 @@ fn decode_jsonb(b: &[u8]) -> Option<(Json, &[u8])> {
         _ => return None,
     };
     Some((j, after))
+}
+
+/// Decode a `TEXTJ`/`TEXT5` JSONB payload into its SQL string value the way
+/// sqlite's `jsonReturnFromBlob` does, used when the strict string parser
+/// rejects the body (e.g. an unknown escape like `\q`, which
+/// `json_set(…,'$."a\qb"',…)` stores verbatim in a TEXT5 label). Each
+/// backslash escape is decoded by the `jsonUnescapeOneChar` rules; an invalid
+/// escape (`JSON_INVALID_CHAR`) is silently dropped from the value.
+fn lenient_unescape(body: &str) -> String {
+    let b = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let hex = |at: usize, k: usize| -> u32 {
+        // Like sqlite's jsonHexToInt*, a non-hex digit contributes 0.
+        let mut v = 0u32;
+        for j in 0..k {
+            v = v * 16
+                + b.get(at + j)
+                    .and_then(|&c| (c as char).to_digit(16))
+                    .unwrap_or(0);
+        }
+        v
+    };
+    // The byte count of a line-terminator run (`\r\n`, `\r`, `\n`, U+2028,
+    // U+2029) starting at `at` — sqlite's `jsonBytesToBypass`.
+    let bypass = |mut at: usize| -> usize {
+        let start = at;
+        loop {
+            match b.get(at) {
+                Some(b'\r') => at += if b.get(at + 1) == Some(&b'\n') { 2 } else { 1 },
+                Some(b'\n') => at += 1,
+                Some(0xe2) if b.get(at + 1) == Some(&0x80) => match b.get(at + 2) {
+                    Some(0xa8 | 0xa9) => at += 3,
+                    _ => break,
+                },
+                _ => break,
+            }
+        }
+        at - start
+    };
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c != b'\\' {
+            // Copy the literal UTF-8 run through verbatim.
+            let start = i;
+            i += 1;
+            while i < b.len() && b[i] != b'\\' {
+                i += 1;
+            }
+            out.push_str(&body[start..i]);
+            continue;
+        }
+        if i + 1 >= b.len() {
+            break; // trailing lone backslash: invalid, dropped
+        }
+        // `v` is the decoded scalar, `None` for an invalid escape (dropped).
+        let (v, consumed): (Option<u32>, usize) = match b[i + 1] {
+            b'u' => {
+                if b.len() - i < 6 {
+                    (None, b.len() - i)
+                } else {
+                    let hi = hex(i + 2, 4);
+                    if (hi & 0xfc00) == 0xd800
+                        && b.len() - i >= 12
+                        && b[i + 6] == b'\\'
+                        && b[i + 7] == b'u'
+                        && (hex(i + 8, 4) & 0xfc00) == 0xdc00
+                    {
+                        let lo = hex(i + 8, 4);
+                        (Some(((hi & 0x3ff) << 10) + (lo & 0x3ff) + 0x10000), 12)
+                    } else {
+                        (Some(hi), 6)
+                    }
+                }
+            }
+            b'b' => (Some(0x08), 2),
+            b'f' => (Some(0x0c), 2),
+            b'n' => (Some(0x0a), 2),
+            b'r' => (Some(0x0d), 2),
+            b't' => (Some(0x09), 2),
+            // The blob-unescape path maps `\v` to U+000B (unlike the text
+            // parser's U+0009 — sqlite is inconsistent here on purpose).
+            b'v' => (Some(0x0b), 2),
+            // `\0` not followed by a digit is a NUL.
+            b'0' => {
+                if b.get(i + 2).is_some_and(u8::is_ascii_digit) {
+                    (None, 2)
+                } else {
+                    (Some(0), 2)
+                }
+            }
+            e @ (b'\'' | b'"' | b'/' | b'\\') => (Some(e as u32), 2),
+            b'x' => {
+                if b.len() - i < 4 {
+                    (None, b.len() - i)
+                } else {
+                    (Some(hex(i + 2, 2)), 4)
+                }
+            }
+            // A backslash before a line terminator is a line continuation: the
+            // terminator run is skipped and decoding resumes after it.
+            0xe2 | b'\r' | b'\n' => {
+                let skip = bypass(i + 1);
+                if skip == 0 {
+                    (None, b.len() - i) // a non-terminator U+E2xx: invalid
+                } else if i + 1 + skip == b.len() {
+                    (Some(0), b.len() - i)
+                } else {
+                    (None, 1 + skip) // resume at the next character
+                }
+            }
+            _ => (None, 2), // unknown escape: invalid, dropped
+        };
+        if let Some(v) = v {
+            // A value that is not a valid scalar (a lone surrogate half) cannot
+            // live in a Rust string; sqlite emits its WTF-8 bytes, we degrade
+            // to U+FFFD.
+            out.push(char::from_u32(v).unwrap_or('\u{FFFD}'));
+        }
+        i += consumed;
+    }
+    out
 }
 
 /// Whether a string contains any character requiring a JSON escape.
@@ -606,7 +754,24 @@ pub(crate) fn push_path_key(path: &str, k: &str) -> String {
 /// the decoded-value [`push_path_key`] logic.
 pub(crate) fn push_path_key_prov(path: &str, k: &str, raw: &Option<StrSrc>) -> String {
     match raw {
-        Some(src) => alloc::format!("{path}.\"{}\"", src.body()),
+        Some(StrSrc::TextJ(body) | StrSrc::Text5(body)) => {
+            alloc::format!("{path}.\"{body}\"")
+        }
+        // A TEXTRAW label's payload is the decoded key itself; SQLite's
+        // `jsonAppendPathName` prints the payload *verbatim* (no escaping),
+        // bare when it is a simple identifier and double-quoted otherwise.
+        Some(StrSrc::Raw) => {
+            let mut chars = k.chars();
+            let simple = match chars.next() {
+                Some(c) if c.is_ascii_alphabetic() => chars.all(|c| c.is_ascii_alphanumeric()),
+                _ => false,
+            };
+            if simple {
+                alloc::format!("{path}.{k}")
+            } else {
+                alloc::format!("{path}.\"{k}\"")
+            }
+        }
         None => push_path_key(path, k),
     }
 }
@@ -1444,7 +1609,7 @@ pub fn navigate<'a>(root: &'a Json, path: &str) -> Option<&'a Json> {
     let mut cur = root;
     for seg in &segs {
         match (cur, seg) {
-            (Json::Object(members), Seg::Key(k)) => {
+            (Json::Object(members), Seg::Key(k, _)) => {
                 cur = members
                     .iter()
                     .find(|(kk, _, _)| kk == k)
@@ -1479,7 +1644,7 @@ pub(crate) fn navigate_with_offset<'a>(
     for seg in &segs {
         let body = value_offset + jsonb_header_len(cur.jsonb_payload_len());
         match (cur, seg) {
-            (Json::Object(members), Seg::Key(k)) => {
+            (Json::Object(members), Seg::Key(k, _)) => {
                 let mut at = body;
                 let mut found = None;
                 for (kk, kraw, vv) in members {
@@ -1613,7 +1778,12 @@ impl Idx {
 
 /// One step of a JSON path: an object key or an array index.
 enum Seg {
-    Key(String),
+    /// An object-key step. The first field is the decoded key (used for
+    /// lookup); the second is the label provenance SQLite would assign when
+    /// *creating* this key (`TEXTRAW` for a bare or backslash-free quoted
+    /// label, `TEXT5` — verbatim body — for a quoted label containing a
+    /// backslash) — see [`parse_key`] and sqlite's `jsonLookupStep` (`rawKey`).
+    Key(String, Option<StrSrc>),
     Index(Idx),
 }
 
@@ -1637,8 +1807,8 @@ fn parse_path(path: &str) -> Option<Vec<Seg>> {
     while i < bytes.len() {
         match bytes[i] {
             b'.' => {
-                let (key, next) = parse_key(bytes, i + 1)?;
-                segs.push(Seg::Key(key));
+                let (key, prov, next) = parse_key(bytes, i + 1)?;
+                segs.push(Seg::Key(key, prov));
                 i = next;
             }
             b'[' => {
@@ -1691,17 +1861,33 @@ fn json_path_hex4(bytes: &[u8], at: usize) -> Option<u32> {
     Some(v)
 }
 
-fn parse_key(bytes: &[u8], i: usize) -> Option<(String, usize)> {
+fn parse_key(bytes: &[u8], i: usize) -> Option<(String, Option<StrSrc>, usize)> {
     if bytes.get(i) == Some(&b'"') {
         // Quoted key: read until the closing (unescaped) quote, decoding JSON
         // escapes. SQLite scans past `\<char>` when locating the close and then
         // compares labels with escapes decoded (`jsonUnescapeOneChar`), so
         // `$."a\"b"` selects the key `a"b`.
-        let mut j = i + 1;
+        //
+        // For a *new* key `json_set`/`json_insert` create, SQLite tags the
+        // label by whether the verbatim body (between the quotes) contains a
+        // backslash: none → TEXTRAW (`rawKey`), otherwise → TEXT5, storing the
+        // body verbatim either way (`jsonLookupStep`). Mirror that provenance
+        // so a created key encodes byte-identically. (With no backslash the
+        // decoded key equals the body, so `Raw` needs no separate body.)
+        let start = i + 1;
+        let mut j = start;
         let mut s = String::new();
         while let Some(&c) = bytes.get(j) {
             match c {
-                b'"' => return Some((s, j + 1)),
+                b'"' => {
+                    let body = core::str::from_utf8(&bytes[start..j]).ok()?;
+                    let prov = if body.as_bytes().contains(&b'\\') {
+                        Some(StrSrc::Text5(String::from(body)))
+                    } else {
+                        Some(StrSrc::Raw)
+                    };
+                    return Some((s, prov, j + 1));
+                }
                 b'\\' => {
                     let e = *bytes.get(j + 1)?;
                     j += 2;
@@ -1736,6 +1922,15 @@ fn parse_key(bytes: &[u8], i: usize) -> Option<(String, usize)> {
                         other => s.push(other as char),
                     }
                 }
+                // A raw multi-byte UTF-8 sequence: copy the bytes through.
+                0x80..=0xFF => {
+                    let start = j;
+                    j += 1;
+                    while bytes.get(j).is_some_and(|&x| (0x80..0xC0).contains(&x)) {
+                        j += 1;
+                    }
+                    s.push_str(core::str::from_utf8(&bytes[start..j]).ok()?);
+                }
                 _ => {
                     s.push(c as char);
                     j += 1;
@@ -1754,7 +1949,8 @@ fn parse_key(bytes: &[u8], i: usize) -> Option<(String, usize)> {
             return None;
         }
         let key = core::str::from_utf8(&bytes[start..j]).ok()?.to_string();
-        Some((key, j))
+        // A bare identifier label is always `rawKey` → TEXTRAW when created.
+        Some((key, Some(StrSrc::Raw), j))
     }
 }
 
@@ -1776,7 +1972,7 @@ pub enum SetMode {
 fn walk_to_parent<'a>(mut cur: &'a mut Json, segs: &[Seg]) -> Option<&'a mut Json> {
     for seg in segs {
         cur = match (cur, seg) {
-            (Json::Object(m), Seg::Key(k)) => {
+            (Json::Object(m), Seg::Key(k, _)) => {
                 m.iter_mut().find(|(kk, _, _)| kk == k).map(|(_, _, v)| v)?
             }
             (Json::Array(a), Seg::Index(idx)) => {
@@ -1801,13 +1997,16 @@ fn walk_to_parent_creating<'a>(mut cur: &'a mut Json, segs: &[Seg]) -> Option<&'
     }
     for i in 0..segs.len() - 1 {
         let make = || match &segs[i + 1] {
-            Seg::Key(_) => Json::Object(Vec::new()),
+            Seg::Key(..) => Json::Object(Vec::new()),
             Seg::Index(_) => Json::Array(Vec::new()),
         };
         cur = match (cur, &segs[i]) {
-            (Json::Object(m), Seg::Key(k)) => {
+            (Json::Object(m), Seg::Key(k, prov)) => {
                 if !m.iter().any(|(kk, _, _)| kk == k) {
-                    m.push((k.clone(), None, make()));
+                    // A created intermediate key carries the label provenance
+                    // SQLite would assign (TEXTRAW for a bare label), so the
+                    // JSONB encodes byte-identically (`jsonLookupStep`).
+                    m.push((k.clone(), prov.clone(), make()));
                 }
                 m.iter_mut().find(|(kk, _, _)| kk == k).map(|(_, _, v)| v)?
             }
@@ -1867,15 +2066,21 @@ pub fn set_path(root: &mut Json, path: &str, value: Json, mode: SetMode) -> Opti
 /// can discard created intermediates on a no-op).
 fn write_leaf(cur: &mut Json, last: &Seg, value: Json, mode: SetMode) -> bool {
     match (cur, last) {
-        (Json::Object(m), Seg::Key(k)) => {
+        (Json::Object(m), Seg::Key(k, prov)) => {
             let slot = m.iter_mut().find(|(kk, _, _)| kk == k);
             match (slot, mode) {
                 (Some(s), SetMode::Set) | (Some(s), SetMode::Replace) => {
+                    // Overwriting an existing member leaves its stored key
+                    // bytes (and tag) untouched, exactly like sqlite's
+                    // `jsonBlobEdit` of just the value.
                     s.2 = value;
                     true
                 }
                 (None, SetMode::Set) | (None, SetMode::Insert) => {
-                    m.push((k.clone(), None, value));
+                    // A freshly created key carries the path label's
+                    // provenance (TEXTRAW for a bare or backslash-free quoted
+                    // label), matching sqlite's `rawKey`.
+                    m.push((k.clone(), prov.clone(), value));
                     true
                 }
                 _ => false,
@@ -1920,7 +2125,7 @@ pub fn remove_path(root: &mut Json, path: &str) -> Option<()> {
         return Some(());
     };
     match (cur, last) {
-        (Json::Object(m), Seg::Key(k)) => m.retain(|(kk, _, _)| kk != k),
+        (Json::Object(m), Seg::Key(k, _)) => m.retain(|(kk, _, _)| kk != k),
         (Json::Array(a), Seg::Index(idx)) => {
             if let Some(n) = idx.resolve_read(a.len())
                 && n < a.len()

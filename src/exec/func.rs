@@ -1054,7 +1054,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     while i + 1 < v.len() {
                         check_path(&v[i])?;
                         let path = eval::to_text(&v[i]);
-                        let val = json_value_arg(&v[i + 1], args.get(i + 1))?;
+                        let val = json_edit_value_arg(&v[i + 1], args.get(i + 1))?;
                         super::json::set_path(&mut root, &path, val, mode);
                         i += 2;
                     }
@@ -1660,6 +1660,28 @@ fn json_value_arg(val: &Value, expr: Option<&Expr>) -> Result<super::json::Json>
     Ok(arg_to_json(val, expr))
 }
 
+/// The *value* argument of `json_set`/`json_insert`/`json_replace` (and their
+/// `jsonb_*` forms). Identical to [`json_value_arg`] except that a plain
+/// (non-JSON-subtype) SQL TEXT value becomes a **TEXTRAW** element — the raw
+/// UTF-8 bytes stored verbatim, unescaped — matching sqlite's
+/// `jsonFunctionArgToBlob`, which serves exactly this argument position (the
+/// JSON *text* constructors `json_object`/`json_array` instead escape a plain
+/// string into a `TEXT`/`TEXTJ` node when their output is re-encoded).
+fn json_edit_value_arg(val: &Value, expr: Option<&Expr>) -> Result<super::json::Json> {
+    if let Value::Blob(b) = val {
+        return super::json::Json::from_jsonb(b)
+            .ok_or_else(|| Error::Error("JSON cannot hold BLOB values".into()));
+    }
+    // A JSON-subtype TEXT value (the output of a json-producing expression) is
+    // parsed as JSON; any other plain TEXT is stored raw (TEXTRAW).
+    if let Value::Text(s) = val
+        && !expr.is_some_and(produces_json)
+    {
+        return Ok(super::json::Json::text_raw(s.as_str()));
+    }
+    Ok(arg_to_json(val, expr))
+}
+
 /// `json_extract`: one path returns the SQL value at that path (objects/arrays as
 /// minified JSON text); multiple paths return a JSON array of the extracted
 /// elements (missing paths become JSON `null`). `jsonb_extract` is the same but
@@ -1732,9 +1754,12 @@ pub(crate) fn produces_json(e: &Expr) -> bool {
         Expr::Function { name, args, .. } => {
             let lname = name.to_ascii_lowercase();
             match lname.as_str() {
-                "json" | "json_array" | "json_object" | "json_insert" | "json_replace"
-                | "json_set" | "json_patch" | "json_remove" | "json_group_array"
-                | "json_group_object" => true,
+                // `json_quote` marks its result with the JSON subtype too
+                // (sqlite's `jsonQuoteFunc` calls `sqlite3_result_subtype`), so
+                // `json_set('{}','$.a',json_quote('s'))` embeds `"s"` as JSON.
+                "json" | "json_quote" | "json_array" | "json_object" | "json_insert"
+                | "json_replace" | "json_set" | "json_patch" | "json_remove"
+                | "json_group_array" | "json_group_object" => true,
                 // Multiple paths → a JSON array (subtype). One path's subtype is
                 // value-dependent (structure vs scalar), so don't claim it here.
                 "json_extract" => args.len() >= 3,
