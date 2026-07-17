@@ -44,6 +44,194 @@ pub fn is_aggregate_call(name: &str, nargs: usize, star: bool) -> bool {
     }
 }
 
+/// One SQL function graphite registers, as reported by `PRAGMA function_list`:
+/// `(name, kind, narg)`. `kind` is `'s'` scalar, `'a'` aggregate, `'w'` window;
+/// `narg` is the declared argument count or `-1` for a variadic/optional-arg
+/// function. graphite has no runtime `FuncDef` registry (functions are dispatched
+/// by a `match` in [`eval_scalar`] and folded by the executor), so this is the
+/// hand-maintained enumeration of that same set — the honest analogue of sqlite's
+/// `aBuiltinFunc[]`. Kept in step with the dispatch arms below.
+pub type FunctionListEntry = (&'static str, char, i32);
+
+/// The functions graphite actually implements, one entry per `(name, kind)`.
+/// Consumed by `PRAGMA function_list`. `min`/`max` appear twice (scalar with 2+
+/// args, aggregate with one), mirroring sqlite. Deliberately excludes trigger-only
+/// `RAISE()`. `narg` uses `-1` for any variadic/optional-arg function rather than
+/// reproducing sqlite's internal negative-arity quirks (`coalesce` is `-1`, not
+/// `-4`). Not sorted here — [`function_list`] sorts by name.
+const FUNCTION_LIST: &[FunctionListEntry] = &[
+    // --- scalar ---
+    ("abs", 's', 1),
+    ("acos", 's', 1),
+    ("acosh", 's', 1),
+    ("asin", 's', 1),
+    ("asinh", 's', 1),
+    ("atan", 's', 1),
+    ("atan2", 's', 2),
+    ("atanh", 's', 1),
+    ("ceil", 's', 1),
+    ("ceiling", 's', 1),
+    ("changes", 's', 0),
+    ("char", 's', -1),
+    ("coalesce", 's', -1),
+    ("concat", 's', -1),
+    ("concat_ws", 's', -1),
+    ("cos", 's', 1),
+    ("cosh", 's', 1),
+    ("date", 's', -1),
+    ("datetime", 's', -1),
+    ("degrees", 's', 1),
+    ("exp", 's', 1),
+    ("floor", 's', 1),
+    ("format", 's', -1),
+    ("geopoly_area", 's', 1),
+    ("geopoly_bbox", 's', 1),
+    ("geopoly_blob", 's', 1),
+    ("geopoly_ccw", 's', 1),
+    ("geopoly_contains_point", 's', 3),
+    ("geopoly_json", 's', 1),
+    ("geopoly_overlap", 's', 2),
+    ("geopoly_regular", 's', 4),
+    ("geopoly_svg", 's', -1),
+    ("geopoly_within", 's', 2),
+    ("geopoly_xform", 's', 7),
+    ("glob", 's', 2),
+    ("hex", 's', 1),
+    ("if", 's', 3),
+    ("ifnull", 's', 2),
+    ("iif", 's', 3),
+    ("instr", 's', 2),
+    ("json", 's', 1),
+    ("json_array", 's', -1),
+    ("json_array_length", 's', -1),
+    ("json_error_position", 's', 1),
+    ("json_extract", 's', -1),
+    ("json_insert", 's', -1),
+    ("json_object", 's', -1),
+    ("json_patch", 's', 2),
+    ("json_pretty", 's', -1),
+    ("json_quote", 's', 1),
+    ("json_remove", 's', -1),
+    ("json_replace", 's', -1),
+    ("json_set", 's', -1),
+    ("json_type", 's', -1),
+    ("json_valid", 's', -1),
+    ("jsonb", 's', 1),
+    ("jsonb_array", 's', -1),
+    ("jsonb_extract", 's', -1),
+    ("jsonb_insert", 's', -1),
+    ("jsonb_object", 's', -1),
+    ("jsonb_patch", 's', 2),
+    ("jsonb_remove", 's', -1),
+    ("jsonb_replace", 's', -1),
+    ("jsonb_set", 's', -1),
+    ("julianday", 's', -1),
+    ("last_insert_rowid", 's', 0),
+    ("length", 's', 1),
+    ("like", 's', -1),
+    ("likelihood", 's', 2),
+    ("likely", 's', 1),
+    ("ln", 's', 1),
+    ("log", 's', -1),
+    ("log10", 's', 1),
+    ("log2", 's', 1),
+    ("lower", 's', 1),
+    ("ltrim", 's', -1),
+    ("max", 's', -1),
+    ("min", 's', -1),
+    ("mod", 's', 2),
+    ("nullif", 's', 2),
+    ("octet_length", 's', 1),
+    ("pi", 's', 0),
+    ("pow", 's', 2),
+    ("power", 's', 2),
+    ("printf", 's', -1),
+    ("quote", 's', 1),
+    ("radians", 's', 1),
+    ("random", 's', 0),
+    ("randomblob", 's', 1),
+    ("replace", 's', 3),
+    ("round", 's', -1),
+    ("rtrim", 's', -1),
+    ("sign", 's', 1),
+    ("sin", 's', 1),
+    ("sinh", 's', 1),
+    ("soundex", 's', 1),
+    ("sqlite_compileoption_get", 's', 1),
+    ("sqlite_compileoption_used", 's', 1),
+    ("sqlite_source_id", 's', 0),
+    ("sqlite_version", 's', 0),
+    ("sqrt", 's', 1),
+    ("strftime", 's', -1),
+    ("substr", 's', -1),
+    ("substring", 's', -1),
+    ("subtype", 's', 1),
+    ("tan", 's', 1),
+    ("tanh", 's', 1),
+    ("time", 's', -1),
+    ("timediff", 's', 2),
+    ("total_changes", 's', 0),
+    ("trim", 's', -1),
+    ("trunc", 's', 1),
+    ("typeof", 's', 1),
+    ("unhex", 's', -1),
+    ("unicode", 's', 1),
+    ("unistr", 's', 1),
+    ("unistr_quote", 's', 1),
+    ("unixepoch", 's', -1),
+    ("unlikely", 's', 1),
+    ("upper", 's', 1),
+    ("zeroblob", 's', 1),
+    // --- aggregate ---
+    ("avg", 'a', 1),
+    ("count", 'a', -1),
+    ("geopoly_group_bbox", 'a', 1),
+    ("group_concat", 'a', -1),
+    ("json_group_array", 'a', 1),
+    ("json_group_object", 'a', 2),
+    ("jsonb_group_array", 'a', 1),
+    ("jsonb_group_object", 'a', 2),
+    ("max", 'a', 1),
+    ("min", 'a', 1),
+    ("string_agg", 'a', 2),
+    ("sum", 'a', 1),
+    ("total", 'a', 1),
+    // --- window ---
+    ("cume_dist", 'w', 0),
+    ("dense_rank", 'w', 0),
+    ("first_value", 'w', 1),
+    ("lag", 'w', -1),
+    ("last_value", 'w', 1),
+    ("lead", 'w', -1),
+    ("nth_value", 'w', 2),
+    ("ntile", 'w', 1),
+    ("percent_rank", 'w', 0),
+    ("rank", 'w', 0),
+    ("row_number", 'w', 0),
+];
+
+/// The FTS5 auxiliary/query functions, registered only when the `fts5` feature is
+/// built in. Split out so the base list stays feature-independent.
+#[cfg(feature = "fts5")]
+const FTS5_FUNCTION_LIST: &[FunctionListEntry] = &[
+    ("bm25", 's', -1),
+    ("highlight", 's', 4),
+    ("match", 's', 2),
+    ("snippet", 's', 6),
+];
+
+/// The full set of SQL functions this build registers, sorted by name (then by
+/// kind for a stable order among same-named entries like `min`/`max`), matching
+/// sqlite's `PRAGMA function_list` ordering. Feature-gated functions (FTS5) are
+/// included only when their feature is active.
+pub fn function_list() -> Vec<FunctionListEntry> {
+    let mut out: Vec<FunctionListEntry> = FUNCTION_LIST.to_vec();
+    #[cfg(feature = "fts5")]
+    out.extend_from_slice(FTS5_FUNCTION_LIST);
+    out.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1)));
+    out
+}
+
 /// The searchable `(column name, text)` pairs an FTS5 `MATCH` operand refers to,
 /// or `None` if the operand is not a column or table-name reference (so `MATCH`
 /// is not a full-text query in this context). A reference to an indexed column

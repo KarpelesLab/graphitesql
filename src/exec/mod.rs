@@ -4151,6 +4151,38 @@ impl Connection {
                     .map(|n| alloc::vec![Value::Text((*n).into())])
                     .collect(),
             }),
+            // `PRAGMA function_list` — introspection over the SQL functions this
+            // build registers (graphite's own set, from `func::function_list()`),
+            // sorted by name like sqlite. Same six columns as sqlite:
+            // `name, builtin, type, enc, narg, flags`. `name`, `builtin` (always
+            // 1 — every graphite function is built in), `type` (`s`/`a`/`w`),
+            // `enc` (always `utf8` — graphite is UTF-8 only), and `narg` (the
+            // declared arity, `-1` for variadic) are reported faithfully. `flags`
+            // is a build/implementation-specific `FuncDef` bitmask graphite does
+            // not model, so it is reported as 0 rather than fabricated.
+            "function_list" => Ok(QueryResult {
+                columns: alloc::vec![
+                    String::from("name"),
+                    String::from("builtin"),
+                    String::from("type"),
+                    String::from("enc"),
+                    String::from("narg"),
+                    String::from("flags"),
+                ],
+                rows: func::function_list()
+                    .into_iter()
+                    .map(|(name, kind, narg)| {
+                        alloc::vec![
+                            Value::Text(name.into()),
+                            Value::Integer(1),
+                            Value::Text(alloc::string::String::from(kind).into()),
+                            Value::Text("utf8".into()),
+                            Value::Integer(narg as i64),
+                            Value::Integer(0),
+                        ]
+                    })
+                    .collect(),
+            }),
             "foreign_key_list" => self.pragma_foreign_key_list(p),
             "foreign_key_check" => self.pragma_foreign_key_check(p),
             "integrity_check" | "quick_check" => self.pragma_integrity_check(p),
@@ -38808,6 +38840,7 @@ const PRAGMA_LIST: &[&str] = &[
     "freelist_count",
     "full_column_names",
     "fullfsync",
+    "function_list",
     "hard_heap_limit",
     "ignore_check_constraints",
     "incremental_vacuum",

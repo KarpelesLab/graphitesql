@@ -77,3 +77,96 @@ fn compile_options_reports_enabled_features() {
         "compile_options should report ENABLE_FTS5 when built with fts5"
     );
 }
+
+#[test]
+fn function_list_is_populated_sorted_and_sqlite_shaped() {
+    let c = Connection::open_memory().unwrap();
+    let r = c.query("PRAGMA function_list").unwrap();
+    // Same six columns as sqlite's `PRAGMA function_list`.
+    assert_eq!(
+        r.columns,
+        vec!["name", "builtin", "type", "enc", "narg", "flags"]
+    );
+    assert!(
+        r.rows.len() > 100,
+        "expected many functions, got {}",
+        r.rows.len()
+    );
+
+    // Every row: builtin is 1, enc is utf8, type is one of s/a/w.
+    for row in &r.rows {
+        assert_eq!(row[1], Value::Integer(1), "builtin must be 1");
+        assert_eq!(row[3], Value::Text("utf8".into()), "enc must be utf8");
+        match &row[2] {
+            Value::Text(t) => assert!(
+                t == "s" || t == "a" || t == "w",
+                "type must be s/a/w, got {t}"
+            ),
+            other => panic!("type must be text, got {other:?}"),
+        }
+    }
+
+    // Sorted by name (sqlite orders `function_list` alphabetically).
+    let ns = names(&c, "PRAGMA function_list");
+    let mut sorted = ns.clone();
+    sorted.sort();
+    assert_eq!(ns, sorted, "function_list must be sorted by name");
+
+    // A spread of functions graphite genuinely registers must be present.
+    for want in [
+        "abs",
+        "coalesce",
+        "json_extract",
+        "printf",
+        "substr",
+        "sum",
+        "count",
+        "row_number",
+        "sqlite_compileoption_used",
+        "sqlite_compileoption_get",
+    ] {
+        assert!(ns.iter().any(|n| n == want), "function_list missing {want}");
+    }
+    #[cfg(feature = "fts5")]
+    for want in ["bm25", "highlight", "snippet"] {
+        assert!(
+            ns.iter().any(|n| n == want),
+            "function_list missing fts5 {want}"
+        );
+    }
+}
+
+#[test]
+fn function_list_reports_kind_and_arity() {
+    let c = Connection::open_memory().unwrap();
+    let r = c.query("PRAGMA function_list").unwrap();
+    let find = |name: &str, kind: &str| -> Option<i64> {
+        r.rows.iter().find_map(|row| {
+            let n = if let Value::Text(t) = &row[0] {
+                t.to_string()
+            } else {
+                return None;
+            };
+            let k = if let Value::Text(t) = &row[2] {
+                t.to_string()
+            } else {
+                return None;
+            };
+            match row[4] {
+                Value::Integer(narg) if n == name && k == kind => Some(narg),
+                _ => None,
+            }
+        })
+    };
+    // Scalar with a fixed arity.
+    assert_eq!(find("abs", "s"), Some(1));
+    // Variadic scalar reports -1.
+    assert_eq!(find("coalesce", "s"), Some(-1));
+    // Aggregate kind 'a'.
+    assert_eq!(find("sum", "a"), Some(1));
+    // Window kind 'w'.
+    assert_eq!(find("row_number", "w"), Some(0));
+    // min/max appear as both scalar and aggregate.
+    assert_eq!(find("min", "s"), Some(-1));
+    assert_eq!(find("min", "a"), Some(1));
+}
