@@ -28,7 +28,7 @@ use crate::btree::{
 };
 use crate::error::{Error, Result};
 use crate::format::record::{decode_record, encode_record};
-use crate::pager::{AutoVacuum, PageSource, WritePager};
+use crate::pager::{AutoVacuum, CheckpointMode, PageSource, WritePager};
 use crate::schema::Schema;
 use crate::sql::ast::*;
 use crate::sql::{self};
@@ -4146,22 +4146,32 @@ impl Connection {
                 }
                 Ok(single("timeout", Value::Integer(self.busy_timeout.get())))
             }
-            // `wal_checkpoint[(mode)]` — graphite never runs in WAL mode (its
-            // journal is delete/memory), so a checkpoint is a no-op. sqlite still
-            // returns one `(busy, log, checkpointed)` row; for a non-WAL database
-            // that is always `0, -1, -1`.
-            "wal_checkpoint" => Ok(QueryResult {
-                columns: alloc::vec![
-                    String::from("busy"),
-                    String::from("log"),
-                    String::from("checkpointed"),
-                ],
-                rows: alloc::vec![alloc::vec![
-                    Value::Integer(0),
-                    Value::Integer(-1),
-                    Value::Integer(-1),
-                ]],
-            }),
+            // `wal_checkpoint[(mode)]` returns one `(busy, log, checkpointed)`
+            // row. On a **non-WAL** database (rollback journal / memory) there is
+            // nothing to checkpoint and sqlite reports `0, -1, -1` — so does this
+            // read-only (`&self`) path. In **WAL** mode the checkpoint actually
+            // mutates (it backfills committed frames into the main file and can
+            // rewrite/truncate the `-wal`), which `query`'s `&self` borrow cannot
+            // do; route it to the mutating `execute`/`exec_pragma` path (which
+            // calls the real `checkpoint_mode`) via the same `use execute()`
+            // signal the executor uses for any other write-shaped statement.
+            "wal_checkpoint" => {
+                if self.backend.wal_mode() {
+                    return Err(Error::Unsupported("use execute() for wal_checkpoint"));
+                }
+                Ok(QueryResult {
+                    columns: alloc::vec![
+                        String::from("busy"),
+                        String::from("log"),
+                        String::from("checkpointed"),
+                    ],
+                    rows: alloc::vec![alloc::vec![
+                        Value::Integer(0),
+                        Value::Integer(-1),
+                        Value::Integer(-1),
+                    ]],
+                })
+            }
             "wal_autocheckpoint" => Ok(single(
                 "wal_autocheckpoint",
                 Value::Integer(self.wal_autocheckpoint.get()),
@@ -8164,7 +8174,19 @@ impl Connection {
             // Other modes (delete/truncate/persist/memory/off) keep the
             // rollback-journal path; switching back out of WAL is a no-op.
         } else if p.name.eq_ignore_ascii_case("wal_checkpoint") {
-            self.backend.writer()?.checkpoint()?;
+            // `PRAGMA wal_checkpoint(mode)` — the optional argument selects the
+            // checkpoint mode (`pragma.c`: PASSIVE/FULL/RESTART/TRUNCATE, default
+            // PASSIVE), mapped by `CheckpointMode::from_name`. A non-WAL database
+            // has nothing to checkpoint (the pager returns the `(0, -1, -1)`
+            // triple, discarded here). The `(busy, log, checkpointed)` row is
+            // produced by the read path (`run_pragma`) for a non-WAL database; in
+            // WAL mode the side effect runs here.
+            let mode = p
+                .value
+                .as_ref()
+                .map(|e| CheckpointMode::from_name(&pragma_text(e)))
+                .unwrap_or(CheckpointMode::Passive);
+            self.backend.writer()?.checkpoint_mode(mode)?;
         } else if p.name.eq_ignore_ascii_case("user_version") {
             if let Some(e) = &p.value {
                 let v = pragma_header_int(e, params)?;
@@ -13046,6 +13068,19 @@ impl Connection {
                         next_auto += 1;
                         r
                     });
+                // sqlite's `rtreeUpdate` validates the coordinate pairs *before*
+                // the rowid-uniqueness check, so a row that violates both reports
+                // the coordinate error. The coordinate violation is a
+                // `SQLITE_CONSTRAINT` subject to the statement's conflict mode:
+                // `OR IGNORE` skips the row, everything else (including
+                // `OR REPLACE`, which only resolves the rowid conflict) errors.
+                let cell = match rtree_cell_from_values(
+                    rid, values, n_coord, integer, &table, &arg_refs,
+                ) {
+                    Ok(c) => c,
+                    Err(_) if matches!(on_conflict, OnConflict::Ignore) => continue,
+                    Err(e) => return Err(e),
+                };
                 if existing.contains(&rid) {
                     match on_conflict {
                         OnConflict::Replace => {}
@@ -13059,7 +13094,7 @@ impl Connection {
                 }
                 existing.insert(rid);
                 cells.retain(|c| c.key != rid); // OR REPLACE within this batch
-                cells.push(rtree_cell_from_values(rid, values, n_coord, integer)?);
+                cells.push(cell);
                 n += 1;
             }
             self.rtree_apply(&table, n_coord, integer, cells, &[])?;
@@ -13483,7 +13518,9 @@ impl Connection {
                     Some(Value::Null) | None => *old_rowid,
                     Some(v) => eval::to_i64(v),
                 };
-                inserts.push(rtree_cell_from_values(new_rid, values, n_coord, integer)?);
+                inserts.push(rtree_cell_from_values(
+                    new_rid, values, n_coord, integer, &upd.table, &arg_refs,
+                )?);
             }
             self.rtree_apply(&upd.table, n_coord, integer, inserts, &deletes)?;
             return Ok(changes.len());
@@ -43724,15 +43761,14 @@ fn rtree_cell_from_values(
     values: &[Value],
     n_coord: usize,
     integer: bool,
+    table: &str,
+    args: &[&str],
 ) -> Result<RtreeCell> {
-    for d in 0..n_coord / 2 {
-        let mn = values.get(1 + 2 * d).map_or(0.0, crate::vtab::coord_f64);
-        let mx = values.get(2 + 2 * d).map_or(0.0, crate::vtab::coord_f64);
-        if mn > mx {
-            return Err(Error::Error("rtree constraint failed".into()));
-        }
-    }
-    let coords = (0..n_coord)
+    // Round each coordinate the way `rtree.c`'s `rtreeUpdate` stores it before
+    // any validation: for the float rtree each min (even coordinate index)
+    // toward −∞ and each max (odd index) toward +∞ as an f32; for `rtree_i32`
+    // truncate toward zero into the signed 32-bit range.
+    let coords: Vec<f64> = (0..n_coord)
         .map(|d| {
             let v = values.get(1 + d).map_or(0.0, crate::vtab::coord_f64);
             if integer {
@@ -43744,6 +43780,20 @@ fn rtree_cell_from_values(
             }
         })
         .collect();
+    // Validate `min <= max` on the *stored* (rounded) coordinates — sqlite
+    // compares the rounded values, so a pair that rounds to the same f32 (e.g.
+    // `1.000000000001` vs `1.0`) is accepted. The message names the first
+    // failing pair's columns from the `USING rtree(…)` argument list, byte-for-
+    // byte `rtreeConstraintError` (`rtree constraint failed: <t>.(<min><=<max>)`).
+    for d in 0..n_coord / 2 {
+        if coords[2 * d] > coords[2 * d + 1] {
+            return Err(crate::vtab::rtree_constraint_error(
+                Some(table),
+                args,
+                1 + 2 * d,
+            ));
+        }
+    }
     Ok(RtreeCell { key: rowid, coords })
 }
 
