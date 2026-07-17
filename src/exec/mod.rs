@@ -251,6 +251,15 @@ pub struct Connection {
     /// page count, a negative value is KiB; default −2000). graphite keeps every
     /// page resident, so this is reported back but does not bound a real cache.
     cache_size: core::cell::Cell<i64>,
+    /// `PRAGMA data_version` — sqlite's per-connection `SQLITE_FCNTL_DATA_VERSION`
+    /// counter. It stays constant for the life of a connection *unless another
+    /// connection commits* to the database, at which point it changes. Starts at
+    /// `1` (`dv_counter`); `dv_seen_cc` remembers the on-disk change counter this
+    /// connection has already accounted for (its own writes plus the last value
+    /// read), so a later read that finds a *different* change counter — a foreign
+    /// commit — bumps `dv_counter`. `None` until first observed.
+    dv_counter: core::cell::Cell<i64>,
+    dv_seen_cc: core::cell::Cell<Option<u32>>,
     /// `PRAGMA analysis_limit` — the row sample cap `ANALYZE` would use (0 =
     /// unlimited). graphite always analyzes fully, so this is advisory; it is
     /// stored and reported back like sqlite (which clamps a negative value to 0).
@@ -620,6 +629,8 @@ impl Connection {
             vtab_registry: VTabRegistry::with_builtins(),
             rng_state: core::cell::Cell::new(initial_rng_seed()),
             cache_size: core::cell::Cell::new(-2000),
+            dv_counter: core::cell::Cell::new(1),
+            dv_seen_cc: core::cell::Cell::new(None),
             analysis_limit: core::cell::Cell::new(0),
             busy_timeout: core::cell::Cell::new(0),
             journal_size_limit: core::cell::Cell::new(-1),
@@ -686,6 +697,8 @@ impl Connection {
             vtab_registry: VTabRegistry::with_builtins(),
             rng_state: core::cell::Cell::new(initial_rng_seed()),
             cache_size: core::cell::Cell::new(-2000),
+            dv_counter: core::cell::Cell::new(1),
+            dv_seen_cc: core::cell::Cell::new(None),
             analysis_limit: core::cell::Cell::new(0),
             busy_timeout: core::cell::Cell::new(0),
             journal_size_limit: core::cell::Cell::new(-1),
@@ -4055,7 +4068,44 @@ impl Connection {
                 "application_id",
                 Value::Integer(header.application_id as i32 as i64),
             )),
-            "data_version" => Ok(single("data_version", Value::Integer(1))),
+            // `PRAGMA data_version` — sqlite's `SQLITE_FCNTL_DATA_VERSION`: a value
+            // that is stable for this connection but changes when *another*
+            // connection commits. We start at `1` and bump each time we observe
+            // the on-disk change counter differ from the value our own writes /
+            // last read left behind (see `dv_seen_cc`, updated after every
+            // `execute`). Same-connection writes never move it; a foreign commit
+            // does — matching sqlite's behaviour (the exact integer is arbitrary).
+            "data_version" => {
+                // Read the *live* file change counter from page 1 (header offset
+                // 24, big-endian) rather than the connection's cached header: in
+                // WAL mode a foreign commit lands as a page-1 frame that the
+                // shared wal-index overlays, so page(1) reflects it while the
+                // cached header does not. Fall back to the cached value if page 1
+                // is momentarily unreadable.
+                let cc = self
+                    .backend
+                    .source()
+                    .page(1)
+                    .ok()
+                    .and_then(|pg| {
+                        pg.data()
+                            .get(24..28)
+                            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+                    })
+                    .unwrap_or_else(|| self.backend.source().header().change_counter);
+                match self.dv_seen_cc.get() {
+                    Some(prev) if prev != cc => {
+                        self.dv_counter.set(self.dv_counter.get().wrapping_add(1));
+                        self.dv_seen_cc.set(Some(cc));
+                    }
+                    None => self.dv_seen_cc.set(Some(cc)),
+                    _ => {}
+                }
+                Ok(single(
+                    "data_version",
+                    Value::Integer(self.dv_counter.get()),
+                ))
+            }
             "table_info" => self.pragma_table_info(p, false),
             "table_xinfo" => self.pragma_table_info(p, true),
             "index_list" => self.pragma_index_list(p),
@@ -4073,6 +4123,32 @@ impl Connection {
                     .iter()
                     .enumerate()
                     .map(|(i, n)| alloc::vec![Value::Integer(i as i64), Value::Text((*n).into())])
+                    .collect(),
+            }),
+            // `PRAGMA pragma_list` / `module_list` / `compile_options` —
+            // introspection over graphite's *own* registries (never a copy of a
+            // particular sqlite build's list). One `name` column each
+            // (`compile_options` names its column `compile_options`), rows in
+            // sqlite's alphabetical order.
+            "pragma_list" => Ok(QueryResult {
+                columns: alloc::vec![String::from("name")],
+                rows: PRAGMA_LIST
+                    .iter()
+                    .map(|n| alloc::vec![Value::Text((*n).into())])
+                    .collect(),
+            }),
+            "module_list" => Ok(QueryResult {
+                columns: alloc::vec![String::from("name")],
+                rows: module_list_names()
+                    .iter()
+                    .map(|n| alloc::vec![Value::Text((*n).into())])
+                    .collect(),
+            }),
+            "compile_options" => Ok(QueryResult {
+                columns: alloc::vec![String::from("compile_options")],
+                rows: compile_option_names()
+                    .iter()
+                    .map(|n| alloc::vec![Value::Text((*n).into())])
                     .collect(),
             }),
             "foreign_key_list" => self.pragma_foreign_key_list(p),
@@ -5907,6 +5983,18 @@ impl Connection {
 
     /// Like [`execute`](Self::execute) but with bound parameters.
     pub fn execute_params(&mut self, sql: &str, params: &Params) -> Result<usize> {
+        let r = self.execute_params_inner(sql, params);
+        // Record the on-disk change counter this connection's own statement left
+        // behind, so `PRAGMA data_version` does not mistake our own writes for a
+        // foreign modification (sqlite's `SQLITE_FCNTL_DATA_VERSION` only tracks
+        // *other* connections' commits). A read-only/in-memory backend has a
+        // stable counter, so this is a cheap no-op there.
+        let cc = self.backend.source().header().change_counter;
+        self.dv_seen_cc.set(Some(cc));
+        r
+    }
+
+    fn execute_params_inner(&mut self, sql: &str, params: &Params) -> Result<usize> {
         let stmt = sql::parse_one(sql)?;
         self.run_authorizer(&stmt)?;
         // Statement boundary: like the read path (`query_params`), drop any read
@@ -38687,6 +38775,120 @@ fn is_const_arg(e: &Expr) -> bool {
         Expr::Unary { expr, .. } | Expr::Paren(expr) => is_const_arg(expr),
         _ => false,
     }
+}
+
+/// The pragmas graphite implements, spelled and ordered as sqlite's
+/// `PRAGMA pragma_list` reports them (alphabetically). This is graphite's own
+/// supported set — a subset of sqlite's `aPragmaName[]` — not a copy of a
+/// particular sqlite build's list. Keep it in step with `run_pragma`'s arms.
+const PRAGMA_LIST: &[&str] = &[
+    "analysis_limit",
+    "application_id",
+    "auto_vacuum",
+    "automatic_index",
+    "busy_timeout",
+    "cache_size",
+    "case_sensitive_like",
+    "cell_size_check",
+    "checkpoint_fullfsync",
+    "collation_list",
+    "compile_options",
+    "count_changes",
+    "data_version",
+    "database_list",
+    "defer_foreign_keys",
+    "empty_result_callbacks",
+    "encoding",
+    "foreign_key_check",
+    "foreign_key_list",
+    "foreign_keys",
+    "freelist_count",
+    "full_column_names",
+    "fullfsync",
+    "hard_heap_limit",
+    "ignore_check_constraints",
+    "incremental_vacuum",
+    "index_info",
+    "index_list",
+    "index_xinfo",
+    "integrity_check",
+    "journal_mode",
+    "journal_size_limit",
+    "legacy_alter_table",
+    "legacy_file_format",
+    "locking_mode",
+    "max_page_count",
+    "mmap_size",
+    "module_list",
+    "optimize",
+    "page_count",
+    "page_size",
+    "pragma_list",
+    "query_only",
+    "quick_check",
+    "read_uncommitted",
+    "recursive_triggers",
+    "reverse_unordered_selects",
+    "schema_version",
+    "secure_delete",
+    "short_column_names",
+    "soft_heap_limit",
+    "synchronous",
+    "table_info",
+    "table_list",
+    "table_xinfo",
+    "temp_store",
+    "threads",
+    "user_version",
+    "wal_autocheckpoint",
+    "wal_checkpoint",
+    "writable_schema",
+];
+
+/// The virtual-table modules graphite makes available — its built-in registry
+/// (`VTabRegistry::with_builtins`) plus the eponymous table-valued modules the
+/// executor resolves directly in a `FROM` clause. sqlite's `PRAGMA module_list`
+/// reports whichever modules its build registered; this is graphite's honest
+/// equivalent (fts5 is feature-gated), sorted alphabetically for determinism.
+fn module_list_names() -> alloc::vec::Vec<&'static str> {
+    let mut names = alloc::vec![
+        "dbstat",
+        "generate_series",
+        "geopoly",
+        "json_each",
+        "json_tree",
+        "rtree",
+        "rtree_i32",
+        "series",
+        "sqlite_dbpage",
+    ];
+    #[cfg(feature = "fts5")]
+    {
+        names.push("fts5");
+        names.push("fts5vocab");
+    }
+    names.sort_unstable();
+    names
+}
+
+/// graphite's real compile-time options — the optional capabilities actually
+/// built into this binary. Reported by `PRAGMA compile_options` using sqlite's
+/// recognizable `ENABLE_*` spellings, but the *content* reflects graphite's own
+/// feature set (never a copy of a particular sqlite build's list). Alphabetical.
+fn compile_option_names() -> alloc::vec::Vec<&'static str> {
+    let mut opts = alloc::vec![
+        "ENABLE_DBSTAT_VTAB",
+        "ENABLE_GEOPOLY",
+        "ENABLE_JSON1",
+        "ENABLE_MATH_FUNCTIONS",
+        "ENABLE_RTREE",
+    ];
+    #[cfg(feature = "fts5")]
+    opts.push("ENABLE_FTS5");
+    #[cfg(feature = "unicode")]
+    opts.push("ENABLE_ICU");
+    opts.sort_unstable();
+    opts
 }
 
 fn pragma_has_tvf(bare: &str) -> bool {
