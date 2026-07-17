@@ -215,12 +215,28 @@ impl FpDecode {
 /// core shared by `quote()` and the `printf` bang path; it does not apply field
 /// width, zero-padding, thousands separators, or a forced `+`/space prefix
 /// (callers that need those handle them separately).
-pub fn format(
+pub fn format(r: f64, precision: i32, xtype: XType, altform2: bool, altform: bool) -> String {
+    printf_float(r, precision, xtype, altform2, altform, false, false)
+}
+
+/// The full `etFLOAT`/`etEXP`/`etGENERIC` conversion arm of SQLite's
+/// `sqlite3_str_vappendf`, minus field-width handling (the caller pads):
+/// [`format`] plus the `,` flag (`cthousand` — thousands separators woven into
+/// the pre-decimal digits) and the `0` flag's effect on the *non-finite*
+/// renderings (`zeropad`: NaN prints `null` instead of `NaN`, and an infinity
+/// is rendered as the numeric form `9` with decimal-point position 1000 — a
+/// 1000-digit number under `%f`, `9.0…e+999` under `%e`/`%g` — instead of
+/// `Inf`). A negative value carries its `-` sign; the caller applies any
+/// `+`/space prefix and zero-pads to the field width afterwards, exactly like
+/// the C code's trailing `flag_zeropad` block.
+pub fn printf_float(
     r: f64,
     mut precision: i32,
     mut xtype: XType,
     altform2: bool,
     altform: bool,
+    cthousand: bool,
+    zeropad: bool,
 ) -> String {
     let i_round = match xtype {
         XType::Float => -precision,
@@ -232,15 +248,27 @@ pub fn format(
         }
         XType::Exp => precision + 1,
     };
-    let s = FpDecode::decode(r, i_round, if altform2 { 26 } else { 16 });
+    let mut s = FpDecode::decode(r, i_round, if altform2 { 26 } else { 16 });
 
     if s.is_special != 0 {
-        let mut out = String::new();
-        if s.sign == b'-' {
-            out.push('-');
+        if s.is_special == 2 {
+            // NaN: never signed; under the `0` flag SQLite prints "null".
+            return String::from(if zeropad { "null" } else { "NaN" });
+        } else if zeropad {
+            // An infinity under the `0` flag renders numerically as the digit 9
+            // with the decimal point at position 1000 (so ~1e999, the largest
+            // value SQLite's text-to-float parsing round-trips to infinity).
+            s.digits = alloc::vec![b'9'];
+            s.i_dp = 1000;
+            s.n = 1;
+        } else {
+            let mut out = String::new();
+            if s.sign == b'-' {
+                out.push('-');
+            }
+            out.push_str("Inf");
+            return out;
         }
-        out.push_str(if s.is_special == 2 { "NaN" } else { "Inf" });
-        return out;
     }
 
     let mut out = String::new();
@@ -272,12 +300,16 @@ pub fn format(
         c as char
     };
 
-    // Digits before the decimal point.
+    // Digits before the decimal point (with the `,` flag, a thousands
+    // separator after each digit that has a multiple-of-3 count remaining).
     if e2 < 0 {
         out.push('0');
     } else {
         while e2 >= 0 {
             out.push(digit(&mut j));
+            if cthousand && e2 % 3 == 0 && e2 > 1 {
+                out.push(',');
+            }
             e2 -= 1;
         }
     }
