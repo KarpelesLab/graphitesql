@@ -80,34 +80,6 @@ fn temp_object_schema(schema: Option<String>, unqualified_msg: &str) -> Result<O
     }
 }
 
-fn token_arg_text(tok: &Token) -> String {
-    match tok {
-        Token::Word(w) => w.clone(),
-        Token::Ident(i) => i.clone(),
-        Token::Integer(n) => alloc::format!("{n}"),
-        Token::Int2Pow63 => String::from("9223372036854775808"),
-        Token::Float(f) => alloc::format!("{f}"),
-        Token::Str(s) => s.clone(),
-        Token::Minus => String::from("-"),
-        Token::Plus => String::from("+"),
-        Token::Dot => String::from("."),
-        Token::Star => String::from("*"),
-        Token::Eq => String::from("="),
-        other => alloc::format!("{other:?}"),
-    }
-}
-
-/// Whether `s` ends in an alphanumeric/underscore character (a word-like run
-/// that should be space-separated from a following word-like token).
-fn ends_wordish(s: &str) -> bool {
-    s.chars().next_back().is_some_and(is_wordish_start)
-}
-
-/// Whether `c` begins a word-like token (letter, digit, or underscore).
-fn is_wordish_start(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
 /// Maximum recursion depth for nested expressions and sub-selects.
 ///
 /// The parser is recursive descent, so an attacker-supplied string with very
@@ -1893,9 +1865,21 @@ impl Parser {
     }
 
     /// Capture one module argument of a `CREATE VIRTUAL TABLE … USING m(…)` list
-    /// verbatim as a string, stopping at a top-level comma or the closing paren.
+    /// **verbatim from the source**, stopping at a top-level comma or the closing
+    /// paren. SQLite passes each argument to the module's `xConnect` exactly as
+    /// written (quotes, punctuation, and interior spacing intact); reassembling it
+    /// from tokens would lose the quoting that distinguishes a quoted identifier
+    /// containing spaces (`"min x"`, a single column name) from a name-plus-type
+    /// (`minx REAL`). Slicing the original source between the argument's first and
+    /// last token preserves it, so the module (e.g. `rtree_col_name`) can strip
+    /// the quotes itself, matching sqlite's `rtreeInit`/fts5 config parsing.
     fn vtab_arg(&mut self) -> Result<String> {
-        let mut out = String::new();
+        let start = self
+            .tokens
+            .get(self.pos)
+            .map(|s| s.start)
+            .ok_or_else(|| self.err("unterminated virtual-table argument list"))?;
+        let mut end = start;
         let mut depth = 0usize;
         loop {
             match self.peek() {
@@ -1904,27 +1888,21 @@ impl Parser {
                 Some(Token::Comma) if depth == 0 => break,
                 Some(_) => {}
             }
-            let tok = self.advance().expect("peeked");
-            match &tok {
+            // Extend the span to just past this token before consuming it.
+            if let Some(s) = self.tokens.get(self.pos) {
+                end = s.end;
+            }
+            match self.advance().expect("peeked") {
                 Token::LParen => depth += 1,
                 Token::RParen => depth = depth.saturating_sub(1),
                 _ => {}
             }
-            let text = token_arg_text(&tok);
-            // Separate two word-like tokens with a space, but keep a sign or dot
-            // adjacent to its number (so `- 5` stays `-5`).
-            let needs_space = !out.is_empty()
-                && ends_wordish(&out)
-                && text.chars().next().is_some_and(is_wordish_start);
-            if needs_space {
-                out.push(' ');
-            }
-            out.push_str(&text);
         }
-        if out.is_empty() {
+        let text = String::from(self.source.get(start..end).unwrap_or("").trim());
+        if text.is_empty() {
             return Err(self.err("empty virtual-table argument"));
         }
-        Ok(out)
+        Ok(text)
     }
 
     fn if_not_exists(&mut self) -> Result<bool> {

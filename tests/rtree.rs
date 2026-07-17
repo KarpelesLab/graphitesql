@@ -768,3 +768,39 @@ fn graphite_written_rtree_i32_is_read_by_sqlite3() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn quoted_column_names_with_spaces() {
+    // A coordinate or auxiliary column declared with a quoted identifier that
+    // contains a space (`"min x"`, `+"my label"`) keeps that exact name — the
+    // module argument reaches the R-Tree verbatim (quotes intact), like sqlite,
+    // rather than being split at the space into a name + a bogus type.
+    let mut c = Connection::open_memory().unwrap();
+    c.execute("CREATE VIRTUAL TABLE r USING rtree(id, \"min x\", \"max x\", +\"my label\" TEXT)")
+        .unwrap();
+    // table_info reports the full quoted names, not the pre-space prefix.
+    let info = c.query("PRAGMA table_info(r)").unwrap();
+    let names: Vec<String> = info
+        .rows
+        .iter()
+        .map(|r| match &r[1] {
+            Value::Text(s) => s.to_string(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(names, vec!["id", "min x", "max x", "my label"]);
+    // The columns are selectable and filterable by their quoted names.
+    c.execute("INSERT INTO r VALUES (1, 0,1, 'hi'), (2, 5,6, 'bye')")
+        .unwrap();
+    assert_eq!(
+        rows(
+            &c,
+            "SELECT id, \"my label\" FROM r WHERE \"min x\" >= 4 ORDER BY id"
+        ),
+        [vec![Value::Integer(2), Value::Text("bye".into())]]
+    );
+    assert_eq!(
+        c.query("PRAGMA integrity_check").unwrap().rows[0][0],
+        Value::Text("ok".into())
+    );
+}
