@@ -10897,6 +10897,38 @@ impl Connection {
             if let Some(ipk) = meta.ipk {
                 values[ipk] = Value::Integer(rowid);
             }
+            // SQLite fires a BEFORE INSERT trigger *before* any constraint or
+            // conflict handling (insert.c: the trigger program runs ahead of the
+            // NOT NULL/type/CHECK checks, the uniqueness/PK resolution, and the FK
+            // checks). So an `INSERT OR REPLACE` has not yet deleted the
+            // conflicting row when the trigger runs — the trigger still observes
+            // it — and a row later skipped by `OR IGNORE` (for a NOT NULL/UNIQUE
+            // violation) has already run its BEFORE trigger's side effects.
+            // `NEW.<rowid>` reads -1 when the rowid will be auto-assigned; an
+            // explicit rowid is visible as itself.
+            let (before_values, before_rowid) = if rowid_auto {
+                let mut bv = values.clone();
+                if let Some(ipk) = meta.ipk {
+                    bv[ipk] = Value::Integer(-1);
+                }
+                (bv, -1)
+            } else {
+                (values.clone(), rowid)
+            };
+            self.fire_triggers(
+                &ins.table,
+                TrigEvent::Insert,
+                TriggerTiming::Before,
+                &meta.columns,
+                None,
+                Some((&before_values, before_rowid)),
+                params,
+                None,
+            )?;
+            // A `BEFORE INSERT` trigger's `RAISE(IGNORE)` abandons just this row.
+            if self.raise_ignore.replace(false) {
+                continue;
+            }
             // NOT NULL / STRICT-type / CHECK constraints. `INSERT OR IGNORE`
             // skips a row that violates any of these (rather than failing the
             // statement); every other conflict policy lets the error propagate.
@@ -11014,35 +11046,6 @@ impl Connection {
             }
 
             let index_values = values.clone();
-            // SQLite runs a BEFORE INSERT trigger *before* the rowid is
-            // auto-assigned, so `NEW.<rowid>` (an INTEGER PRIMARY KEY or the bare
-            // `rowid`/`_rowid_`/`oid`) reads back as -1 there when the row will
-            // take an auto rowid. An explicitly supplied rowid is visible as
-            // itself. Present that view to the trigger only; the real rowid is
-            // used for the actual insert below.
-            let (before_values, before_rowid) = if rowid_auto {
-                let mut bv = index_values.clone();
-                if let Some(ipk) = meta.ipk {
-                    bv[ipk] = Value::Integer(-1);
-                }
-                (bv, -1)
-            } else {
-                (index_values.clone(), rowid)
-            };
-            self.fire_triggers(
-                &ins.table,
-                TrigEvent::Insert,
-                TriggerTiming::Before,
-                &meta.columns,
-                None,
-                Some((&before_values, before_rowid)),
-                params,
-                None,
-            )?;
-            // A `BEFORE INSERT` trigger's `RAISE(IGNORE)` abandons just this row.
-            if self.raise_ignore.replace(false) {
-                continue;
-            }
             // The child-side foreign-key check runs only for a row that is actually
             // inserted — AFTER a UNIQUE/PK conflict was resolved (an `OR IGNORE` /
             // upsert `DO NOTHING` skip, or an `OR REPLACE` that first deleted the
