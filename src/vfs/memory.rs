@@ -163,6 +163,10 @@ impl File for MemoryFile {
         Ok(())
     }
 
+    fn check_reserved_lock(&self) -> Result<bool> {
+        Ok(self.locks.borrow().has_write_intent())
+    }
+
     fn wal_index(&self) -> Option<crate::pager::SharedWalIndex> {
         Some(self.wal_index.clone())
     }

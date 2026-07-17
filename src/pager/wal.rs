@@ -48,6 +48,13 @@ const WAL_HEADER_LEN: usize = 32;
 const FRAME_HEADER_LEN: usize = 24;
 const WAL_MAGIC_BE: u32 = 0x377f_0682; // base magic; LSB carries the endianness
 
+/// Whether this build's native byte order is big-endian — `SQLITE_BIGENDIAN` in
+/// `wal.c`. A fresh WAL header stamps `WAL_MAGIC | SQLITE_BIGENDIAN` and computes
+/// checksums in native word order (`walChecksumBytes(1, …)`), so graphite does
+/// the same: little-endian checksums (magic `…82`) on little-endian targets,
+/// big-endian (magic `…83`) on big-endian ones.
+pub(crate) const NATIVE_BIG_ENDIAN: bool = cfg!(target_endian = "big");
+
 /// A parsed, validated WAL overlaid on a main database file, presented as a
 /// [`PageSource`] that returns WAL frames where they exist and main-file pages
 /// otherwise.
@@ -248,6 +255,22 @@ pub struct WalIndex {
     cksum: (u32, u32),
     /// The page size of frames in this WAL, or 0 before the first frame.
     page_size: u32,
+    /// The number of frames already copied back into the main database file by a
+    /// checkpoint — `WalCkptInfo.nBackfill` in `wal.c`. Only a checkpoint
+    /// increases it; a WAL reset/restart returns it to 0. Frames ≤ this mark are
+    /// durable in the main file, so once it reaches [`mx_frame`](Self::mx_frame)
+    /// the next writer may restart the log from the beginning (`walRestartLog`).
+    n_backfill: u32,
+    /// The checkpoint sequence number stamped into the WAL header (`Wal.nCkpt`,
+    /// WAL header bytes 12–15). Incremented by every log restart
+    /// ([`restart_hdr`](Self::restart_hdr)), exactly like `walRestartHdr`.
+    ckpt_seq: u32,
+    /// Whether frame checksums in the current WAL use big-endian word order (the
+    /// header magic's least-significant bit, `WalIndexHdr.bigEndCksum`). Seeded
+    /// from the on-disk header when attaching to an existing WAL; reset to the
+    /// *native* byte order whenever a fresh header is written, matching
+    /// `sqlite3WalFrames` (`pWal->hdr.bigEndCksum = SQLITE_BIGENDIAN`).
+    big_end_cksum: bool,
     /// A monotonic generation bumped on every WAL reset (checkpoint/VACUUM/mode
     /// switch). A reader whose pinned generation differs knows its snapshot is
     /// stale and must re-read the header.
@@ -272,6 +295,9 @@ impl WalIndex {
             next_offset: 0,
             cksum: (0, 0),
             page_size: 0,
+            n_backfill: 0,
+            ckpt_seq: 0,
+            big_end_cksum: NATIVE_BIG_ENDIAN,
             generation: 0,
             readers: Vec::new(),
         }
@@ -286,6 +312,92 @@ impl WalIndex {
     /// The current WAL generation (bumped on every reset).
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// The number of frames already backfilled into the main database file
+    /// (`WalCkptInfo.nBackfill`).
+    pub fn n_backfill(&self) -> u32 {
+        self.n_backfill
+    }
+
+    /// Record that a checkpoint has copied every frame up to `n` into the main
+    /// database file. Only ever advances (a reset returns it to 0), mirroring
+    /// `walCheckpoint`'s `AtomicStore(&pInfo->nBackfill, mxSafeFrame)`.
+    pub fn set_n_backfill(&mut self, n: u32) {
+        if n > self.n_backfill {
+            self.n_backfill = n;
+        }
+    }
+
+    /// The checkpoint sequence number for the next WAL header (`Wal.nCkpt`).
+    pub fn ckpt_seq(&self) -> u32 {
+        self.ckpt_seq
+    }
+
+    /// The salts currently in force (WAL header bytes 16–23).
+    pub fn salt(&self) -> [u8; 8] {
+        self.salt
+    }
+
+    /// Whether the current WAL's checksums use big-endian word order.
+    pub fn big_end_cksum(&self) -> bool {
+        self.big_end_cksum
+    }
+
+    /// Restart the log so the next writer overwrites the WAL file from the
+    /// beginning — the port of `wal.c`'s `walRestartHdr`: bump the checkpoint
+    /// sequence, increment salt-1 as a big-endian integer, replace salt-2, and
+    /// zero `mxFrame`/`nBackfill`. Callers must have confirmed every frame is
+    /// backfilled and no reader still resolves pages from the log (sqlite blocks
+    /// on the read-slot locks; graphite's callers check the pinned reader marks).
+    ///
+    /// sqlite draws salt-2 from `sqlite3_randomness`; graphite has no RNG
+    /// (`no_std`, zero deps), so it remixes the previous salt-2 with an xorshift
+    /// step — different every restart, which is all recovery needs (stale frames
+    /// from the previous generation must fail the salt comparison).
+    pub fn restart_hdr(&mut self) {
+        self.ckpt_seq = self.ckpt_seq.wrapping_add(1);
+        let s1 = u32::from_be_bytes([self.salt[0], self.salt[1], self.salt[2], self.salt[3]])
+            .wrapping_add(1);
+        self.salt[0..4].copy_from_slice(&s1.to_be_bytes());
+        let mut s2 = u32::from_be_bytes([self.salt[4], self.salt[5], self.salt[6], self.salt[7]]);
+        s2 ^= s2 << 13;
+        s2 ^= s2 >> 17;
+        s2 ^= s2 << 5;
+        s2 = s2.wrapping_add(0x9E37_79B9);
+        self.salt[4..8].copy_from_slice(&s2.to_be_bytes());
+        self.log.clear();
+        self.mx_frame = 0;
+        self.n_backfill = 0;
+        self.next_offset = 0;
+        self.cksum = (0, 0);
+        self.big_end_cksum = NATIVE_BIG_ENDIAN;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// The pages a checkpoint may copy into the main database file, honoring the
+    /// backfill window: for every page touched by a frame in
+    /// (`n_backfill`, `mx_frame`], take its **newest** such frame, and emit the
+    /// page only if that frame is ≤ `mx_safe`. This is `walCheckpoint`'s
+    /// iterator loop with its `iFrame<=nBackfill || iFrame>mxSafeFrame` skip: a
+    /// page whose newest frame lies beyond the safe mark is deferred entirely (a
+    /// later checkpoint picks it up), never written at an older version.
+    pub fn backfill_pages(&self, mx_safe: u32) -> Vec<(u32, Vec<u8>)> {
+        let lo = self.n_backfill as usize;
+        let hi = (self.mx_frame as usize).min(self.log.len());
+        if lo >= hi {
+            return Vec::new();
+        }
+        // Newest frame index (0-based into `log`) per page within (lo, hi].
+        let mut newest: BTreeMap<u32, usize> = BTreeMap::new();
+        for (i, frame) in self.log[lo..hi].iter().enumerate() {
+            newest.insert(frame.page_no, lo + i);
+        }
+        newest
+            .into_iter()
+            .filter(|&(_, i)| (i as u32 + 1) <= mx_safe)
+            .map(|(page_no, i)| (page_no, self.log[i].data.clone()))
+            .collect()
     }
 
     /// The salts, append offset, checksum, and page size a writer needs to
@@ -343,6 +455,9 @@ impl WalIndex {
         self.next_offset = 0;
         self.cksum = (0, 0);
         self.page_size = 0;
+        self.n_backfill = 0;
+        self.ckpt_seq = 0;
+        self.big_end_cksum = NATIVE_BIG_ENDIAN;
         self.generation = self.generation.wrapping_add(1);
     }
 
@@ -364,16 +479,6 @@ impl WalIndex {
     /// `None` (or ≥ the checkpointed mark), so no in-flight reader loses frames.
     pub fn min_reader_mark(&self) -> Option<u32> {
         self.readers.iter().copied().min()
-    }
-
-    /// The latest committed version of every page across the **entire** log
-    /// (page → bytes), for a full checkpoint. Later frames win.
-    pub fn checkpoint_pages(&self) -> Vec<(u32, Vec<u8>)> {
-        let mut latest: BTreeMap<u32, &Vec<u8>> = BTreeMap::new();
-        for frame in &self.log {
-            latest.insert(frame.page_no, &frame.data);
-        }
-        latest.into_iter().map(|(p, d)| (p, d.clone())).collect()
     }
 
     /// The db size recorded by the last commit in the full log (0 if empty).
@@ -498,6 +603,10 @@ impl WalIndex {
     /// Seed the index from frames loaded off an existing `-wal` file on first open
     /// (only when the shared index is still empty). Idempotent races are avoided
     /// by the caller holding the index lock and checking emptiness first.
+    /// `ckpt_seq` and `big_end_cksum` come from the parsed WAL header (bytes
+    /// 12–15 and the magic's LSB); the backfill mark is unknown without a `-shm`
+    /// wal-index, so it conservatively restarts at 0 (a checkpoint then re-copies
+    /// frames that may already be in the main file — harmless, the bytes match).
     #[allow(clippy::too_many_arguments)]
     pub fn seed(
         &mut self,
@@ -506,6 +615,8 @@ impl WalIndex {
         next_offset: u64,
         cksum: (u32, u32),
         page_size: u32,
+        ckpt_seq: u32,
+        big_end_cksum: bool,
     ) {
         self.log = frames
             .into_iter()
@@ -520,6 +631,9 @@ impl WalIndex {
         self.next_offset = next_offset;
         self.cksum = cksum;
         self.page_size = page_size;
+        self.n_backfill = 0;
+        self.ckpt_seq = ckpt_seq;
+        self.big_end_cksum = big_end_cksum;
     }
 }
 

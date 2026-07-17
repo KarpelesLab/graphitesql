@@ -93,6 +93,39 @@ pub enum AutoVacuum {
     Incremental,
 }
 
+/// The checkpoint mode of `PRAGMA wal_checkpoint(...)` /
+/// `sqlite3_wal_checkpoint_v2` — `SQLITE_CHECKPOINT_PASSIVE..TRUNCATE`. Ordered
+/// so each mode includes everything the previous one does (the comparisons in
+/// [`WritePager::checkpoint_mode`] mirror `wal.c`'s `eMode>=RESTART` checks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CheckpointMode {
+    /// Copy what can be copied without blocking anyone; never reports busy.
+    Passive,
+    /// Also take the writer lock and report busy if readers limited the backfill.
+    Full,
+    /// Full, plus ensure the next writer restarts the WAL from the beginning.
+    Restart,
+    /// Restart, plus truncate the `-wal` file to zero bytes.
+    Truncate,
+}
+
+impl CheckpointMode {
+    /// Map a `PRAGMA wal_checkpoint(<arg>)` argument to a mode. Unrecognized
+    /// names fall back to `Passive`, exactly like `pragma.c` (only `full`,
+    /// `restart` and `truncate` are recognized, case-insensitively).
+    pub fn from_name(name: &str) -> CheckpointMode {
+        if name.eq_ignore_ascii_case("full") {
+            CheckpointMode::Full
+        } else if name.eq_ignore_ascii_case("restart") {
+            CheckpointMode::Restart
+        } else if name.eq_ignore_ascii_case("truncate") {
+            CheckpointMode::Truncate
+        } else {
+            CheckpointMode::Passive
+        }
+    }
+}
+
 /// A writable pager over a database file, with an optional journal file.
 pub struct WritePager {
     file: Box<dyn File>,
@@ -235,7 +268,7 @@ struct WalRuntime {
     salt: [u8; 8],
 }
 
-const WAL_MAGIC_LE: u32 = 0x377f_0682; // little-endian checksum variant
+const WAL_MAGIC: u32 = 0x377f_0682; // base magic; the LSB carries the checksum endianness
 const WAL_HDR_LEN: usize = 32;
 const WAL_FRAME_HDR_LEN: usize = 24;
 
@@ -259,7 +292,7 @@ impl WritePager {
         mut wal_file: Option<Box<dyn File>>,
     ) -> Result<WritePager> {
         if let Some(j) = journal.as_mut() {
-            Self::recover(file.as_mut(), j.as_mut())?;
+            Self::recover_hot_journal(file.as_mut(), j.as_mut())?;
         }
         let file_size = file.size()?;
         if file_size < HEADER_LEN as u64 {
@@ -279,6 +312,7 @@ impl WritePager {
         // path. Seed it from the `-wal` file if it is still empty (first open of
         // this file in the process); otherwise adopt whatever a sibling connection
         // has already published, so reads are coherent across connections.
+        let mut header = header;
         let wal = if header.read_version == 2 {
             match wal_file.as_mut() {
                 Some(w) => Self::attach_wal(w.as_mut(), page_size)?,
@@ -287,6 +321,18 @@ impl WritePager {
         } else {
             None
         };
+        // The newest committed page 1 may live in the WAL; parse the header
+        // *through* it, as sqlite reads page 1 via the WAL once the log is
+        // attached (`pagerSharedLock` → `walFindFrame`). Without this the
+        // header snapshot (change counter, user_version, freelist head, …) is
+        // stale whenever page 1 was rewritten since the last checkpoint.
+        if let Some(w) = &wal
+            && let Some(p1) = w
+                .index
+                .with(|ix| ix.find_frame(1, w.snapshot.get().mx_frame))
+        {
+            header = DatabaseHeader::parse(&p1)?;
+        }
         let page_count = wal.as_ref().map(|w| w.db_size.get()).unwrap_or(pages);
         Ok(WritePager {
             file,
@@ -1839,28 +1885,56 @@ impl WritePager {
         let index = wal.index.clone();
         let file = self.wal_file.as_mut().expect("wal file");
 
+        // `walRestartLog`: if every committed frame has been backfilled into the
+        // main file by a checkpoint and no reader still resolves pages from the
+        // log, restart the log — the new frames then overwrite the WAL file from
+        // the beginning (under a fresh header with an incremented checkpoint
+        // sequence and new salts) instead of appending forever. sqlite gates this
+        // on the writer holding read-slot 0 (reading from the db only) and on the
+        // read-slot locks being free; graphite's equivalent is "no pinned reader
+        // marks at all", which is safely conservative.
+        index.with(|ix| {
+            if ix.mx_frame() > 0
+                && ix.n_backfill() == ix.mx_frame()
+                && ix.min_reader_mark().is_none()
+            {
+                ix.restart_hdr();
+            }
+        });
+
         // Continue whatever the shared index already published (a sibling
         // connection may have written the header and earlier frames); if the WAL
-        // is empty, we write the header and start fresh under *our* salts. Reading
-        // the shared writer state under the write-intent lock is safe: WAL writers
-        // serialize on that lock.
-        let (mut offset, mut cksum, salt) = match index.with(|ix| ix.writer_state()) {
-            Some((off, ck, salt, _ps)) => (off, ck, salt),
-            None => {
-                let salt = wal.salt;
-                let mut hdr = [0u8; WAL_HDR_LEN];
-                hdr[0..4].copy_from_slice(&WAL_MAGIC_LE.to_be_bytes());
-                hdr[4..8].copy_from_slice(&3_007_000u32.to_be_bytes()); // format version
-                hdr[8..12].copy_from_slice(&(page_size as u32).to_be_bytes());
-                hdr[12..16].copy_from_slice(&0u32.to_be_bytes()); // checkpoint sequence
-                hdr[16..24].copy_from_slice(&salt);
-                let (h0, h1) = super::wal::checksum(false, 0, 0, &hdr[0..24]);
-                hdr[24..28].copy_from_slice(&h0.to_be_bytes());
-                hdr[28..32].copy_from_slice(&h1.to_be_bytes());
-                file.write_all_at(&hdr, 0)?;
-                (WAL_HDR_LEN as u64, (h0, h1), salt)
-            }
-        };
+        // is empty, we write a fresh header — `sqlite3WalFrames`'s `iFrame==0`
+        // branch: magic (native-endian checksum bit), format 3007000, page size,
+        // the checkpoint sequence, and the salts in force. Reading the shared
+        // writer state under the write-intent lock is safe: WAL writers serialize
+        // on that lock.
+        let (mut offset, mut cksum, salt, big_end) =
+            match index.with(|ix| (ix.writer_state(), ix.big_end_cksum())) {
+                (Some((off, ck, salt, _ps)), be) => (off, ck, salt, be),
+                (None, _) => {
+                    let (ckpt_seq, ix_salt) = index.with(|ix| (ix.ckpt_seq(), ix.salt()));
+                    // A restarted/attached index carries its own salts; a
+                    // never-seeded one falls back to this connection's.
+                    let salt = if ix_salt == [0u8; 8] {
+                        wal.salt
+                    } else {
+                        ix_salt
+                    };
+                    let big_end = super::wal::NATIVE_BIG_ENDIAN;
+                    let mut hdr = [0u8; WAL_HDR_LEN];
+                    hdr[0..4].copy_from_slice(&(WAL_MAGIC | big_end as u32).to_be_bytes());
+                    hdr[4..8].copy_from_slice(&3_007_000u32.to_be_bytes()); // format version
+                    hdr[8..12].copy_from_slice(&(page_size as u32).to_be_bytes());
+                    hdr[12..16].copy_from_slice(&ckpt_seq.to_be_bytes());
+                    hdr[16..24].copy_from_slice(&salt);
+                    let (h0, h1) = super::wal::checksum(big_end, 0, 0, &hdr[0..24]);
+                    hdr[24..28].copy_from_slice(&h0.to_be_bytes());
+                    hdr[28..32].copy_from_slice(&h1.to_be_bytes());
+                    file.write_all_at(&hdr, 0)?;
+                    (WAL_HDR_LEN as u64, (h0, h1), salt, big_end)
+                }
+            };
 
         let n = pages.len();
         let frame_len = WAL_FRAME_HDR_LEN + page_size;
@@ -1874,8 +1948,8 @@ impl WritePager {
             fhdr[0..4].copy_from_slice(&page_no.to_be_bytes());
             fhdr[4..8].copy_from_slice(&db_size.to_be_bytes());
             fhdr[8..16].copy_from_slice(&salt);
-            let (c0, c1) = super::wal::checksum(false, cksum.0, cksum.1, &fhdr[0..8]);
-            let (c0, c1) = super::wal::checksum(false, c0, c1, data);
+            let (c0, c1) = super::wal::checksum(big_end, cksum.0, cksum.1, &fhdr[0..8]);
+            let (c0, c1) = super::wal::checksum(big_end, c0, c1, data);
             fhdr[16..20].copy_from_slice(&c0.to_be_bytes());
             fhdr[20..24].copy_from_slice(&c1.to_be_bytes());
             let mut frame = Vec::with_capacity(frame_len);
@@ -1910,77 +1984,175 @@ impl WritePager {
         Ok(())
     }
 
-    /// Checkpoint: fold all committed WAL frames into the main database file, and
-    /// — if no other in-process reader is still pinned to an older WAL snapshot —
-    /// reset the `-wal` file and shared index with fresh salts. If a sibling reader
-    /// *is* pinned, the frames are still backfilled into the main file (safe: the
-    /// main file catches up) but the WAL log is left intact so that reader keeps
-    /// resolving the frames its snapshot needs, matching `wal.c`'s "checkpoint
-    /// cannot pass an active reader" rule.
+    /// Checkpoint with the default mode graphite has always used for
+    /// `PRAGMA wal_checkpoint` and the internal flush points (VACUUM):
+    /// [`CheckpointMode::Truncate`], which folds every committed frame into the
+    /// main file and — when no reader blocks it — truncates the `-wal` to zero
+    /// bytes. See [`checkpoint_mode`](Self::checkpoint_mode) for the full
+    /// `sqlite3WalCheckpoint` mode semantics.
     pub fn checkpoint(&mut self) -> Result<()> {
-        let Some(wal) = self.wal.as_mut() else {
-            return Ok(());
+        self.checkpoint_mode(CheckpointMode::Truncate).map(|_| ())
+    }
+
+    /// Checkpoint the WAL in the given `mode` — the port of `wal.c`'s
+    /// `sqlite3WalCheckpoint`/`walCheckpoint`. Returns the
+    /// `(busy, log, checkpointed)` triple that `PRAGMA wal_checkpoint` reports:
+    /// `busy` is 1 when the requested work was blocked by an active reader or
+    /// writer, `log` is the total number of frames in the WAL, and
+    /// `checkpointed` is the number of those now backfilled into the main
+    /// database file. On a rollback-journal (non-WAL) database the triple is
+    /// `(0, -1, -1)`, matching sqlite.
+    ///
+    /// Mode semantics (`R-62920…`/`R-10421…` and friends in `wal.c`):
+    ///
+    /// * **Passive** — copy as many frames as possible without blocking: the
+    ///   backfill stops at the oldest pinned reader mark, and the `-wal` file is
+    ///   left in place. Never reports busy.
+    /// * **Full** — like Passive, but takes the writer lock (an active writer
+    ///   downgrades the run to Passive and reports busy) and reports busy when a
+    ///   pinned reader kept the backfill short of the log's end.
+    /// * **Restart** — Full, plus: once everything is backfilled, require that no
+    ///   reader still resolves pages from the log, so the **next writer restarts
+    ///   the WAL file from the beginning** (via `walRestartLog` at the next
+    ///   commit). The `-wal` bytes are not touched here.
+    /// * **Truncate** — Restart, plus the log is restarted immediately
+    ///   (`walRestartHdr`) and the `-wal` file is truncated to zero bytes; the
+    ///   reported triple is then `(0, 0, 0)`.
+    ///
+    /// graphite has no busy handler, so every "block until" in sqlite is an
+    /// immediate busy here — exactly how sqlite behaves with no handler set.
+    ///
+    /// The main file is truncated to the committed page count and synced only
+    /// when the *entire* log was backfilled, mirroring `walCheckpoint`'s
+    /// `mxSafeFrame==mxFrame` gate; a partial backfill leaves both untouched
+    /// beyond the copied pages.
+    pub fn checkpoint_mode(&mut self, mode: CheckpointMode) -> Result<(i64, i64, i64)> {
+        use crate::vfs::LockLevel;
+        let Some(wal) = self.wal.as_ref() else {
+            return Ok((0, -1, -1));
         };
         let page_size = self.page_size as u64;
         let index = wal.index.clone();
-        let salt = wal.salt;
-        // Snapshot the full log and decide whether it is safe to reset.
-        let (frames, full_db_size, can_reset) = index.with(|ix| {
-            let mx = ix.mx_frame();
-            // Safe to reset only when every pinned reader is already at the full
-            // high-water mark (they need nothing that a reset would drop). This
-            // connection's own snapshot does not block a reset — it is refreshed
-            // below to the post-checkpoint state.
-            let others_ok = ix.min_reader_mark().map(|m| m >= mx).unwrap_or(true);
-            (ix.checkpoint_pages(), ix.full_db_size(), others_ok)
-        });
-        if frames.is_empty() {
-            return Ok(());
-        }
-        for (page_no, data) in &frames {
-            self.file
-                .write_all_at(data, (*page_no as u64 - 1) * page_size)?;
-        }
-        self.file.truncate(full_db_size as u64 * page_size)?;
-        self.file.sync()?;
-        self.disk_pages.set(full_db_size);
-        // The checkpoint rewrote the main file; drop the clean read cache.
-        self.read_cache.borrow_mut().clear();
 
-        if can_reset {
-            // No pinned sibling reader needs the WAL: empty it and restart with a
-            // fresh salt so subsequent writes begin a new WAL generation.
-            if let Some(w) = self.wal_file.as_mut() {
-                w.truncate(0)?;
-                w.sync()?;
+        // FULL/RESTART/TRUNCATE also take the exclusive writer lock; if a writer
+        // is mid-transaction the run downgrades to PASSIVE and reports busy at
+        // the end (`sqlite3WalCheckpoint`'s `eMode2 = SQLITE_CHECKPOINT_PASSIVE`).
+        let entry = self.held.get();
+        let mut mode2 = mode;
+        let mut took_reserved = false;
+        if mode != CheckpointMode::Passive && entry < LockLevel::Reserved {
+            match self.file.lock(LockLevel::Reserved) {
+                Ok(()) => {
+                    self.held.set(LockLevel::Reserved);
+                    took_reserved = true;
+                }
+                Err(Error::Busy) => mode2 = CheckpointMode::Passive,
+                Err(e) => return Err(e),
             }
-            let new_salt = {
-                let mut s = salt;
-                let v = u32::from_be_bytes([s[0], s[1], s[2], s[3]]).wrapping_add(1);
-                s[0..4].copy_from_slice(&v.to_be_bytes());
-                s
-            };
-            let snapshot = index.with(|ix| {
-                ix.reset(new_salt);
-                ix.snapshot()
-            });
-            self.wal = Some(WalRuntime {
-                index,
-                snapshot: Cell::new(snapshot),
-                registered_mark: Cell::new(None),
-                db_size: Cell::new(full_db_size),
-                salt: new_salt,
-            });
-        } else {
-            // A sibling reader is still pinned; keep the WAL log intact. This
-            // connection now reads from the freshly-checkpointed main file, so pin
-            // its snapshot at the current high-water mark (its own reads see the
-            // WAL frames it just backfilled, which equal the main file).
-            let wal = self.wal.as_mut().expect("wal mode");
-            wal.db_size.set(full_db_size);
-            wal.snapshot.set(index.with(|ix| ix.snapshot()));
         }
-        Ok(())
+        let result = self.checkpoint_locked(&index, page_size, mode2);
+        if took_reserved {
+            let _ = self.file.unlock(entry);
+            self.held.set(entry);
+        }
+        let (mut busy, log, ckpt) = result?;
+        if mode2 != mode {
+            busy = true; // downgraded by an active writer ⇒ SQLITE_BUSY
+        }
+        Ok((busy as i64, log as i64, ckpt as i64))
+    }
+
+    /// The body of [`checkpoint_mode`](Self::checkpoint_mode) — `walCheckpoint`
+    /// itself — run with any writer-lock bookkeeping handled by the caller.
+    /// Returns `(busy, log_frames, backfilled_frames)`.
+    fn checkpoint_locked(
+        &mut self,
+        index: &SharedWalIndex,
+        page_size: u64,
+        mode: CheckpointMode,
+    ) -> Result<(bool, u32, u32)> {
+        let (mx, n_backfill, min_mark, full_db_size) = index.with(|ix| {
+            (
+                ix.mx_frame(),
+                ix.n_backfill(),
+                ix.min_reader_mark(),
+                ix.full_db_size(),
+            )
+        });
+        let mut busy = false;
+
+        if n_backfill < mx {
+            // The last frame safe to backfill: frames beyond the oldest pinned
+            // reader mark might overwrite pages that reader still resolves from
+            // the main file, so stop there (`mxSafeFrame`). With no busy handler
+            // a pinned reader is simply respected, never waited out.
+            let mut mx_safe = mx;
+            if let Some(m) = min_mark
+                && m < mx_safe
+            {
+                mx_safe = m;
+            }
+            if n_backfill < mx_safe {
+                // Copy each page's newest safe frame into the main file, skipping
+                // pages beyond the committed size (`iDbpage>mxPage`).
+                for (page_no, data) in index.with(|ix| ix.backfill_pages(mx_safe)) {
+                    if page_no == 0 || page_no > full_db_size {
+                        continue;
+                    }
+                    self.file
+                        .write_all_at(&data, (page_no as u64 - 1) * page_size)?;
+                }
+                if mx_safe == mx {
+                    // The whole log is now in the main file: shrink it to the
+                    // committed size and make it durable (the second fsync that
+                    // makes resetting the WAL safe).
+                    self.file.truncate(full_db_size as u64 * page_size)?;
+                    self.file.sync()?;
+                    self.disk_pages.set(full_db_size);
+                }
+                index.with(|ix| ix.set_n_backfill(mx_safe));
+                // The checkpoint rewrote the main file under the clean read cache.
+                self.read_cache.borrow_mut().clear();
+            }
+        }
+
+        let backfilled = index.with(|ix| ix.n_backfill());
+        if mode != CheckpointMode::Passive {
+            if backfilled < mx {
+                busy = true; // a reader kept the backfill short of the log's end
+            } else if mode >= CheckpointMode::Restart {
+                // Block until no reader is using the log — graphite cannot wait,
+                // so any pinned reader means busy (sqlite's read-slot locks).
+                if index.with(|ix| ix.min_reader_mark()).is_some() {
+                    busy = true;
+                } else if mode == CheckpointMode::Truncate {
+                    // `walRestartHdr` first (so the shared state never claims
+                    // frames the file no longer has), then truncate the `-wal`.
+                    index.with(|ix| ix.restart_hdr());
+                    if let Some(w) = self.wal_file.as_mut() {
+                        w.truncate(0)?;
+                        w.sync()?;
+                    }
+                }
+            }
+        }
+
+        // Refresh this connection's own view — unless it holds a pinned read
+        // transaction, whose snapshot must stay put.
+        let wal = self.wal.as_ref().expect("wal mode");
+        if wal.registered_mark.get().is_none() {
+            wal.snapshot.set(index.with(|ix| ix.snapshot()));
+            if full_db_size != 0 {
+                wal.db_size.set(full_db_size);
+            }
+        }
+        let salt = index.with(|ix| ix.salt());
+        if salt != [0u8; 8] {
+            self.wal.as_mut().expect("wal mode").salt = salt;
+        }
+
+        let (log, ckpt) = index.with(|ix| (ix.mx_frame(), ix.n_backfill()));
+        Ok((busy, log, ckpt))
     }
 
     /// Replace the entire database file with a freshly-built, compact `image`
@@ -2053,7 +2225,7 @@ impl WritePager {
         let mut hdr = [0u8; WAL_HDR_LEN];
         wal.read_exact_at(&mut hdr, 0)?;
         let magic = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-        if magic & 0xFFFF_FFFE != WAL_MAGIC_LE {
+        if magic & 0xFFFF_FFFE != WAL_MAGIC {
             return Self::attach_from_index_only(index);
         }
         let big_endian = (magic & 1) == 1;
@@ -2061,6 +2233,7 @@ impl WritePager {
         if wal_ps != page_size {
             return Self::attach_from_index_only(index);
         }
+        let ckpt_seq = u32::from_be_bytes([hdr[12], hdr[13], hdr[14], hdr[15]]);
         let mut salt = [0u8; 8];
         salt.copy_from_slice(&hdr[16..24]);
         let (h0, h1) = super::wal::checksum(big_endian, 0, 0, &hdr[0..24]);
@@ -2122,7 +2295,15 @@ impl WritePager {
                 off == committed_off && s == salt && ps == page_size as u32
             });
             if !matches_disk {
-                ix.seed(log, salt, committed_off, committed_cksum, page_size as u32);
+                ix.seed(
+                    log,
+                    salt,
+                    committed_off,
+                    committed_cksum,
+                    page_size as u32,
+                    ckpt_seq,
+                    big_endian,
+                );
             }
             ix.snapshot()
         });
@@ -2226,6 +2407,76 @@ impl WritePager {
         j.write_all_at(&nrec.to_be_bytes(), 8)?;
         j.sync()?;
         Ok(())
+    }
+
+    /// Detect and recover a **hot** rollback journal at open, under the locking
+    /// interlock of `pager.c`'s `pagerSharedLock`/`hasHotJournal`. Recovery must
+    /// never run unlocked: a journal accompanied by a live `RESERVED` holder
+    /// belongs to a transaction *in progress*, and playing it back would destroy
+    /// that writer's committed baseline.
+    ///
+    /// The protocol, ported step for step:
+    ///
+    /// 1. Take a `SHARED` lock on the database (fails `Busy` against a writer
+    ///    mid-commit holding `EXCLUSIVE`, exactly like `pager_wait_on_lock` with
+    ///    no busy handler).
+    /// 2. `hasHotJournal`: the journal is hot only if no connection holds a
+    ///    `RESERVED`-or-stronger lock, the database is non-empty, and the
+    ///    journal's first byte is non-zero. A journal next to an *empty* database
+    ///    is a stale remnant and is discarded (under a transient `RESERVED`)
+    ///    without playback.
+    /// 3. If hot, upgrade **directly to `EXCLUSIVE`** — deliberately skipping
+    ///    `RESERVED` so a concurrent opener cannot mistake mid-rollback for a
+    ///    live writer and start reading — then play the journal back.
+    ///
+    /// All locks are released before returning (graphite's open holds no
+    /// persistent lock; sqlite would drop back to `SHARED` and keep reading).
+    /// An empty journal skips the locking entirely — the common fast path.
+    fn recover_hot_journal(file: &mut dyn File, journal: &mut dyn File) -> Result<()> {
+        use crate::vfs::LockLevel;
+        if journal.size()? == 0 {
+            return Ok(()); // no journal bytes: nothing can be hot
+        }
+        file.lock(LockLevel::Shared)?;
+        let result = Self::recover_hot_journal_locked(file, journal);
+        let _ = file.unlock(LockLevel::Unlocked);
+        result
+    }
+
+    /// Steps 2–3 of [`recover_hot_journal`](Self::recover_hot_journal), run under
+    /// the `SHARED` lock (so the wrapper can release it on every path).
+    fn recover_hot_journal_locked(file: &mut dyn File, journal: &mut dyn File) -> Result<()> {
+        use crate::vfs::LockLevel;
+        // A live RESERVED holder means the journal belongs to an in-progress
+        // transaction: not hot, leave it alone (`hasHotJournal`'s
+        // `sqlite3OsCheckReservedLock` gate).
+        if file.check_reserved_lock()? {
+            return Ok(());
+        }
+        // A journal next to a zero-length database is a remnant of a prior
+        // database with the same name (or an aborted initial transaction):
+        // discard it rather than play it back, under a transient RESERVED so a
+        // concurrent opener does not race the discard. A refused lock simply
+        // leaves the journal for the next opener, like sqlite's benign path.
+        if file.size()? == 0 {
+            if file.lock(LockLevel::Reserved).is_ok() {
+                journal.truncate(0)?;
+            }
+            return Ok(());
+        }
+        // Hot only if the journal actually starts with a non-zero byte (a zeroed
+        // header — journal_mode=PERSIST leftovers — is not hot and must not
+        // trigger the EXCLUSIVE escalation).
+        let mut first = [0u8; 1];
+        journal.read_exact_at(&mut first, 0)?;
+        if first[0] == 0 {
+            return Ok(());
+        }
+        // Upgrade straight to EXCLUSIVE (never RESERVED on the way) and roll the
+        // journal back. `recover` re-validates the header under the lock, so a
+        // false positive here is handled the way sqlite handles ticket #3883.
+        file.lock(LockLevel::Exclusive)?;
+        Self::recover(file, journal)
     }
 
     /// Replay a hot SQLite-format journal onto `file`, restoring the pre-commit

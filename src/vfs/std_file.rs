@@ -332,6 +332,19 @@ impl File for StdFile {
         Ok(())
     }
 
+    fn check_reserved_lock(&self) -> Result<bool> {
+        // In-process holders are tracked in the shared aggregate state. A
+        // *cross-process* write intent is covered by the pessimistic CpLock
+        // model: a foreign writer holds the OS-exclusive lock for its whole
+        // transaction, so this connection's SHARED acquire already failed with
+        // `Busy` before hot-journal detection could ask this question.
+        let s = self
+            .locks
+            .lock()
+            .map_err(|_| Error::Io("lock state poisoned".into()))?;
+        Ok(s.state.has_write_intent())
+    }
+
     fn wal_index(&self) -> Option<crate::pager::SharedWalIndex> {
         Some(self.wal_index.clone())
     }

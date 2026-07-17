@@ -214,6 +214,20 @@ pub trait File {
         Ok(())
     }
 
+    /// Whether *any* handle to this file currently holds a `RESERVED`-or-stronger
+    /// (write-intent) lock — SQLite's `xCheckReservedLock`.
+    ///
+    /// The pager's hot-journal detection (`pager.c` `hasHotJournal`) uses this:
+    /// a rollback journal accompanied by a live `RESERVED` holder belongs to an
+    /// in-progress transaction and must **not** be played back by a second
+    /// connection opening the file. The built-in VFSs answer from the shared
+    /// per-path [`LockState`]; the default (for trivial or host-provided files
+    /// that do their own coordination) reports no holder, which preserves the
+    /// pre-interlock behaviour of always trusting the journal's own header.
+    fn check_reserved_lock(&self) -> Result<bool> {
+        Ok(false)
+    }
+
     /// The shared **wal-index** for this file's path, if the VFS provides one
     /// (ROADMAP C9c).
     ///
