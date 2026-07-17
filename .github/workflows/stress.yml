@@ -1,0 +1,109 @@
+name: Stress
+
+# Heavy resilience + scale tests that are too slow for the per-PR gate:
+#   * process-kill crash recovery — real writer processes SIGKILLed mid-write,
+#     including MULTIPLE processes writing one database (the cross-process lock
+#     path that caused the production stale-header corruption);
+#   * volume / scale — millions of rows, multi-MiB overflow blobs, random-key
+#     fragmentation, big transactions + VACUUM.
+#
+# The tests are all `#[ignore]` (so `cargo test` never runs them in CI's gate);
+# this workflow runs them with `-- --ignored`. It runs nightly and on demand.
+# Manual runs can dial the intensity up via the workflow inputs.
+
+on:
+  schedule:
+    # 03:17 UTC nightly (off the top of the hour to avoid the scheduler rush).
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      iters:
+        description: "Crash-kill iterations per test"
+        default: "60"
+      writers:
+        description: "Concurrent writer processes (multi-process tests)"
+        default: "6"
+      rows:
+        description: "Rows for the volume tests"
+        default: "1500000"
+      blob_mb:
+        description: "Size of each overlarge blob (MiB)"
+        default: "16"
+      frag_keys:
+        description: "Random text-PK rows (WITHOUT ROWID; O(n^2) today, keep modest)"
+        default: "5000"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Release for realistic throughput, but skip LTO so the build stays quick and
+  # predictable (stress runtime is dominated by I/O and the workload, not codegen
+  # micro-optimizations).
+  CARGO_PROFILE_RELEASE_LTO: "false"
+
+jobs:
+  # The sqlite3 oracle install is shared by both jobs (differential cross-checks
+  # after recovery / at scale). Kept identical to ci.yml's pinned 3.50.4.
+  crash-kill:
+    name: Process-kill crash recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GSQL_STRESS_ITERS: ${{ github.event.inputs.iters || '60' }}
+      GSQL_STRESS_WRITERS: ${{ github.event.inputs.writers || '6' }}
+      GSQL_STRESS_ACCTS: "50"
+      GSQL_STRESS_BLOB_MAX: "200000"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: stress
+      - name: Install sqlite3 (pinned 3.50.4)
+        run: |
+          set -euo pipefail
+          ver=3500400
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://www.sqlite.org/2025/sqlite-tools-linux-x64-${ver}.zip" -o /tmp/sqlite-tools.zip
+          unzip -o -j /tmp/sqlite-tools.zip sqlite3 -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/sqlite3"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: sqlite3 version
+        run: sqlite3 --version
+      - name: Crash-kill stress (single + multi-process, delete + WAL)
+        run: cargo test --release --all-features --test stress_crash_kill -- --ignored --nocapture --test-threads=1
+
+  volume:
+    name: Volume / scale
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GSQL_VOLUME_ROWS: ${{ github.event.inputs.rows || '1500000' }}
+      GSQL_VOLUME_BLOB_MB: ${{ github.event.inputs.blob_mb || '16' }}
+      GSQL_VOLUME_BLOBS: "8"
+      GSQL_VOLUME_FRAG_KEYS: ${{ github.event.inputs.frag_keys || '5000' }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: stress
+      - name: Install sqlite3 (pinned 3.50.4)
+        run: |
+          set -euo pipefail
+          ver=3500400
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://www.sqlite.org/2025/sqlite-tools-linux-x64-${ver}.zip" -o /tmp/sqlite-tools.zip
+          unzip -o -j /tmp/sqlite-tools.zip sqlite3 -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/sqlite3"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: sqlite3 version
+        run: sqlite3 --version
+      - name: Volume stress (rows, overflow blobs, fragmentation, VACUUM)
+        run: cargo test --release --all-features --test stress_volume -- --ignored --nocapture --test-threads=1
