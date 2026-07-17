@@ -53,7 +53,6 @@ fn malformed_sql_strings_error_not_panic() {
         "SELECT x'gg'",
         "SELECT x'",
         "/* unterminated comment",
-        "SELECT 1 /* nested",
         "SELECT 1.2.3",
         "SELECT 1e",
         "SELECT .e",
@@ -119,6 +118,9 @@ fn malformed_sql_strings_error_not_panic() {
         "\u{0}\u{1}\u{2}",
         "VALUES",
         "BEGIN BEGIN",
+        // an unterminated block comment is whitespace (tokenize.c CC_SLASH),
+        // so this is a complete `SELECT 1` — valid, like sqlite
+        "SELECT 1 /* nested",
     ];
     for (i, s) in edge.iter().enumerate() {
         run_no_panic(&c, s, &format!("edge-{i}"));

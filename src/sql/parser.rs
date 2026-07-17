@@ -38,10 +38,15 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
             break;
         }
         parser.max_param = 0; // parameters are numbered per statement
-        statements.push(parser.statement()?);
-        if !parser.at_end() && !parser.check(&Token::Semicolon) {
-            return Err(parser.err("expected ';' or end of input after statement"));
-        }
+        parser.register_ref = None; // `#N` diagnostics are per statement too
+        let result = parser.statement().and_then(|stmt| {
+            if !parser.at_end() && !parser.check(&Token::Semicolon) {
+                Err(parser.err("expected ';' or end of input after statement"))
+            } else {
+                Ok(stmt)
+            }
+        });
+        statements.push(parser.apply_register_ref(result)?);
     }
     Ok(statements)
 }
@@ -145,6 +150,25 @@ struct Parser {
     /// rather than thrown so the executor can surface it only after resolving the
     /// trigger target (see [`ast::CreateTrigger::body_error`]). First-wins.
     trigger_body_err: Option<String>,
+    /// A `#N` register reference seen in an expression (`SELECT #1`). SQLite's
+    /// grammar accepts these only in a *nested* parse, which user SQL never is;
+    /// its `expr ::= VARIABLE` action raises `near "#N": syntax error` but the
+    /// LALR automaton keeps processing the token that triggered the reduction,
+    /// so a syntax error raised at that same token replaces this one. Recorded
+    /// (first-wins) and resolved by [`Parser::apply_register_ref`].
+    register_ref: Option<RegisterRef>,
+}
+
+/// A recorded `#N` register-reference diagnostic (see [`Parser::register_ref`]).
+struct RegisterRef {
+    /// The `near "#N": syntax error` message.
+    msg: String,
+    /// Byte offset of the `#N` token, for the CLI's `^--- error here` caret.
+    offset: usize,
+    /// Index of the token *after* `#N` — the lookahead that triggers sqlite's
+    /// erroring `expr ::= VARIABLE` reduction, and the last token its parser
+    /// processes before abandoning the statement.
+    trigger_idx: usize,
 }
 
 /// Decrements the parser's depth counter when dropped, so recursion accounting
@@ -169,6 +193,49 @@ impl Parser {
             max_param: 0,
             in_trigger_body: false,
             trigger_body_err: None,
+            register_ref: None,
+        }
+    }
+
+    /// Resolve a recorded `#N` register-reference error against the outcome of
+    /// the statement parse, matching sqlite's observable behavior.
+    /// `sqlite3RunParser` stops at the token that triggered the erroring
+    /// `expr ::= VARIABLE` reduction, so:
+    ///
+    /// - a syntax error raised while processing that same trigger token
+    ///   replaces the register error (`SELECT (#1;` → `near ";"`), while an
+    ///   error graphite finds at a *later* token was never reached by sqlite —
+    ///   the register error stands, with its byte offset (the statement never
+    ///   completed, so the offset survives to drive the CLI caret);
+    /// - a statement that parses to completion did so (in sqlite) only when
+    ///   the trigger token was the statement's own terminator; that path
+    ///   finalizes a prepared statement whose error transfer drops the byte
+    ///   offset (`sqlite3VdbeTransferError`), so there is no caret. A trigger
+    ///   token interior to the statement keeps the offset.
+    fn apply_register_ref(&self, result: Result<Statement>) -> Result<Statement> {
+        let Some(reg) = &self.register_ref else {
+            return result;
+        };
+        match result {
+            Err(e) => {
+                let at_trigger = match (&e, self.tokens.get(reg.trigger_idx)) {
+                    // An offset-carrying error at exactly the trigger token.
+                    (Error::ParseAt(_, off), Some(s)) => *off == s.start,
+                    // The trigger was the end of input; any later error is at
+                    // the same place (`SELECT (#1` → `incomplete input`).
+                    (_, None) => true,
+                    _ => false,
+                };
+                if at_trigger {
+                    Err(e)
+                } else {
+                    Err(Error::ParseAt(reg.msg.clone(), reg.offset))
+                }
+            }
+            // On completion `self.pos` sits at the statement's terminating `;`
+            // (or at the end of input).
+            Ok(_) if reg.trigger_idx >= self.pos => Err(Error::Parse(reg.msg.clone())),
+            Ok(_) => Err(Error::ParseAt(reg.msg.clone(), reg.offset)),
         }
     }
 
@@ -2510,6 +2577,27 @@ impl Parser {
             Some(Token::Str(s)) => Ok(Expr::Literal(Literal::Str(s))),
             Some(Token::Blob(b)) => Ok(Expr::Literal(Literal::Blob(b))),
             Some(Token::Param(p)) => {
+                // A `#N` variable (`#` followed by a digit) is a register
+                // reference (parse.y `expr ::= VARIABLE`), valid only in a
+                // nested parse — which user SQL never is. sqlite raises
+                // `near "#N": syntax error` from the reduce action but keeps
+                // processing the triggering token; emulate by recording the
+                // error and continuing with a placeholder expression, resolved
+                // by `apply_register_ref` once the statement parse settles.
+                if let crate::sql::token::Param::Named(name) = &p
+                    && name.as_bytes().first() == Some(&b'#')
+                    && name.as_bytes().get(1).is_some_and(u8::is_ascii_digit)
+                {
+                    if self.register_ref.is_none() {
+                        let s = &self.tokens[self.pos - 1];
+                        self.register_ref = Some(RegisterRef {
+                            msg: format!("near \"{}\": syntax error", &self.source[s.start..s.end]),
+                            offset: s.start,
+                            trigger_idx: self.pos,
+                        });
+                    }
+                    return Ok(Expr::Literal(Literal::Null));
+                }
                 // Number parameters by parse position (SQLite's rule) so a bare
                 // `?` binds to a fixed index regardless of evaluation order: a
                 // bare `?` becomes one greater than the largest number assigned so
