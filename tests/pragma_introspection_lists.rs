@@ -170,3 +170,36 @@ fn function_list_reports_kind_and_arity() {
     assert_eq!(find("min", "s"), Some(-1));
     assert_eq!(find("min", "a"), Some(1));
 }
+
+/// The four introspection lists are also exposed as eponymous table-valued
+/// functions (`SELECT … FROM pragma_<name>`), exactly as sqlite does — usable in
+/// a FROM clause and drivable by `WHERE`, not just as a bare `PRAGMA` statement.
+#[test]
+fn introspection_lists_usable_as_table_valued_functions() {
+    let c = Connection::open_memory().unwrap();
+    for tvf in [
+        "pragma_function_list",
+        "pragma_module_list",
+        "pragma_pragma_list",
+        "pragma_compile_options",
+    ] {
+        let sql = alloc_count(tvf);
+        let n = match &c.query(&sql).unwrap().rows[0][0] {
+            Value::Integer(n) => *n,
+            other => panic!("{tvf}: expected integer count, got {other:?}"),
+        };
+        assert!(n > 0, "{tvf} TVF returned no rows");
+    }
+    // Drivable by an equality constraint on the exposed column, like sqlite.
+    let hit = names(
+        &c,
+        "SELECT name FROM pragma_function_list WHERE name = 'abs'",
+    );
+    assert_eq!(hit, vec!["abs".to_string()]);
+}
+
+fn alloc_count(tvf: &str) -> String {
+    let mut s = String::from("SELECT count(*) FROM ");
+    s.push_str(tvf);
+    s
+}
