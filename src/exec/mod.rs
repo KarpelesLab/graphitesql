@@ -12831,14 +12831,15 @@ impl Connection {
         let schema = module.dyn_connect(&arg_refs)?;
         let persistent = module.dyn_persistent();
         let cols = schema.columns;
-        // An R-Tree with no auxiliary columns uses SQLite's byte-compatible node
-        // format (`_node`/`_rowid`/`_parent`) so its file round-trips through
-        // sqlite3; an aux-column R-Tree and all other persistent modules keep the
-        // generic `<name>_data` backing table.
+        // Every R-Tree — with or without auxiliary (`+col`) columns — uses
+        // SQLite's byte-compatible node format (`_node`/`_rowid`/`_parent`) so its
+        // file round-trips through sqlite3; aux columns persist in `_rowid`'s
+        // `a0..aN` (see `rtree_create_storage`). All other persistent modules keep
+        // the generic `<name>_data` backing table.
         let rtree_n_coord = (cvt.module.eq_ignore_ascii_case("rtree")
             || cvt.module.eq_ignore_ascii_case("rtree_i32"))
         .then(|| crate::vtab::RTreeModule::n_coords(&arg_refs))
-        .filter(|n| cols.len() == 1 + n);
+        .filter(|n| cols.len() > *n);
         #[cfg(feature = "fts5")]
         let is_fts5 = cvt.module.eq_ignore_ascii_case("fts5");
         #[cfg(not(feature = "fts5"))]
@@ -12851,7 +12852,8 @@ impl Connection {
             self.geopoly_create_storage(&cvt.name, cvt.args.len())?;
         } else if let Some(n_coord) = rtree_n_coord {
             let integer = cvt.module.eq_ignore_ascii_case("rtree_i32");
-            self.rtree_create_storage(&cvt.name, n_coord, integer)?;
+            let n_aux = cols.len() - 1 - n_coord;
+            self.rtree_create_storage(&cvt.name, n_coord, integer, n_aux)?;
         } else if is_fts5 {
             // FTS5 uses sqlite's shadow tables (so the file round-trips through
             // stock sqlite), not the generic `<name>_data` store. An external-
@@ -13164,21 +13166,24 @@ impl Connection {
             self.geopoly_apply(&table, inserts, &[])?;
             return Ok(n);
         }
-        // R-Tree with no aux columns: store in SQLite's byte-compatible node tree.
+        // R-Tree: store in SQLite's byte-compatible node tree. Auxiliary (`+col`)
+        // values ride in `_rowid`'s `a0..aN`; a no-aux R-Tree uses the plain
+        // `_rowid(rowid,nodeno)` layout and the no-aux write path unchanged.
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let rtree_nc = (module_name.eq_ignore_ascii_case("rtree")
             || module_name.eq_ignore_ascii_case("rtree_i32"))
         .then(|| crate::vtab::RTreeModule::n_coords(&arg_refs))
-        .filter(|n| ncols == 1 + n);
+        .filter(|n| ncols > *n);
         if let Some(n_coord) = rtree_nc {
             let integer = module_name.eq_ignore_ascii_case("rtree_i32");
+            let n_aux = ncols - 1 - n_coord;
             let mut existing: alloc::collections::BTreeSet<i64> = self
                 .rtree_entries(&table, n_coord, integer)?
                 .iter()
                 .map(|c| c.key)
                 .collect();
             let mut next_auto = existing.iter().max().copied().unwrap_or(0) + 1;
-            let mut cells: Vec<RtreeCell> = Vec::new();
+            let mut cells: Vec<(RtreeCell, Vec<Value>)> = Vec::new();
             let mut n = 0;
             for (rowid, values) in &changes {
                 let rid = rowid
@@ -13216,11 +13221,19 @@ impl Connection {
                     }
                 }
                 existing.insert(rid);
-                cells.retain(|c| c.key != rid); // OR REPLACE within this batch
-                cells.push(cell);
+                // The aux tuple is the trailing columns after id + coordinates,
+                // stored verbatim (rtree.c applies no affinity to aux values).
+                let aux: Vec<Value> = values.get(1 + n_coord..).unwrap_or(&[]).to_vec();
+                cells.retain(|(c, _)| c.key != rid); // OR REPLACE within this batch
+                cells.push((cell, aux));
                 n += 1;
             }
-            self.rtree_apply(&table, n_coord, integer, cells, &[])?;
+            if n_aux == 0 {
+                let cells = cells.into_iter().map(|(c, _)| c).collect();
+                self.rtree_apply(&table, n_coord, integer, cells, &[])?;
+            } else {
+                self.rtree_apply_aux(&table, n_coord, integer, cells, &[])?;
+            }
             return Ok(n);
         }
         // Record each new self-content fts5 document (assigned rowid + column
@@ -13455,15 +13468,20 @@ impl Connection {
             self.geopoly_apply(&del.table, Vec::new(), &victims)?;
             return Ok(victims.len());
         }
-        // R-Tree with no aux columns: rebuild the node tree without the victims.
+        // R-Tree: rebuild the node tree (and, for an aux-column R-Tree, `_rowid`'s
+        // aux) without the victims.
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let rtree_nc = (module_name.eq_ignore_ascii_case("rtree")
             || module_name.eq_ignore_ascii_case("rtree_i32"))
         .then(|| crate::vtab::RTreeModule::n_coords(&arg_refs))
-        .filter(|n| columns.len() == 1 + n);
+        .filter(|n| columns.len() > *n);
         if let Some(n_coord) = rtree_nc {
             let integer = module_name.eq_ignore_ascii_case("rtree_i32");
-            self.rtree_apply(&del.table, n_coord, integer, Vec::new(), &victims)?;
+            if columns.len() == 1 + n_coord {
+                self.rtree_apply(&del.table, n_coord, integer, Vec::new(), &victims)?;
+            } else {
+                self.rtree_apply_aux(&del.table, n_coord, integer, Vec::new(), &victims)?;
+            }
             return Ok(victims.len());
         }
         let deleted = self.with_vtab_store(
@@ -13624,28 +13642,37 @@ impl Connection {
             self.geopoly_apply(&upd.table, inserts, &deletes)?;
             return Ok(changes.len());
         }
-        // R-Tree with no aux columns: rebuild the node tree (delete old + insert
-        // new; the `id` column may move the rowid).
+        // R-Tree: rebuild the node tree (delete old + insert new; the `id` column
+        // may move the rowid). An aux-column R-Tree re-stores each new row's aux
+        // values in `_rowid`.
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let rtree_nc = (module_name.eq_ignore_ascii_case("rtree")
             || module_name.eq_ignore_ascii_case("rtree_i32"))
         .then(|| crate::vtab::RTreeModule::n_coords(&arg_refs))
-        .filter(|n| columns.len() == 1 + n);
+        .filter(|n| columns.len() > *n);
         if let Some(n_coord) = rtree_nc {
             let integer = module_name.eq_ignore_ascii_case("rtree_i32");
+            let n_aux = columns.len() - 1 - n_coord;
             let mut deletes = Vec::with_capacity(changes.len());
-            let mut inserts = Vec::with_capacity(changes.len());
+            let mut inserts: Vec<(RtreeCell, Vec<Value>)> = Vec::with_capacity(changes.len());
             for (old_rowid, values) in &changes {
                 deletes.push(*old_rowid);
                 let new_rid = match values.first() {
                     Some(Value::Null) | None => *old_rowid,
                     Some(v) => eval::to_i64(v),
                 };
-                inserts.push(rtree_cell_from_values(
+                let cell = rtree_cell_from_values(
                     new_rid, values, n_coord, integer, &upd.table, &arg_refs,
-                )?);
+                )?;
+                let aux: Vec<Value> = values.get(1 + n_coord..).unwrap_or(&[]).to_vec();
+                inserts.push((cell, aux));
             }
-            self.rtree_apply(&upd.table, n_coord, integer, inserts, &deletes)?;
+            if n_aux == 0 {
+                let inserts = inserts.into_iter().map(|(c, _)| c).collect();
+                self.rtree_apply(&upd.table, n_coord, integer, inserts, &deletes)?;
+            } else {
+                self.rtree_apply_aux(&upd.table, n_coord, integer, inserts, &deletes)?;
+            }
             return Ok(changes.len());
         }
         let updated = self.with_vtab_store(
@@ -14110,12 +14137,11 @@ impl Connection {
                 let rows = self.scan_geopoly(name, &bbox)?;
                 return Ok(Some((columns, rows)));
             }
-            // An R-Tree written by SQLite keeps its entries in the `<name>_node`
-            // b-tree of nodes (byte-compatible on-disk format), not graphite's
-            // generic `<name>_data` backing table. Read the node tree directly so
-            // graphite can query a sqlite-written R-Tree. (No-aux R-Trees only;
-            // aux columns live in `<name>_rowid` — handled when graphite also
-            // writes the node format.)
+            // An R-Tree (written by SQLite or by graphite) keeps its entries in the
+            // `<name>_node` b-tree of nodes (byte-compatible on-disk format), not
+            // graphite's generic `<name>_data` backing table. Read the node tree
+            // directly. Aux (`+col`) columns live in `<name>_rowid`'s `a0..aN` and
+            // are joined back in by `scan_rtree_aux`.
             let rtree = cvt.module.eq_ignore_ascii_case("rtree")
                 || cvt.module.eq_ignore_ascii_case("rtree_i32");
             if rtree
@@ -14123,7 +14149,7 @@ impl Connection {
                 && self.schema.table(&format!("{name}_data")).is_none()
             {
                 let n_coords = crate::vtab::RTreeModule::n_coords(&arg_refs);
-                if columns.len() == 1 + n_coords {
+                if columns.len() > n_coords {
                     let integer = cvt.module.eq_ignore_ascii_case("rtree_i32");
                     // Spatial pushdown: turn the query's coordinate comparisons into
                     // per-dimension bounds the node walk uses to prune subtrees.
@@ -14157,7 +14183,11 @@ impl Connection {
                         }
                         None => Vec::new(),
                     };
-                    let rows = self.scan_rtree_nodes(name, n_coords, integer, &bbox)?;
+                    let rows = if columns.len() == 1 + n_coords {
+                        self.scan_rtree_nodes(name, n_coords, integer, &bbox)?
+                    } else {
+                        self.scan_rtree_aux(name, n_coords, integer, &bbox)?
+                    };
                     return Ok(Some((columns, rows)));
                 }
             }
@@ -34052,15 +34082,33 @@ impl Connection {
     }
 
     /// Create an R-Tree's storage: the `_node`/`_rowid`/`_parent` shadow tables
-    /// (byte-compatible with SQLite) plus an empty root node.
-    fn rtree_create_storage(&mut self, name: &str, n_coord: usize, integer: bool) -> Result<()> {
+    /// (byte-compatible with SQLite) plus an empty root node. When the R-Tree
+    /// declares `n_aux` auxiliary (`+col`) columns, `_rowid` is widened with one
+    /// `aK` column per aux column (`rowid,nodeno,a0,…,a(n_aux-1)`) — exactly
+    /// SQLite's `rtree.c` shadow-table schema — so the aux values persist in a
+    /// stock-`sqlite3`-readable file. `n_aux == 0` yields the plain
+    /// `_rowid(rowid,nodeno)` layout byte-for-byte.
+    fn rtree_create_storage(
+        &mut self,
+        name: &str,
+        n_coord: usize,
+        integer: bool,
+        n_aux: usize,
+    ) -> Result<()> {
         // SQLite generates the shadow-table schema with no space after the commas
         // (`(nodeno INTEGER PRIMARY KEY,data)`); match that so `sqlite_master.sql`
         // is byte-identical.
+        let mut rowid_cols = String::from("rowid INTEGER PRIMARY KEY,nodeno");
+        for k in 0..n_aux {
+            rowid_cols.push_str(&format!(",a{k}"));
+        }
         for (suffix, cols) in [
-            ("_node", "nodeno INTEGER PRIMARY KEY,data"),
-            ("_rowid", "rowid INTEGER PRIMARY KEY,nodeno"),
-            ("_parent", "nodeno INTEGER PRIMARY KEY,parentnode"),
+            ("_node", "nodeno INTEGER PRIMARY KEY,data".to_string()),
+            ("_rowid", rowid_cols),
+            (
+                "_parent",
+                "nodeno INTEGER PRIMARY KEY,parentnode".to_string(),
+            ),
         ] {
             let sql = format!(
                 "CREATE TABLE {}({cols})",
@@ -34078,6 +34126,66 @@ impl Connection {
             self.rtree_node_size_for(n_coord),
         );
         self.rtree_write_build(name, &build)
+    }
+
+    /// Apply inserts/deletes to an R-Tree that has auxiliary (`+col`) columns:
+    /// rebuild the node tree from the surviving coordinate cells and rewrite
+    /// `_rowid` with each survivor's aux values in `a0..aN`. This mirrors
+    /// [`Self::geopoly_apply`] (which is the 2-D, `_shape`-in-`a0` special case),
+    /// generalized to any `n_coord`/`integer`. Each insert carries its coordinate
+    /// cell and its aux tuple `[a0, a1, …]` (the trailing `values[1+n_coord..]`).
+    fn rtree_apply_aux(
+        &mut self,
+        name: &str,
+        n_coord: usize,
+        integer: bool,
+        inserts: Vec<(RtreeCell, Vec<Value>)>,
+        deletes: &[i64],
+    ) -> Result<()> {
+        let mut entries = self.rtree_entries(name, n_coord, integer)?;
+        let mut aux = self.geopoly_read_aux(name)?;
+        let removed: alloc::collections::BTreeSet<i64> = deletes
+            .iter()
+            .copied()
+            .chain(inserts.iter().map(|(c, _)| c.key))
+            .collect();
+        entries.retain(|c| !removed.contains(&c.key));
+        for r in &removed {
+            aux.remove(r);
+        }
+        for (cell, a) in inserts {
+            aux.insert(cell.key, a);
+            entries.push(cell);
+        }
+        let build = rtree_bulk_build(entries, n_coord, integer, self.rtree_node_size_for(n_coord));
+        self.rtree_write_build_aux(name, &build, &aux)
+    }
+
+    /// Scan an aux-column R-Tree, pruning candidate subtrees by `bbox` and
+    /// yielding one row per surviving entry as `[id, coord0, …, a0, a1, …]` — the
+    /// coordinates read from the byte-compatible node tree, the aux values joined
+    /// in from `_rowid`. The bbox prune is a superset, so `run_core` re-applies
+    /// the exact `WHERE`.
+    fn scan_rtree_aux(
+        &self,
+        name: &str,
+        n_coord: usize,
+        integer: bool,
+        bbox: &[(usize, ConstraintOp, f64)],
+    ) -> Result<Vec<InputRow>> {
+        let aux = self.geopoly_read_aux(name)?;
+        let candidates = self.scan_rtree_nodes(name, n_coord, integer, bbox)?;
+        let mut out = Vec::with_capacity(candidates.len());
+        for r in candidates {
+            let Some(rowid) = r.rowid else { continue };
+            let mut values = r.values; // [id, coord0, …, coord(n_coord-1)]
+            values.extend(aux.get(&rowid).cloned().unwrap_or_default());
+            out.push(InputRow {
+                values,
+                rowid: Some(rowid),
+            });
+        }
+        Ok(out)
     }
 
     /// Apply inserts and/or a delete to an R-Tree by rebuilding its node tree
@@ -34162,23 +34270,9 @@ impl Connection {
         inserts: Vec<(RtreeCell, Vec<Value>)>,
         deletes: &[i64],
     ) -> Result<()> {
-        let mut entries = self.rtree_entries(name, 4, false)?;
-        let mut aux = self.geopoly_read_aux(name)?;
-        let removed: alloc::collections::BTreeSet<i64> = deletes
-            .iter()
-            .copied()
-            .chain(inserts.iter().map(|(c, _)| c.key))
-            .collect();
-        entries.retain(|c| !removed.contains(&c.key));
-        for r in &removed {
-            aux.remove(r);
-        }
-        for (cell, a) in inserts {
-            aux.insert(cell.key, a);
-            entries.push(cell);
-        }
-        let build = rtree_bulk_build(entries, 4, false, self.rtree_node_size_for(4));
-        self.rtree_write_build_aux(name, &build, &aux)
+        // geopoly is the 2-D (`n_coord == 4`), float, `_shape`-in-`a0` special
+        // case of an aux-column R-Tree.
+        self.rtree_apply_aux(name, 4, false, inserts, deletes)
     }
 
     /// Scan a geopoly table, pruning candidate subtrees by `bbox` (query-polygon

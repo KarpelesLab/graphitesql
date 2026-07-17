@@ -1,10 +1,12 @@
 //! Roadmap D3a-c: the built-in `rtree` virtual-table module. A plain (no-aux)
 //! R-Tree persists in SQLite's byte-compatible `_node`/`_rowid`/`_parent` shadow
 //! tables and spatial queries walk that node tree with subtree pruning, so the
-//! file round-trips through stock sqlite3 in both directions; an aux-column
-//! R-Tree still uses the generic `<name>_data` backing table. Coordinates are
-//! stored as 32-bit floats (min rounded down, max rounded up) and the id as an
-//! integer, byte-for-byte like sqlite3 3.50.4.
+//! file round-trips through stock sqlite3 in both directions. An aux-column
+//! (`+col`) R-Tree uses the same `_node`/`_parent` shadows and a `_rowid`
+//! widened with one `aK` column per aux column (`rowid,nodeno,a0,…`), also
+//! byte-compatible with sqlite3. Coordinates are stored as 32-bit floats (min
+//! rounded down, max rounded up) and the id as an integer, byte-for-byte like
+//! sqlite3 3.50.4.
 
 #![cfg(feature = "std")]
 
@@ -452,6 +454,34 @@ fn auxiliary_columns_store_and_query() {
     let info = c.query("PRAGMA table_info(r)").unwrap();
     assert_eq!(info.rows[3][1], Value::Text("label".into()));
     assert_eq!(info.rows[3][2], Value::Text("".into()));
+    // Aux values persist in SQLite's byte-compatible shadow tables (the `_rowid`
+    // widened with `a0`/`a1`), NOT the generic `_data` backing.
+    assert!(c.query("SELECT a0, a1 FROM r_rowid WHERE rowid=1").is_ok());
+    assert!(c.query("SELECT * FROM r_data").is_err());
+    assert_eq!(
+        rows(&c, "SELECT a0, a1 FROM r_rowid WHERE rowid=1"),
+        [vec![Value::Text("alpha".into()), Value::Integer(42)]]
+    );
+    // An UPDATE rewrites the aux row; a DELETE drops it.
+    c.execute("UPDATE r SET label='ALPHA' WHERE id=1").unwrap();
+    assert_eq!(
+        rows(&c, "SELECT label FROM r WHERE id=1"),
+        [vec![Value::Text("ALPHA".into())]]
+    );
+    c.execute("DELETE FROM r WHERE id=2").unwrap();
+    assert_eq!(
+        rows(&c, "SELECT id FROM r ORDER BY id"),
+        [vec![Value::Integer(1)]]
+    );
+    assert_eq!(
+        c.query("SELECT count(*) FROM r_rowid").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
+    // The whole database still passes integrity_check.
+    assert_eq!(
+        c.query("PRAGMA integrity_check").unwrap().rows[0][0],
+        Value::Text("ok".into())
+    );
 }
 
 #[test]
