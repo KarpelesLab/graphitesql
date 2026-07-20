@@ -7014,9 +7014,27 @@ impl Connection {
             Value::Text(s) => String::from(s.as_str()),
             other => eval::to_text(&other),
         };
-        if std::path::Path::new(&path).exists() {
-            // SQLite's message is exactly this — no path is appended.
-            return Err(Error::Error("output file already exists".into()));
+        // SQLite requires the target to be empty: an existing *non-empty* file is
+        // rejected (it opens it as a database — a valid one is `output file already
+        // exists`, anything else `file is not a database`), but an existing *empty*
+        // (0-byte) file is written into. Both messages carry no path.
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.len() > 0 => {
+                let mut hdr = [0u8; 16];
+                let looks_like_db = std::fs::File::open(&path)
+                    .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut hdr).map(|()| hdr))
+                    .is_ok_and(|h| &h == b"SQLite format 3\0");
+                return Err(Error::Error(if looks_like_db {
+                    "output file already exists".into()
+                } else {
+                    "file is not a database".into()
+                }));
+            }
+            // An existing empty file: remove it so the fresh create starts clean.
+            Ok(_) => {
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(_) => {} // does not exist — the normal path
         }
         let user_version = self.backend.source().header().user_version;
         let mut dst = Connection::create(&path)?;

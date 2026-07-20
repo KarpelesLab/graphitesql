@@ -2633,7 +2633,10 @@ fn is_prepare_error(e: &graphitesql::Error, msg: &str, sql: &str) -> bool {
             ];
             PREPARE_PREFIXES.iter().any(|p| msg.starts_with(p))
                 || PREPARE_CONTAINS.iter().any(|p| msg.contains(p))
-                || msg.ends_with(" already exists")
+                // "table/index/… already exists" is a prepare-time DDL diagnostic,
+                // but VACUUM INTO's "output file already exists" is a run-time
+                // (step) error despite the same suffix.
+                || (msg.ends_with(" already exists") && msg != "output file already exists")
         }
         _ => false,
     }

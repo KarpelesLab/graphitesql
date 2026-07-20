@@ -68,6 +68,9 @@ impl Error {
             // big" is `SQLITE_TOOBIG` (18).
             Error::Error(m) | Error::ErrorAt(m, _) if m == "datatype mismatch" => 20,
             Error::Error(m) | Error::ErrorAt(m, _) if m == "string or blob too big" => 18,
+            // Opening a non-database file (e.g. `VACUUM INTO` a junk target) is
+            // `SQLITE_NOTADB` (26).
+            Error::Error(m) | Error::ErrorAt(m, _) if m == "file is not a database" => 26,
             Error::Error(_)
             | Error::ErrorAt(..)
             | Error::Parse(_)
