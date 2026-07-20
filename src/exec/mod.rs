@@ -26977,24 +26977,34 @@ impl Connection {
                 // fallback validates only self-contained subqueries (no false
                 // positive).
                 if self.outer_scope.borrow().is_empty() {
+                    // Resolve the outer FROM scope for validating subquery bodies.
+                    // When it can't be resolved cheaply — a CTE / view / derived /
+                    // virtual source that `window_join_source_columns` declines —
+                    // SKIP the eager checks rather than run them against an *empty*
+                    // scope: a correlated subquery legitimately references that
+                    // outer scope, so an empty one falsely reports `no such column`
+                    // (e.g. `WITH t AS (…) SELECT (SELECT … WHERE x=t.a) FROM t`).
+                    // The query already produced `result`; the lazy path covers the
+                    // rest. A resolvable (plain-table) FROM still validates fully.
                     let scope = match &sel.from {
-                        Some(_) => self.window_join_source_columns(sel).unwrap_or_default(),
-                        None => Vec::new(),
+                        None => Some(Vec::new()),
+                        Some(_) => self.window_join_source_columns(sel).ok(),
                     };
-                    // A bare reference inside a subquery that binds to an enclosing
-                    // FROM carrying that name on two sources is ambiguous — rejected
-                    // statically, before the body-column resolution below (the
-                    // tree-walker's order at the outermost level).
-                    self.validate_nested_ambiguity(sel, &scope)?;
-                    self.validate_subquery_body_columns(sel, &scope)?;
-                    self.reject_invalid_in_subquery_arity(sel, &scope)?;
-                    self.reject_invalid_scalar_subquery_arity(sel, &scope)?;
-                    self.reject_row_value_misuse(sel, &scope)?;
-                    // Unknown / wrong-arity function calls inside a subquery body,
-                    // over the real scope (the `&[]` call above only reaches
-                    // uncorrelated bodies) — mirrors the tree-walker's outermost
-                    // `reject_unresolved_functions_in_subqueries(sel, &columns)`.
-                    self.reject_unresolved_functions_in_subqueries(sel, &scope)?;
+                    if let Some(scope) = scope {
+                        // A bare reference inside a subquery that binds to an
+                        // enclosing FROM carrying that name on two sources is
+                        // ambiguous — rejected statically, before the body-column
+                        // resolution below (the tree-walker's order).
+                        self.validate_nested_ambiguity(sel, &scope)?;
+                        self.validate_subquery_body_columns(sel, &scope)?;
+                        self.reject_invalid_in_subquery_arity(sel, &scope)?;
+                        self.reject_invalid_scalar_subquery_arity(sel, &scope)?;
+                        self.reject_row_value_misuse(sel, &scope)?;
+                        // Unknown / wrong-arity function calls inside a subquery
+                        // body, over the real scope — mirrors the tree-walker's
+                        // outermost `reject_unresolved_functions_in_subqueries`.
+                        self.reject_unresolved_functions_in_subqueries(sel, &scope)?;
+                    }
                 }
                 return Ok(result);
             }
