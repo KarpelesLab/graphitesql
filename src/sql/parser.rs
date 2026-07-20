@@ -1712,7 +1712,7 @@ impl Parser {
             return Ok(Statement::CreateView(cv));
         }
         if self.eat_kw("trigger") {
-            let mut ct = self.create_trigger()?;
+            let mut ct = self.create_trigger(temp)?;
             if temp {
                 ct.schema = temp_object_schema(
                     ct.schema.take(),
@@ -1732,7 +1732,7 @@ impl Parser {
         Err(self.err("expected TABLE, INDEX, VIEW, TRIGGER, or VIRTUAL TABLE after CREATE"))
     }
 
-    fn create_trigger(&mut self) -> Result<CreateTrigger> {
+    fn create_trigger(&mut self, temp: bool) -> Result<CreateTrigger> {
         let if_not_exists = self.if_not_exists()?;
         let (schema, name) = self.qualified_name()?;
         let timing = if self.eat_kw("before") {
@@ -1762,7 +1762,23 @@ impl Parser {
             return Err(self.err("expected INSERT, UPDATE, or DELETE in CREATE TRIGGER"));
         };
         self.expect_kw("on")?;
-        let table = self.ident()?;
+        // SQLite accepts a schema-qualified target table (`ON db.t`). The database
+        // must be the trigger's own — a non-TEMP trigger can only reference objects
+        // in its own database (a TEMP trigger may reference any) — otherwise it is
+        // `trigger <name> cannot reference objects in database <db>`. When the
+        // schema agrees the bare table name resolves there, so the qualifier is
+        // dropped; the caret points at the table token.
+        let table_off = self.tokens.get(self.pos).map(|s| s.start).unwrap_or(0);
+        let (table_schema, table) = self.qualified_name()?;
+        if let Some(tsch) = &table_schema
+            && !temp
+            && !tsch.eq_ignore_ascii_case(schema.as_deref().unwrap_or("main"))
+        {
+            return Err(Error::ParseAt(
+                format!("trigger {name} cannot reference objects in database {tsch}"),
+                table_off,
+            ));
+        }
         if self.eat_kw("for") {
             self.expect_kw("each")?;
             self.expect_kw("row")?;
