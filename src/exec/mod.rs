@@ -11404,6 +11404,58 @@ impl Connection {
 
     /// Rowids of existing rows that conflict with a candidate row on the rowid
     /// or any UNIQUE/PRIMARY KEY column set (NULLs are considered distinct).
+    /// The existing rows that could possibly collide with `values` on the rowid or
+    /// a UNIQUE / PRIMARY KEY constraint — found by **seeking** the rowid and each
+    /// unique index (O(log n) each), never by scanning the whole table. The result
+    /// may be a superset (a partial-index or NULL-key subtlety); [`find_conflicts`]
+    /// re-confirms every candidate with the exact per-constraint comparison, so an
+    /// extra candidate is harmless. Every index on the rowid INSERT path is
+    /// maintained incrementally as rows are inserted, so a mid-statement seek sees
+    /// the rows already added this statement.
+    fn conflict_candidates(
+        &self,
+        table: &str,
+        meta: &TableMeta,
+        rowid: i64,
+        values: &[Value],
+        params: &Params,
+    ) -> Result<Vec<(i64, Vec<Value>)>> {
+        let mut ids: alloc::collections::BTreeSet<i64> = alloc::collections::BTreeSet::new();
+        // A rowid / INTEGER PRIMARY KEY collision: seek the table b-tree by rowid.
+        if self.read_row(meta, rowid)?.is_some() {
+            ids.insert(rowid);
+        }
+        // Every UNIQUE index — the automatic indexes of the inline UNIQUE / PRIMARY
+        // KEY sets plus standalone `CREATE UNIQUE INDEX`es — seeked by this row's
+        // key. A NULL key term or an excluding partial predicate can't collide.
+        let src = self.backend.source();
+        for idx in self.indexes_of(table)?.iter().filter(|i| i.unique) {
+            if !self.row_in_index(idx, meta, values, Some(rowid), params)? {
+                continue;
+            }
+            let key = self.index_key_values(idx, meta, values, rowid, params)?;
+            if key.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
+            }
+            for er in crate::btree::index_seek_rowids(
+                src,
+                idx.root,
+                &key,
+                &idx.collations,
+                idx.seek_descs(),
+            )? {
+                ids.insert(er);
+            }
+        }
+        let mut out = Vec::with_capacity(ids.len());
+        for er in ids {
+            if let Some(ev) = self.read_row(meta, er)? {
+                out.push((er, ev));
+            }
+        }
+        Ok(out)
+    }
+
     fn find_conflicts(
         &self,
         table: &str,
@@ -11444,7 +11496,10 @@ impl Connection {
         // The declared `ON CONFLICT` action of the first inline UNIQUE/PRIMARY KEY
         // set the new row collides on (used when the statement has no `OR <action>`).
         let mut action: Option<OnConflict> = None;
-        for (er, ev) in self.scan_table(meta)? {
+        // Only the handful of rows that could possibly collide (found by seeking
+        // the rowid + each unique index), NOT the whole table — this is what keeps
+        // INSERT O(n·log n) instead of O(n²). Each candidate is re-confirmed below.
+        for (er, ev) in self.conflict_candidates(table, meta, rowid, values, params)? {
             if Some(er) == exclude {
                 continue;
             }
