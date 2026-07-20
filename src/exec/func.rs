@@ -513,10 +513,11 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         }
         // `json_quote(X)` returns a JSON-subtyped argument as-is (it is already
         // JSON text), and only quotes a value that is *not* JSON. graphite has no
-        // value subtypes, so it approximates the subtype syntactically: an arg
-        // that is itself a JSON-producing call (`json`, `json_array`, …) carries
-        // the subtype. Anything else falls through to the quoting arm below.
-        "json_quote" if args.len() == 1 && produces_json(&args[0]) => {
+        // value subtypes, so it decides the subtype from the source expression: a
+        // JSON-producing call (`json`, `json_array`, …) or a single-path
+        // `json_extract` that yields a container (`carries_json_subtype`, runtime).
+        // Anything else falls through to the quoting arm below.
+        "json_quote" if args.len() == 1 && carries_json_subtype(&args[0], ctx) => {
             let val = eval::eval(&args[0], ctx)?;
             // A JSONB blob (e.g. `json_quote(jsonb('[1,2]'))`) renders as its JSON
             // text; any other blob is rejected.
@@ -1219,7 +1220,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         "json_array" | "jsonb_array" => {
             let mut items = Vec::with_capacity(v.len());
             for (i, val) in v.iter().enumerate() {
-                items.push(json_value_arg(val, args.get(i))?);
+                items.push(json_value_arg(val, args.get(i), ctx)?);
             }
             json_doc_result(&lname, &super::json::Json::Array(items))
         }
@@ -1237,7 +1238,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 let Value::Text(key) = &kv[0] else {
                     return Err(Error::Error("json_object() labels must be TEXT".into()));
                 };
-                let val = json_value_arg(&kv[1], args.get(2 * i + 1))?;
+                let val = json_value_arg(&kv[1], args.get(2 * i + 1), ctx)?;
                 // A key built from a SQL TEXT arg carries no escape provenance.
                 members.push((String::from(key.as_str()), None, val));
             }
@@ -1274,7 +1275,7 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     while i + 1 < v.len() {
                         check_path(&v[i])?;
                         let path = eval::to_text(&v[i]);
-                        let val = json_edit_value_arg(&v[i + 1], args.get(i + 1))?;
+                        let val = json_edit_value_arg(&v[i + 1], args.get(i + 1), ctx)?;
                         super::json::set_path(&mut root, &path, val, mode);
                         i += 2;
                     }
@@ -1902,12 +1903,13 @@ fn check_path(p: &Value) -> Result<()> {
 /// BLOB is embedded as its JSON when it decodes as JSONB (so `jsonb_*` results
 /// compose, e.g. `jsonb_object('a', jsonb_array(1,2))`) and otherwise rejected —
 /// graphite has no value subtypes, so it falls back to "does it parse as JSONB".
-fn json_value_arg(val: &Value, expr: Option<&Expr>) -> Result<super::json::Json> {
+fn json_value_arg(val: &Value, expr: Option<&Expr>, ctx: &EvalCtx) -> Result<super::json::Json> {
     if let Value::Blob(b) = val {
         return super::json::Json::from_jsonb(b)
             .ok_or_else(|| Error::Error("JSON cannot hold BLOB values".into()));
     }
-    Ok(arg_to_json(val, expr))
+    let subtype = expr.is_some_and(|e| carries_json_subtype(e, ctx));
+    Ok(arg_to_json_with_subtype(val, subtype))
 }
 
 /// The *value* argument of `json_set`/`json_insert`/`json_replace` (and their
@@ -1917,19 +1919,24 @@ fn json_value_arg(val: &Value, expr: Option<&Expr>) -> Result<super::json::Json>
 /// `jsonFunctionArgToBlob`, which serves exactly this argument position (the
 /// JSON *text* constructors `json_object`/`json_array` instead escape a plain
 /// string into a `TEXT`/`TEXTJ` node when their output is re-encoded).
-fn json_edit_value_arg(val: &Value, expr: Option<&Expr>) -> Result<super::json::Json> {
+fn json_edit_value_arg(
+    val: &Value,
+    expr: Option<&Expr>,
+    ctx: &EvalCtx,
+) -> Result<super::json::Json> {
     if let Value::Blob(b) = val {
         return super::json::Json::from_jsonb(b)
             .ok_or_else(|| Error::Error("JSON cannot hold BLOB values".into()));
     }
     // A JSON-subtype TEXT value (the output of a json-producing expression) is
     // parsed as JSON; any other plain TEXT is stored raw (TEXTRAW).
+    let subtype = expr.is_some_and(|e| carries_json_subtype(e, ctx));
     if let Value::Text(s) = val
-        && !expr.is_some_and(produces_json)
+        && !subtype
     {
         return Ok(super::json::Json::text_raw(s.as_str()));
     }
-    Ok(arg_to_json(val, expr))
+    Ok(arg_to_json_with_subtype(val, subtype))
 }
 
 /// `json_extract`: one path returns the SQL value at that path (objects/arrays as
@@ -1984,13 +1991,52 @@ fn json_extract(root: &super::json::Json, paths: &[Value], jsonb: bool) -> Resul
 /// embedded as parsed JSON — mirroring SQLite's JSON subtype propagation — rather
 /// than quoted as a string.
 pub(crate) fn arg_to_json(val: &Value, expr: Option<&Expr>) -> super::json::Json {
-    if let (Value::Text(s), Some(e)) = (val, expr)
-        && produces_json(e)
+    arg_to_json_with_subtype(val, expr.is_some_and(produces_json))
+}
+
+/// The core of [`arg_to_json`], with the "argument carries the JSON subtype"
+/// decision made by the caller: when `subtype` holds, a TEXT value is spliced in
+/// as parsed JSON rather than quoted as a string.
+fn arg_to_json_with_subtype(val: &Value, subtype: bool) -> super::json::Json {
+    if let Value::Text(s) = val
+        && subtype
         && let Some(j) = super::json::parse(s)
     {
         return j;
     }
     super::json::value_to_json(val)
+}
+
+/// Runtime-aware companion to [`produces_json`]: additionally true when `expr` is
+/// a single-path `json_extract(J, path)` whose extracted node is a JSON object or
+/// array. SQLite marks such a result with the JSON subtype, but its text is
+/// indistinguishable from a scalar string of the same characters (`json_extract`
+/// of the *string* `"[1,2]"` vs of the *array* `[1,2]` both yield the SQL text
+/// `[1,2]`), so the subtype can only be decided from the source expression at
+/// runtime — which the JSON *scalar* constructors/editors can do because they
+/// hold the evaluation `ctx`. (The `json_group_*` aggregates cannot, and keep the
+/// static [`produces_json`] approximation.)
+fn carries_json_subtype(expr: &Expr, ctx: &EvalCtx) -> bool {
+    if let Expr::Paren(inner) = expr {
+        return carries_json_subtype(inner, ctx);
+    }
+    if produces_json(expr) {
+        return true;
+    }
+    if let Expr::Function { name, args, .. } = expr
+        && name.eq_ignore_ascii_case("json_extract")
+        && args.len() == 2
+        && let Ok(doc) = eval::eval(&args[0], ctx)
+        && let Ok(Some(root)) = json_root(&doc)
+        && let Ok(path) = eval::eval(&args[1], ctx)
+        && !matches!(path, Value::Null)
+    {
+        return matches!(
+            super::json::navigate(&root, &eval::to_text(&path)),
+            Some(super::json::Json::Array(_) | super::json::Json::Object(_))
+        );
+    }
+    false
 }
 
 /// Whether an expression *statically* yields a value carrying SQLite's JSON
