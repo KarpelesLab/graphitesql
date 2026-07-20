@@ -113,18 +113,44 @@ fn vacuum_into_matches_sqlite3_logical_content() {
 
 #[test]
 fn vacuum_into_existing_file_errors() {
-    let out = tmp("exists.db");
-    std::fs::write(&out, b"not empty").unwrap();
+    // SQLite requires the target to be empty; a non-empty target is refused with a
+    // message that depends on whether it opens as a database — verified against the
+    // sqlite3 3.50.4 CLI:
+    //   * a valid (non-empty) database → "output file already exists";
+    //   * any other non-empty content → "file is not a database" (SQLITE_NOTADB);
+    //   * an existing *empty* (0-byte) file is written into, not refused.
+    let msg = |c: &mut Connection, out: &str| -> String {
+        c.execute(&format!("VACUUM INTO '{out}'"))
+            .unwrap_err()
+            .to_string()
+            .trim_start_matches("error: ")
+            .to_string()
+    };
+
+    // Non-database content → "file is not a database".
+    let junk = tmp("exists_junk.db");
+    std::fs::write(&junk, b"not empty").unwrap();
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a)").unwrap();
-    // SQLite refuses to overwrite an existing target, with this exact message
-    // (no path appended) — verified against the sqlite3 3.50.4 CLI.
-    let err = c.execute(&format!("VACUUM INTO '{out}'")).unwrap_err();
-    assert_eq!(
-        err.to_string().trim_start_matches("error: "),
-        "output file already exists"
-    );
-    let _ = std::fs::remove_file(&out);
+    assert_eq!(msg(&mut c, &junk), "file is not a database");
+    let _ = std::fs::remove_file(&junk);
+
+    // A valid, non-empty database → "output file already exists".
+    let dbfile = tmp("exists_db.db");
+    let _ = std::fs::remove_file(&dbfile);
+    {
+        let mut seed = Connection::create(&dbfile).unwrap();
+        seed.execute("CREATE TABLE z(x)").unwrap();
+    }
+    assert_eq!(msg(&mut c, &dbfile), "output file already exists");
+    let _ = std::fs::remove_file(&dbfile);
+
+    // An existing empty (0-byte) file is acceptable — VACUUM INTO writes into it.
+    let empty = tmp("exists_empty.db");
+    std::fs::write(&empty, b"").unwrap();
+    c.execute(&format!("VACUUM INTO '{empty}'")).unwrap();
+    assert!(Connection::open(&empty).is_ok());
+    let _ = std::fs::remove_file(&empty);
 }
 
 #[test]
