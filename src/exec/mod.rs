@@ -28092,15 +28092,18 @@ impl Connection {
                               column: &str,
                               quoted: bool|
          -> Option<Error> {
-            // A three-part qualifier must match the matched source's database
-            // (checked before the pseudo-column shortcut, since `bad.t.rowid`
-            // is just as wrong as `bad.t.col`).
+            // A three-part qualifier must match *some* source whose table name AND
+            // database both agree — not merely the first source sharing the table
+            // name (two attached databases can each hold a table `t`, so `m2.t.c`
+            // must find the `m2` source, not stop at `m1`). Checked before the
+            // pseudo-column shortcut, since `bad.t.rowid` is just as wrong as
+            // `bad.t.col`.
             if let Some(sch) = schema {
                 let t = table.unwrap_or_default();
                 let ok = labels
                     .iter()
-                    .position(|l| l.eq_ignore_ascii_case(t))
-                    .is_some_and(|i| src_dbs[i].eq_ignore_ascii_case(sch));
+                    .zip(&src_dbs)
+                    .any(|(l, db)| l.eq_ignore_ascii_case(t) && db.eq_ignore_ascii_case(sch));
                 if !ok {
                     return Some(eval::no_such_column(schema, table, column, quoted));
                 }
@@ -39497,6 +39500,15 @@ fn validate_unambiguous_columns(
                             && table
                                 .as_deref()
                                 .is_none_or(|t| c.table.eq_ignore_ascii_case(t))
+                            // A three-part `db.table.column` reference distinguishes
+                            // two same-named tables in different databases, so a
+                            // schema qualifier narrows the count by origin database
+                            // (an unknown origin — derived/CTE/synthetic — matches
+                            // any qualifier, staying conservative). Matches the
+                            // `column_resolves_scoped` rule.
+                            && schema.as_deref().is_none_or(|s| {
+                                c.schema.as_deref().is_none_or(|cs| cs.eq_ignore_ascii_case(s))
+                            })
                     })
                     .count();
                 if n >= 2 {

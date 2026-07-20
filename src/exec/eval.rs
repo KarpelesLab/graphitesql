@@ -402,11 +402,33 @@ impl<'a> EvalCtx<'a> {
                 return Ok(Value::Integer(r));
             }
         }
+        // Two-pass so a three-part `db.table.column` reference binds to the column
+        // from the *named* database, not merely the first source sharing the table
+        // name (two attached databases can each hold a table `t`). Pass 1 requires
+        // the origin database to match exactly; pass 2 (only for a schema-qualified
+        // reference that pass 1 missed) accepts an unknown origin (derived / CTE /
+        // synthetic column carries no `schema`), staying conservative.
+        let matches = |col: &ColumnInfo, exact_schema: bool| {
+            col.name.eq_ignore_ascii_case(name)
+                && table.is_none_or(|t| col.table.eq_ignore_ascii_case(t))
+                && match schema {
+                    None => true,
+                    Some(s) => match col.schema.as_deref() {
+                        Some(cs) => cs.eq_ignore_ascii_case(s),
+                        None => !exact_schema,
+                    },
+                }
+        };
         for (i, col) in self.columns.iter().enumerate() {
-            let name_ok = col.name.eq_ignore_ascii_case(name);
-            let table_ok = table.is_none_or(|t| col.table.eq_ignore_ascii_case(t));
-            if name_ok && table_ok {
+            if matches(col, true) {
                 return Ok(self.row[i].clone());
+            }
+        }
+        if schema.is_some() {
+            for (i, col) in self.columns.iter().enumerate() {
+                if matches(col, false) {
+                    return Ok(self.row[i].clone());
+                }
             }
         }
         // Fall back to an enclosing query's row (a correlated reference).
