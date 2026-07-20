@@ -32500,6 +32500,67 @@ impl Connection {
     }
 
     /// INSERT into a WITHOUT ROWID (PK-clustered) table.
+    /// Find the existing WITHOUT ROWID rows that collide with `values` on the
+    /// PRIMARY KEY / a UNIQUE constraint, as `(existing, collide)` where `collide`
+    /// indexes into `existing` — the shape the insert conflict handling expects.
+    ///
+    /// Fast path: when the clustered PRIMARY KEY is the table's *only* uniqueness
+    /// constraint (no extra inline `UNIQUE`, no standalone unique index), the only
+    /// possible collision is a duplicate PK, detected by SEEKING the clustered
+    /// b-tree for this row's PK (O(log n)) rather than scanning the whole table
+    /// (O(n) per row → O(n²)). With no collision — the common bulk-insert case —
+    /// it returns empty without materializing the table. On an actual collision
+    /// (rare), or whenever there ARE secondary unique constraints (whose index
+    /// b-trees are rebuilt only at statement end, so a mid-loop seek would be
+    /// stale), it falls back to the authoritative full scan — REPLACE rewrites the
+    /// table from the returned `existing`, so that must be the complete row set.
+    fn wr_find_collisions(
+        &self,
+        table: &str,
+        meta: &TableMeta,
+        values: &[Value],
+        params: &Params,
+    ) -> Result<(Vec<Vec<Value>>, Vec<usize>)> {
+        let pk_only = meta.unique.len() == 1
+            && !self
+                .indexes_of(table)?
+                .iter()
+                .any(|i| i.unique && autoindex_number(&i.name, table).is_none());
+        if pk_only {
+            let pk_len = meta.pk_len;
+            let realified = realify_columns_for_storage(meta, values);
+            let pk_key: Vec<Value> = meta.storage_order[..pk_len]
+                .iter()
+                .map(|&c| realified[c].clone())
+                .collect();
+            let pk_colls = wr_storage_collations(meta)[..pk_len].to_vec();
+            let pk_descs = meta.pk_descs().to_vec();
+            let hit = !crate::btree::index_seek_records(
+                self.backend.source(),
+                meta.root,
+                &pk_key,
+                &pk_colls,
+                &pk_descs,
+            )?
+            .is_empty();
+            if !hit {
+                return Ok((Vec::new(), Vec::new())); // no collision — the fast path
+            }
+            // A real PK collision: fall through to the full scan so REPLACE/upsert
+            // see the complete table.
+        }
+        let existing = self.scan_without_rowid(meta)?;
+        let mut collide = Vec::new();
+        for (i, r) in existing.iter().enumerate() {
+            if unique_match(meta, r, values)
+                || self.wr_index_collision(table, meta, r, values, params)?
+            {
+                collide.push(i);
+            }
+        }
+        Ok((existing, collide))
+    }
+
     fn exec_insert_without_rowid(
         &mut self,
         ins: &Insert,
@@ -32565,16 +32626,10 @@ impl Connection {
 
             // Reject a duplicate primary key, an inline UNIQUE constraint, or a
             // standalone UNIQUE index (incl. partial). Collect colliding rows so
-            // REPLACE can rebuild without them.
-            let existing = self.scan_without_rowid(meta)?;
-            let mut collide = Vec::new();
-            for (i, r) in existing.iter().enumerate() {
-                if unique_match(meta, r, &values)
-                    || self.wr_index_collision(&ins.table, meta, r, &values, params)?
-                {
-                    collide.push(i);
-                }
-            }
+            // REPLACE can rebuild without them. When the clustered PK is the only
+            // uniqueness constraint, this seeks the PK instead of scanning the
+            // whole table on every row (see `wr_find_collisions`).
+            let (existing, collide) = self.wr_find_collisions(&ins.table, meta, &values, params)?;
             if !collide.is_empty() {
                 // An `ON CONFLICT … DO …` upsert clause intercepts the conflict when
                 // it targets the constraint the row collides on (a bare `ON CONFLICT`
