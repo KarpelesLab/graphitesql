@@ -32504,51 +32504,35 @@ impl Connection {
     /// PRIMARY KEY / a UNIQUE constraint, as `(existing, collide)` where `collide`
     /// indexes into `existing` — the shape the insert conflict handling expects.
     ///
-    /// Fast path: when the clustered PRIMARY KEY is the table's *only* uniqueness
-    /// constraint (no extra inline `UNIQUE`, no standalone unique index), the only
-    /// possible collision is a duplicate PK, detected by SEEKING the clustered
-    /// b-tree for this row's PK (O(log n)) rather than scanning the whole table
-    /// (O(n) per row → O(n²)). With no collision — the common bulk-insert case —
-    /// it returns empty without materializing the table. On an actual collision
-    /// (rare), or whenever there ARE secondary unique constraints (whose index
-    /// b-trees are rebuilt only at statement end, so a mid-loop seek would be
-    /// stale), it falls back to the authoritative full scan — REPLACE rewrites the
-    /// table from the returned `existing`, so that must be the complete row set.
+    /// Fast path: detect a collision by SEEKING each uniqueness source — the
+    /// clustered PRIMARY KEY b-tree plus every unique index (the automatic indexes
+    /// of the inline `UNIQUE` sets and any standalone `CREATE UNIQUE INDEX`, all
+    /// maintained incrementally as rows are inserted) — instead of scanning the
+    /// whole table on every row (O(log n) vs O(n) per row → O(n²)). With no
+    /// collision — the common bulk-insert case — it returns empty without
+    /// materializing the table. On an actual collision it falls back to the full
+    /// scan so REPLACE/upsert see the complete `existing` they rewrite from.
+    ///
+    /// `can_seek` must be false once a REPLACE / upsert DO UPDATE has rewritten the
+    /// clustered table this statement: that leaves the incrementally-maintained
+    /// indexes stale until the end-of-statement rebuild, so a seek could miss a
+    /// collision — fall back to the authoritative scan of the (always-current)
+    /// clustered table instead.
     fn wr_find_collisions(
         &self,
         table: &str,
         meta: &TableMeta,
         values: &[Value],
         params: &Params,
+        indexes: &[IndexMeta],
+        can_seek: bool,
     ) -> Result<(Vec<Vec<Value>>, Vec<usize>)> {
-        let pk_only = meta.unique.len() == 1
-            && !self
-                .indexes_of(table)?
-                .iter()
-                .any(|i| i.unique && autoindex_number(&i.name, table).is_none());
-        if pk_only {
-            let pk_len = meta.pk_len;
-            let realified = realify_columns_for_storage(meta, values);
-            let pk_key: Vec<Value> = meta.storage_order[..pk_len]
-                .iter()
-                .map(|&c| realified[c].clone())
-                .collect();
-            let pk_colls = wr_storage_collations(meta)[..pk_len].to_vec();
-            let pk_descs = meta.pk_descs().to_vec();
-            let hit = !crate::btree::index_seek_records(
-                self.backend.source(),
-                meta.root,
-                &pk_key,
-                &pk_colls,
-                &pk_descs,
-            )?
-            .is_empty();
-            if !hit {
-                return Ok((Vec::new(), Vec::new())); // no collision — the fast path
-            }
-            // A real PK collision: fall through to the full scan so REPLACE/upsert
-            // see the complete table.
+        if can_seek && !self.wr_seek_collision(meta, values, params, indexes)? {
+            return Ok((Vec::new(), Vec::new())); // no collision — the fast path
         }
+        // Authoritative full scan: a collision was found (REPLACE needs the whole
+        // `existing`), or the indexes can't be trusted after a rewrite this
+        // statement. The scan reads the clustered table, which is always current.
         let existing = self.scan_without_rowid(meta)?;
         let mut collide = Vec::new();
         for (i, r) in existing.iter().enumerate() {
@@ -32559,6 +32543,60 @@ impl Connection {
             }
         }
         Ok((existing, collide))
+    }
+
+    /// Whether `values` collides with an existing WITHOUT ROWID row on the PRIMARY
+    /// KEY or a UNIQUE constraint, decided purely by b-tree SEEKS: the clustered PK
+    /// b-tree for the PK, and each unique index (`indexes`, incrementally
+    /// maintained) by its leading key columns. A NULL key term or an excluding
+    /// partial predicate can't collide. See [`wr_find_collisions`] for when this
+    /// may be trusted (`can_seek`).
+    fn wr_seek_collision(
+        &self,
+        meta: &TableMeta,
+        values: &[Value],
+        params: &Params,
+        indexes: &[IndexMeta],
+    ) -> Result<bool> {
+        let src = self.backend.source();
+        // 1. Duplicate PRIMARY KEY: the clustered table b-tree is keyed PK-first.
+        let pk_len = meta.pk_len;
+        let realified = realify_columns_for_storage(meta, values);
+        let pk_key: Vec<Value> = meta.storage_order[..pk_len]
+            .iter()
+            .map(|&c| realified[c].clone())
+            .collect();
+        let pk_colls = wr_storage_collations(meta)[..pk_len].to_vec();
+        let pk_descs = meta.pk_descs().to_vec();
+        if !crate::btree::index_seek_records(src, meta.root, &pk_key, &pk_colls, &pk_descs)?
+            .is_empty()
+        {
+            return Ok(true);
+        }
+        // 2. Each UNIQUE index — the automatic indexes of the inline UNIQUE sets
+        //    plus standalone unique indexes — seeked by this row's leading key
+        //    columns; any existing entry there is a uniqueness violation.
+        for idx in indexes.iter().filter(|i| i.unique) {
+            if !self.row_in_index(idx, meta, values, None, params)? {
+                continue;
+            }
+            let key = self.index_key_values(idx, meta, values, 0, params)?;
+            if key.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
+            }
+            if !crate::btree::index_seek_records(
+                src,
+                idx.root,
+                &key,
+                &idx.collations,
+                idx.seek_descs(),
+            )?
+            .is_empty()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Insert one row's entries into every secondary index of a WITHOUT ROWID
@@ -32674,10 +32712,18 @@ impl Connection {
 
             // Reject a duplicate primary key, an inline UNIQUE constraint, or a
             // standalone UNIQUE index (incl. partial). Collect colliding rows so
-            // REPLACE can rebuild without them. When the clustered PK is the only
-            // uniqueness constraint, this seeks the PK instead of scanning the
-            // whole table on every row (see `wr_find_collisions`).
-            let (existing, collide) = self.wr_find_collisions(&ins.table, meta, &values, params)?;
+            // REPLACE can rebuild without them. Seeks each uniqueness source
+            // instead of scanning the whole table on every row (see
+            // `wr_find_collisions`); `!did_rewrite` guards that the incrementally
+            // maintained indexes are still current.
+            let (existing, collide) = self.wr_find_collisions(
+                &ins.table,
+                meta,
+                &values,
+                params,
+                &secondary_indexes,
+                !did_rewrite,
+            )?;
             if !collide.is_empty() {
                 // An `ON CONFLICT … DO …` upsert clause intercepts the conflict when
                 // it targets the constraint the row collides on (a bare `ON CONFLICT`
