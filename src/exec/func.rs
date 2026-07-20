@@ -1989,18 +1989,10 @@ fn json_extract(root: &super::json::Json, paths: &[Value], jsonb: bool) -> Resul
     })
 }
 
-/// Convert a constructor argument to JSON. If the source expression is itself a
-/// JSON-producing call (`json`, `json_array`, `json_object`), its text value is
-/// embedded as parsed JSON — mirroring SQLite's JSON subtype propagation — rather
-/// than quoted as a string.
-pub(crate) fn arg_to_json(val: &Value, expr: Option<&Expr>) -> super::json::Json {
-    arg_to_json_with_subtype(val, expr.is_some_and(produces_json))
-}
-
-/// The core of [`arg_to_json`], with the "argument carries the JSON subtype"
-/// decision made by the caller: when `subtype` holds, a TEXT value is spliced in
-/// as parsed JSON rather than quoted as a string.
-fn arg_to_json_with_subtype(val: &Value, subtype: bool) -> super::json::Json {
+/// Convert a constructor argument to JSON: when `subtype` holds (the argument
+/// carries SQLite's JSON subtype — see [`carries_json_subtype`]), a TEXT value is
+/// spliced in as parsed JSON rather than quoted as a string.
+pub(crate) fn arg_to_json_with_subtype(val: &Value, subtype: bool) -> super::json::Json {
     if let Value::Text(s) = val
         && subtype
         && let Some(j) = super::json::parse(s)
@@ -2019,7 +2011,7 @@ fn arg_to_json_with_subtype(val: &Value, subtype: bool) -> super::json::Json {
 /// runtime — which the JSON *scalar* constructors/editors can do because they
 /// hold the evaluation `ctx`. (The `json_group_*` aggregates cannot, and keep the
 /// static [`produces_json`] approximation.)
-fn carries_json_subtype(expr: &Expr, ctx: &EvalCtx) -> bool {
+pub(crate) fn carries_json_subtype(expr: &Expr, ctx: &EvalCtx) -> bool {
     if let Expr::Paren(inner) = expr {
         return carries_json_subtype(inner, ctx);
     }
@@ -2040,6 +2032,25 @@ fn carries_json_subtype(expr: &Expr, ctx: &EvalCtx) -> bool {
         );
     }
     false
+}
+
+/// Static, conservative test: could `expr` carry the JSON subtype at runtime?
+/// True for the statically-JSON forms ([`produces_json`]) AND a single-path
+/// `json_extract` (whose subtype is value-dependent — [`carries_json_subtype`]
+/// decides it at run time). The VDBE aggregate spike uses this to DECLINE such
+/// arguments (deferring to the tree-walker, which has the row `ctx`), since it
+/// evaluates arguments to bare values that no longer carry their source
+/// expression.
+pub(crate) fn might_carry_json_subtype(expr: &Expr) -> bool {
+    if let Expr::Paren(inner) = expr {
+        return might_carry_json_subtype(inner);
+    }
+    if produces_json(expr) {
+        return true;
+    }
+    matches!(expr,
+        Expr::Function { name, args, .. }
+            if name.eq_ignore_ascii_case("json_extract") && args.len() == 2)
 }
 
 /// Whether an expression *statically* yields a value carrying SQLite's JSON

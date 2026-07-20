@@ -37977,20 +37977,33 @@ impl Connection {
         // possibly multi-argument) per-row values, so they bypass the NULL-
         // stripping single-value collection used by the other aggregates.
         if lname == "json_group_array" || lname == "jsonb_group_array" {
-            let mut vals = Vec::new();
+            // Each element's JSON subtype is decided per row from the argument's
+            // source expression (`carries_json_subtype`, honoring a single-path
+            // `json_extract` that yields a container), so a `json_extract`-of-a-
+            // structure element embeds as JSON rather than quoting its text.
+            let mut items = Vec::new();
+            let mut seen: Vec<Value> = Vec::new();
             for &i in group {
                 let ctx = rows[i].ctx(columns, params).with_subqueries(self);
-                vals.push(eval::eval(&args[0], &ctx)?);
+                let v = eval::eval(&args[0], &ctx)?;
+                // `json_group_array(DISTINCT x)` dedupes the values (first-seen
+                // order), like other DISTINCT aggregates, before serializing.
+                if distinct
+                    && seen.iter().any(|s| {
+                        crate::value::cmp_values_coll(s, &v, crate::value::Collation::default())
+                            == core::cmp::Ordering::Equal
+                    })
+                {
+                    continue;
+                }
+                let subtype = args
+                    .first()
+                    .is_some_and(|e| func::carries_json_subtype(e, &ctx));
+                if distinct {
+                    seen.push(v.clone());
+                }
+                items.push(func::arg_to_json_with_subtype(&v, subtype));
             }
-            // `json_group_array(DISTINCT x)` dedupes the values (first-seen order),
-            // like other DISTINCT aggregates, before serializing.
-            if distinct {
-                dedup_values(&mut vals, crate::value::Collation::default());
-            }
-            let items: Vec<_> = vals
-                .iter()
-                .map(|v| func::arg_to_json(v, args.first()))
-                .collect();
             let arr = json::Json::Array(items);
             return Ok(if lname.starts_with("jsonb") {
                 Value::Blob(arr.to_jsonb())
@@ -38004,7 +38017,14 @@ impl Connection {
                 let ctx = rows[i].ctx(columns, params).with_subqueries(self);
                 let k = eval::eval(&args[0], &ctx)?;
                 let v = eval::eval(&args[1], &ctx)?;
-                pairs.push((eval::to_text(&k), None, func::arg_to_json(&v, args.get(1))));
+                let subtype = args
+                    .get(1)
+                    .is_some_and(|e| func::carries_json_subtype(e, &ctx));
+                pairs.push((
+                    eval::to_text(&k),
+                    None,
+                    func::arg_to_json_with_subtype(&v, subtype),
+                ));
             }
             let obj = json::Json::Object(pairs);
             return Ok(if lname.starts_with("jsonb") {

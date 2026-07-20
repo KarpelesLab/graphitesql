@@ -1068,7 +1068,10 @@ fn agg_kind_distinct(expr: &Expr) -> Option<AggCallSpec> {
         // which the finalizer uses — so a `json(x)`/`->` argument (whose text must
         // be spliced in unquoted) defers to the tree-walker.
         "json_group_array" | "jsonb_group_array"
-            if args.len() == 1 && !args.first().is_some_and(super::func::produces_json) =>
+            if args.len() == 1
+                && !args
+                    .first()
+                    .is_some_and(super::func::might_carry_json_subtype) =>
         {
             (
                 AggKind::JsonGroupArray {
@@ -1082,7 +1085,9 @@ fn agg_kind_distinct(expr: &Expr) -> Option<AggCallSpec> {
         // JSON subtype (the key is always text-coerced). `DISTINCT` is not
         // meaningful here — leave it to the tree-walker.
         "json_group_object" | "jsonb_group_object"
-            if args.len() == 2 && !*distinct && !super::func::produces_json(&args[1]) =>
+            if args.len() == 2
+                && !*distinct
+                && !super::func::might_carry_json_subtype(&args[1]) =>
         {
             (
                 AggKind::JsonGroupObject {
