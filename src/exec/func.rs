@@ -848,10 +848,13 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             }
         }
         "subtype" => {
-            // The value's subtype. graphite tracks no subtypes, so this is
-            // always 0 (SQLite also returns 0 for ordinary, non-JSON values).
+            // The value's subtype. graphite has no runtime subtype field, but the
+            // only subtype SQLite exposes here is the JSON subtype (74), which we
+            // decide from the argument's source expression (`carries_json_subtype`,
+            // the same rule the JSON constructors use). Ordinary values → 0.
             arity(&lname, args, 1)?;
-            Value::Integer(0)
+            let is_json = args.first().is_some_and(|e| carries_json_subtype(e, ctx));
+            Value::Integer(if is_json { 74 } else { 0 })
         }
         "sign" => {
             arity(&lname, args, 1)?;
