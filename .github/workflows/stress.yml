@@ -30,8 +30,8 @@ on:
         description: "Size of each overlarge blob (MiB)"
         default: "16"
       frag_keys:
-        description: "Random text-PK rows (WITHOUT ROWID; O(n^2) today, keep modest)"
-        default: "5000"
+        description: "Random text-PK rows (WITHOUT ROWID fragmentation test)"
+        default: "50000"
 
 permissions:
   contents: read
@@ -85,7 +85,7 @@ jobs:
       GSQL_VOLUME_ROWS: ${{ github.event.inputs.rows || '1500000' }}
       GSQL_VOLUME_BLOB_MB: ${{ github.event.inputs.blob_mb || '16' }}
       GSQL_VOLUME_BLOBS: "8"
-      GSQL_VOLUME_FRAG_KEYS: ${{ github.event.inputs.frag_keys || '5000' }}
+      GSQL_VOLUME_FRAG_KEYS: ${{ github.event.inputs.frag_keys || '50000' }}
     steps:
       - uses: actions/checkout@v6
       - name: Install Rust

@@ -12,14 +12,7 @@
 //!   * `GSQL_VOLUME_ROWS`     — rows in the many-rows test (default 100_000)
 //!   * `GSQL_VOLUME_BLOB_MB`  — size of each overlarge blob, MiB (default 4)
 //!   * `GSQL_VOLUME_BLOBS`    — how many overlarge blobs (default 6)
-//!   * `GSQL_VOLUME_FRAG_KEYS`— random text-PK rows for the fragmentation test (4_000)
-//!
-//! NOTE: `stress_volume_random_key_fragmentation` is currently bounded to a
-//! modest key count because inserting into a `WITHOUT ROWID` table is O(n²) today
-//! — `exec_insert_without_rowid` full-scans the table per row to check the PK /
-//! UNIQUE constraints instead of seeking the b-tree (`src/exec/mod.rs`). Raise the
-//! default once that collision check seeks instead of scans; the test already
-//! guards the *space* side (page count) of the fragmentation fix.
+//!   * `GSQL_VOLUME_FRAG_KEYS`— random text-PK rows for the fragmentation test (50_000)
 
 #![cfg(feature = "std")]
 
@@ -260,9 +253,7 @@ fn stress_volume_overlarge_blobs() {
 #[test]
 #[ignore = "heavy: random-key fragmentation shape; run via the stress workflow"]
 fn stress_volume_random_key_fragmentation() {
-    // Bounded low on purpose: WITHOUT ROWID insert is O(n²) today (per-row full
-    // scan in exec_insert_without_rowid). See the module note.
-    let keys = env_usize("GSQL_VOLUME_FRAG_KEYS", 4_000);
+    let keys = env_usize("GSQL_VOLUME_FRAG_KEYS", 50_000);
     let path = stress_db("volume-frag");
     rm_db(&path);
     let mut c = Connection::create(&path).unwrap();
