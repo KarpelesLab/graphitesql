@@ -32561,6 +32561,47 @@ impl Connection {
         Ok((existing, collide))
     }
 
+    /// Insert one row's entries into every secondary index of a WITHOUT ROWID
+    /// table, incrementally — mirroring the per-index key construction of
+    /// [`rebuild_wr_indexes`](Self::rebuild_wr_indexes) exactly (trailing-PK
+    /// dedup, comparison collations, DESC flags, partial-index predicate) so the
+    /// result is byte-identical to a full rebuild, one row at a time.
+    fn wr_insert_row_indexes(
+        &mut self,
+        meta: &TableMeta,
+        indexes: &[IndexMeta],
+        values: &[Value],
+        params: &Params,
+    ) -> Result<()> {
+        if indexes.is_empty() {
+            return Ok(());
+        }
+        let pk_cols = meta.storage_order[..meta.pk_len].to_vec();
+        let realified = realify_columns_for_storage(meta, values);
+        // Precompute each included index's key + comparison metadata before taking
+        // the writer borrow (a partial index this row is not in adds no entry).
+        type PlannedEntry = (u32, Vec<u8>, Vec<crate::value::Collation>, Vec<bool>);
+        let mut planned: Vec<PlannedEntry> = Vec::new();
+        for idx in indexes {
+            if !self.row_in_index(idx, meta, values, None, params)? {
+                continue;
+            }
+            let (trailing_pk, trailing_colls, trailing_descs) =
+                wr_trailing_pk(&idx.cols, &idx.collations, &pk_cols, meta);
+            let mut key_colls = idx.collations.clone();
+            key_colls.extend(trailing_colls);
+            let mut descs = idx.seek_descs().to_vec();
+            wr_extend_descs(&mut descs, &idx.collations, &trailing_descs);
+            let key = wr_index_key(&idx.cols, &trailing_pk, &realified);
+            planned.push((idx.root, key, key_colls, descs));
+        }
+        let w = self.backend.writer()?;
+        for (root, key, colls, descs) in &planned {
+            insert_index(w, *root, key, colls, descs)?;
+        }
+        Ok(())
+    }
+
     fn exec_insert_without_rowid(
         &mut self,
         ins: &Insert,
@@ -32589,6 +32630,13 @@ impl Connection {
                 .collect::<Result<_>>()?
         };
         let pk = &meta.storage_order[..meta.pk_len];
+        // Secondary indexes are maintained incrementally per inserted row (below);
+        // only a REPLACE / upsert rewrite — which rebuilds the clustered table but
+        // not its indexes — forces the full `rebuild_wr_indexes` at statement end.
+        // This keeps a bulk WITHOUT ROWID load O(n·log n) instead of rebuilding
+        // every index on every statement (O(n²) across many single-row inserts).
+        let secondary_indexes = self.indexes_of(&ins.table)?;
+        let mut did_rewrite = false;
         let mut affected = 0;
         for row_exprs in rows {
             if !is_default_values && row_exprs.len() != target.len() {
@@ -32661,6 +32709,7 @@ impl Connection {
                                 params,
                             )? {
                                 affected += 1;
+                                did_rewrite = true; // rewrote the clustered table
                             }
                             continue;
                         }
@@ -32703,6 +32752,7 @@ impl Connection {
                             .map(|(_, r)| r)
                             .collect();
                         self.rewrite_without_rowid(meta, kept.into_iter())?;
+                        did_rewrite = true;
                     }
                 }
             }
@@ -32723,6 +32773,12 @@ impl Connection {
                 &scolls,
                 meta.pk_descs(),
             )?;
+            // Maintain the secondary indexes incrementally for this new row. After
+            // a rewrite the incremental state is stale, so we stop and let the
+            // statement-end `rebuild_wr_indexes` restore all indexes from the table.
+            if !did_rewrite {
+                self.wr_insert_row_indexes(meta, &secondary_indexes, &values, params)?;
+            }
             self.record_session_change(
                 &ins.table,
                 meta,
@@ -32736,7 +32792,9 @@ impl Connection {
             }
             affected += 1;
         }
-        if affected > 0 {
+        // Only a rewrite (REPLACE / upsert DO UPDATE) invalidates the incremental
+        // index maintenance done above; otherwise the indexes are already current.
+        if affected > 0 && did_rewrite {
             self.rebuild_wr_indexes(meta, &ins.table)?;
         }
         Ok(affected)
