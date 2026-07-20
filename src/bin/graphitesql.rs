@@ -2601,6 +2601,7 @@ fn is_prepare_error(e: &graphitesql::Error, msg: &str, sql: &str) -> bool {
                 "AUTOINCREMENT", // "… is only allowed on …" / "… not allowed on WITHOUT ROWID …"
                 "cannot use DEFAULT on a generated column",
                 "cannot use window functions in recursive",
+                "circular reference", // a mutually-recursive CTE cycle
                 "generated columns cannot",
                 "must have at least one non-generated column",
                 "Cannot add a UNIQUE",
