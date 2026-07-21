@@ -14529,7 +14529,7 @@ impl Connection {
             let binding = if references_name(&cte.select, &cte.name) {
                 self.eval_recursive_cte(cte, params, outer_cap)?
             } else {
-                self.materialize_plain_cte(cte, params)?
+                self.materialize_plain_cte(cte, params, ctes)?
             };
             self.cte_env.borrow_mut().push(binding);
         }
@@ -14566,7 +14566,12 @@ impl Connection {
 
     /// Build the column metadata for a CTE from its body's output labels (or its
     /// explicit `(col, …)` list), labeled with the CTE name.
-    fn cte_columns(&self, cte: &Cte, body_cols: &[String]) -> Result<Vec<ColumnInfo>> {
+    fn cte_columns(
+        &self,
+        cte: &Cte,
+        body_cols: &[String],
+        origins: Option<&[ColOrigin]>,
+    ) -> Result<Vec<ColumnInfo>> {
         let names = if cte.columns.is_empty() {
             body_cols.to_vec()
         } else {
@@ -14582,23 +14587,41 @@ impl Connection {
             }
             cte.columns.clone()
         };
+        // A CTE column that is a direct column reference inherits the base column's
+        // affinity AND collation — exactly like a derived subquery, and matching
+        // SQLite (so `WITH t AS (SELECT a FROM base) SELECT DISTINCT a FROM t`
+        // dedups under `base.a`'s NOCASE). `origins` supplies each column's resolved
+        // `(affinity, collation)`; a computed column, or an unresolvable body
+        // (join / view / recursive / mixed compound), keeps NONE(BLOB)/BINARY.
         Ok(names
             .into_iter()
-            .map(|n| ColumnInfo {
-                name: n,
-                table: cte.name.clone(),
-                affinity: eval::Affinity::Blob,
-                collation: crate::value::Collation::default(),
-                schema: None,
-                hidden: false,
+            .enumerate()
+            .map(|(i, n)| {
+                let (affinity, collation) = origins
+                    .and_then(|o| o.get(i).copied())
+                    .unwrap_or((eval::Affinity::Blob, crate::value::Collation::default()));
+                ColumnInfo {
+                    name: n,
+                    table: cte.name.clone(),
+                    affinity,
+                    collation,
+                    schema: None,
+                    hidden: false,
+                }
             })
             .collect())
     }
 
     /// A non-recursive CTE: run its body once.
-    fn materialize_plain_cte(&self, cte: &Cte, params: &Params) -> Result<CteBinding> {
+    fn materialize_plain_cte(
+        &self,
+        cte: &Cte,
+        params: &Params,
+        ctes: &[Cte],
+    ) -> Result<CteBinding> {
         let result = self.run_select(&cte.select, params)?;
-        let columns = self.cte_columns(cte, &result.columns)?;
+        let origins = self.subquery_column_origins_in(&cte.select, ctes);
+        let columns = self.cte_columns(cte, &result.columns, origins.as_deref())?;
         let rows = result
             .rows
             .into_iter()
@@ -14736,7 +14759,9 @@ impl Connection {
             anchor_rows.extend(r.rows);
         }
         let body_cols = self.run_select(&anchor[0], params)?.columns;
-        let columns = self.cte_columns(cte, &body_cols)?;
+        // A recursive body is a self-referential compound, so its column origins
+        // don't resolve — keep the conservative NONE/BINARY default.
+        let columns = self.cte_columns(cte, &body_cols, None)?;
 
         // Resolve the recursive term's ORDER BY. Like any compound ORDER BY, each
         // term must name an output column — by 1-based position, or by the
