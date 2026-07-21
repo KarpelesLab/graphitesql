@@ -945,6 +945,16 @@ fn is_aggregate_expr(expr: &Expr) -> bool {
     )
 }
 
+/// True if an aggregate call appears anywhere in `e` (recursively) — so a
+/// projection like `sum(a) * 2` or `'n=' || count(*)`, not just a bare `count(*)`,
+/// routes to the aggregate fold. Window functions are NOT aggregates here (they run
+/// on the dedicated window path); [`collect_aggregates`] does not descend into them.
+fn expr_has_aggregate(e: &Expr) -> bool {
+    let mut v = Vec::new();
+    collect_aggregates(e, &mut v);
+    !v.is_empty()
+}
+
 /// True if an aggregate call or a window (`OVER …`) function appears anywhere
 /// within `e` (recursively, not just at the top level).
 fn expr_has_aggregate_or_window(e: &Expr) -> bool {
@@ -1215,42 +1225,30 @@ fn compile_aggregate_select(
     // argument's collation (`AggStep.collation` → `AggAcc.collation`), so a
     // non-BINARY declared column collation runs on the VDBE. An explicit `COLLATE`
     // argument still defers via `agg_kind_distinct` below.
-    // Every projection must be exactly one supported aggregate call. DISTINCT is
-    // supported here (the collected values are deduped at fold time), as is
-    // `FILTER (WHERE …)` (a non-passing row is skipped for that aggregate).
-    let mut slots: Vec<AggCallSpec> = Vec::new();
+    // Gather every distinct aggregate referenced by the projection and by HAVING into
+    // fold slots. Each projection need not BE a single aggregate: the rest of the
+    // expression (a constant, arithmetic over an aggregate, several aggregates in one
+    // term) is compiled against the finalized registers through bindings — the same
+    // binding-driven emission the grouped path uses. DISTINCT and `FILTER (WHERE …)`
+    // are supported per aggregate. An aggregate the fold can't express
+    // (`agg_kind_distinct` = None) makes the query defer, never a wrong result.
+    let mut agg_exprs: Vec<Expr> = Vec::new();
     for (e, _) in projections {
+        collect_aggregates(e, &mut agg_exprs);
+    }
+    if let Some(h) = &sel.having {
+        collect_aggregates(h, &mut agg_exprs);
+    }
+    let mut slots: Vec<AggCallSpec> = Vec::new();
+    for e in &agg_exprs {
         match agg_kind_distinct(e) {
             Some(spec) => slots.push(spec),
             None => return Err(Error::Unsupported("VDBE: unsupported aggregate")),
         }
     }
     let count = projections.len();
-    // An aggregate that appears ONLY in `HAVING` (not in the projection) still folds
-    // over the scan — collect each such distinct aggregate into an extra slot and
-    // record its `(expr -> register)` binding, so the `HAVING` predicate below reads
-    // its finalized value. A `HAVING` aggregate our fold can't express
-    // (`agg_kind_distinct` = None) makes the whole query defer, never a wrong result.
-    let mut having_binds: Vec<(Expr, usize)> = Vec::new();
-    if let Some(having) = &sel.having {
-        let mut hav_aggs = Vec::new();
-        collect_aggregates(having, &mut hav_aggs);
-        for h in hav_aggs {
-            // An aggregate already computed as a projection binds to its slot.
-            if projections.iter().any(|(e, _)| *e == h) {
-                continue;
-            }
-            match agg_kind_distinct(&h) {
-                Some(spec) => {
-                    having_binds.push((h, slots.len()));
-                    slots.push(spec);
-                }
-                None => return Err(Error::Unsupported("VDBE: unsupported aggregate")),
-            }
-        }
-    }
     // The hidden non-empty gate is a `count(*)` folded over the same scan; its
-    // finalized value lands in the slot after the projections and any HAVING extras.
+    // finalized value lands in the slot after the aggregate slots.
     let gate_reg = if gate_nonempty {
         let g = slots.len();
         slots.push((
@@ -1337,7 +1335,7 @@ fn compile_aggregate_select(
     if let Op::Rewind { target } = &mut c.ops[rewind] {
         *target = end;
     }
-    // Finalize each slot into its output register, then emit the single row.
+    // Finalize each aggregate slot into its register.
     for (slot, (kind, _, _, _, _, _, _)) in slots.iter().enumerate() {
         c.ops.push(Op::AggFinal {
             slot,
@@ -1345,27 +1343,49 @@ fn compile_aggregate_select(
             dest: slot,
         });
     }
+    // Bind each aggregate to its finalized register. A bare (non-aggregate) column
+    // has no per-row value in a bare aggregate, so forbid raw column reads: an
+    // unhandled projection/HAVING shape then bails and the tree-walker handles it —
+    // never a wrong result.
+    c.forbid_raw_columns = true;
+    for (k, e) in agg_exprs.iter().enumerate() {
+        c.bindings.push((e.clone(), k));
+    }
+    // Project the output row into a contiguous block (reserved before compiling, so a
+    // projection's temporaries don't overwrite it). HAVING may then reference an
+    // output alias too (matching the tree-walker; table/aggregate bindings win).
+    let out_base = c.next_reg;
+    c.next_reg += count;
+    for (i, (expr, _)) in projections.iter().enumerate() {
+        c.compile_expr_into(expr, out_base + i)?;
+    }
+    for (i, (expr, label)) in projections.iter().enumerate() {
+        let is_bare_col = matches!(expr, Expr::Column { .. });
+        if !is_bare_col && !columns.iter().any(|cn| cn.eq_ignore_ascii_case(label)) {
+            c.bindings.push((
+                Expr::Column {
+                    schema: None,
+                    table: None,
+                    column: label.clone(),
+                    quoted: false,
+                    span: Span::none(),
+                },
+                out_base + i,
+            ));
+        }
+    }
     // The single output row is gated by zero or more `IfFalse` checks (each
     // backpatched to jump past `ResultRow` to the final `Halt`):
     //   * the hidden non-empty gate: a constant-`GROUP BY` emits no row over an
     //     empty table, so skip when the row count (register `gate_reg`) is 0;
-    //   * a `HAVING`: bind each projection aggregate's source expression to its
-    //     finalized register (and each HAVING-only aggregate to its extra slot), then
-    //     compile the predicate. A HAVING term that isn't a foldable aggregate over
-    //     this scan (e.g. a bare column) stays unbound, so `compile_expr` raises an
-    //     Err and the whole query defers to the tree-walker — never a wrong result.
+    //   * a `HAVING`: its aggregates are already bound, so compile the predicate and
+    //     skip the row when it is not true.
     let mut gates: Vec<usize> = Vec::new();
     if let Some(reg) = gate_reg {
         gates.push(c.ops.len());
         c.ops.push(Op::IfFalse { reg, target: 0 });
     }
     if let Some(having) = &sel.having {
-        for (i, (e, _)) in projections.iter().enumerate() {
-            c.bindings.push((e.clone(), i));
-        }
-        for (e, slot) in &having_binds {
-            c.bindings.push((e.clone(), *slot));
-        }
         let hreg = c.compile_expr(having)?;
         gates.push(c.ops.len());
         c.ops.push(Op::IfFalse {
@@ -1373,7 +1393,10 @@ fn compile_aggregate_select(
             target: 0,
         });
     }
-    c.ops.push(Op::ResultRow { start: 0, count });
+    c.ops.push(Op::ResultRow {
+        start: out_base,
+        count,
+    });
     let halt = c.ops.len();
     c.ops.push(Op::Halt);
     for g in gates {
@@ -2770,8 +2793,14 @@ pub fn compile_table_select_opts(
             allow_correlated,
         );
     }
-    // An all-aggregate projection (no GROUP BY) folds the scan into one row.
-    if projections.iter().any(|(e, _)| is_aggregate_expr(e)) {
+    // A projection referencing an aggregate (at any depth, no GROUP BY) folds the
+    // scan into one row: `SELECT sum(a)*2 FROM t`, `SELECT 'n', count(*) FROM t`. A
+    // bare (non-aggregate) column in that projection has no per-row value and defers
+    // inside the aggregate path. HAVING is applied there (its aggregates fold too).
+    // Note: an aggregate appearing ONLY in HAVING does NOT make this an aggregate
+    // query — SQLite requires a GROUP BY or a result-column aggregate — so that case
+    // falls through to the HAVING decline below and the tree-walker rejects it.
+    if projections.iter().any(|(e, _)| expr_has_aggregate(e)) {
         return compile_aggregate_select(
             sel,
             columns,
@@ -2782,9 +2811,9 @@ pub fn compile_table_select_opts(
             false,
         );
     }
-    // A `HAVING` on a non-grouped, non-aggregate query is either an aggregate
-    // filter or invalid; either way the plain scan path does not model it, so
-    // defer to the tree-walker (which evaluates or rejects it).
+    // A `HAVING` on a non-grouped query with no result-column aggregate is not an
+    // aggregate query; the plain scan path does not model it, so defer to the
+    // tree-walker (which evaluates or, per SQLite, rejects it).
     if sel.having.is_some() {
         return Err(Error::Unsupported("VDBE: HAVING without GROUP BY"));
     }
