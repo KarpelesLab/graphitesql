@@ -3401,12 +3401,6 @@ pub fn compile_aggregate_join(
     // collation (`AggStep.collation`), so a non-BINARY declared column collation runs
     // on the VDBE; an explicit `COLLATE` argument still defers via `agg_kind_distinct`.
     let projections = expand_projections(sel, columns, tables)?;
-    // A row-level DISTINCT dedups under each output column's collation; the VDBE's
-    // DistinctCheck compares under BINARY, so an explicit `COLLATE` on a projection
-    // (`SELECT DISTINCT a COLLATE NOCASE`) must defer to the tree-walker.
-    if sel.distinct && projections_have_explicit_collation(&projections) {
-        return Err(Error::Unsupported("VDBE: explicit COLLATE with DISTINCT"));
-    }
     // Every projection must be exactly one supported aggregate call. DISTINCT is
     // supported (the collected values are deduped at fold time, BINARY only — a
     // non-BINARY collation already bailed above).
@@ -3558,12 +3552,9 @@ pub fn compile_group_join(
         return Err(Error::Unsupported("VDBE: GROUP BY join requires GROUP BY"));
     }
     let projections = expand_projections(sel, columns, tables)?;
-    // A row-level DISTINCT dedups under each output column's collation; the VDBE's
-    // DistinctCheck compares under BINARY, so an explicit `COLLATE` on a projection
-    // (`SELECT DISTINCT a COLLATE NOCASE`) must defer to the tree-walker.
-    if sel.distinct && projections_have_explicit_collation(&projections) {
-        return Err(Error::Unsupported("VDBE: explicit COLLATE with DISTINCT"));
-    }
+    // DISTINCT + collation is resolved by the delegated `compile_group_select`
+    // (`distinct_collations`), so a grouped-join DISTINCT with a declared or
+    // explicit `COLLATE` runs on the VDBE too.
     compile_group_select(
         sel,
         columns,
