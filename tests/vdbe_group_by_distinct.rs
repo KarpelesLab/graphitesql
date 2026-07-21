@@ -7,9 +7,9 @@
 //!
 //! Dedup resolves each output column's collation into the `DistinctCheck`
 //! (`distinct_collations`), so a declared-NOCASE grouped column and an explicit
-//! projection `COLLATE` both run on the VDBE. Only a bare aggregate (no GROUP BY)
-//! with DISTINCT and an explicit `COLLATE` still defers, per the
-//! `bare_aggregate_distinct_collation_falls_back` test.
+//! projection `COLLATE` both run on the VDBE. A bare aggregate (no GROUP BY) with
+//! DISTINCT and an explicit `COLLATE` also runs — it yields one row, so DISTINCT is
+//! a no-op there (see `bare_aggregate_distinct_collation_runs_on_vdbe`).
 //!
 //! `query_vdbe` errors on any fallback, so a passing query proves the VDBE ran the
 //! grouped DISTINCT itself. Checked against the tree-walker and sqlite3 3.50.4.
@@ -82,13 +82,21 @@ fn grouped_distinct_runs_on_vdbe_and_matches_tree_walker() {
 }
 
 #[test]
-fn bare_aggregate_distinct_collation_falls_back() {
+fn bare_aggregate_distinct_collation_runs_on_vdbe() {
     let c = conn();
-    // A *bare aggregate* (no GROUP BY) + DISTINCT + explicit `COLLATE` still
-    // defers — the bare-aggregate compiler resolves no post-row-dedup collation.
+    // A *bare aggregate* (no GROUP BY) yields exactly one output row, so DISTINCT is
+    // a no-op there — its explicit `COLLATE` (which would only affect a dedup that
+    // never removes anything) is irrelevant, and the query now runs on the VDBE and
+    // matches the tree-walker.
     let q = "SELECT DISTINCT max(a) COLLATE NOCASE FROM t";
-    assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
-    assert!(c.query(q).is_ok(), "tree-walker should run {q}");
+    let got = c
+        .query_vdbe(q)
+        .unwrap_or_else(|e| panic!("expected VDBE to run {q}: {e}"));
+    assert_eq!(
+        got.rows,
+        c.query(q).unwrap().rows,
+        "VDBE vs tree-walker on {q}"
+    );
 }
 
 #[test]

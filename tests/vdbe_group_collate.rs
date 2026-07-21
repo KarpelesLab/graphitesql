@@ -6,9 +6,9 @@
 //! are byte-identical to the previous BINARY-only path.
 //!
 //! A `SELECT DISTINCT … GROUP BY` now runs on the VDBE too — its post-group dedup
-//! resolves each output column's collation into the `DistinctCheck`. Still
-//! deferred: a *bare aggregate* (no GROUP BY) + `DISTINCT` + explicit `COLLATE`.
-//! Verified against sqlite3 3.50.4.
+//! resolves each output column's collation into the `DistinctCheck`. A bare
+//! aggregate (no GROUP BY) + `DISTINCT` + explicit `COLLATE` also runs (one row, so
+//! DISTINCT is a no-op). Verified against sqlite3 3.50.4.
 
 #![cfg(feature = "std")]
 
@@ -98,13 +98,18 @@ fn grouped_over_collation_key_runs_on_vdbe() {
 }
 
 #[test]
-fn collation_sensitive_grouped_shapes_defer() {
+fn bare_aggregate_distinct_collation_runs_on_vdbe() {
     let c = conn();
-    // Still deferred: a *bare aggregate* (no GROUP BY) + DISTINCT + explicit
-    // `COLLATE` — the bare-aggregate compiler does not resolve a post-row-dedup
-    // collation, so it falls back to the tree-walker.
+    // A *bare aggregate* (no GROUP BY) + DISTINCT + explicit `COLLATE` yields one
+    // row, so DISTINCT is a no-op there and its collation is irrelevant — it now runs
+    // on the VDBE and matches the tree-walker.
     let q = "SELECT DISTINCT max(c) COLLATE NOCASE FROM t";
-    assert!(c.query_vdbe(q).is_err(), "expected VDBE to defer on {q}");
-    // The deferred result (tree-walker) still runs.
-    assert!(c.query(q).is_ok(), "tree-walker failed on {q}");
+    let got = c
+        .query_vdbe(q)
+        .unwrap_or_else(|e| panic!("expected VDBE to run {q}: {e}"));
+    assert_eq!(
+        got.rows,
+        c.query(q).unwrap().rows,
+        "VDBE vs tree-walker on {q}"
+    );
 }

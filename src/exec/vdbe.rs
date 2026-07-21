@@ -1138,29 +1138,6 @@ fn agg_kind_distinct(expr: &Expr) -> Option<AggCallSpec> {
     Some((kind, arg, *distinct, filter, order, sep, arg2))
 }
 
-/// True if any `DISTINCT` output projection carries an explicit non-BINARY
-/// `COLLATE` *anywhere* within it. A row-level `DISTINCT` dedups under each
-/// output column's collation; the VDBE's `DistinctCheck` compares under BINARY,
-/// and the per-site bail only inspects a column's *declared* collation — so an
-/// explicit `COLLATE` (`SELECT DISTINCT a COLLATE NOCASE`) would otherwise dedup
-/// under the wrong sequence. The walk is conservative (a nested `COLLATE` that
-/// does not reach the top-level result collation still defers), which is safe:
-/// the tree-walker handles every such row correctly.
-fn projections_have_explicit_collation(projections: &[(Expr, String)]) -> bool {
-    let mut found = false;
-    for (e, _) in projections {
-        crate::exec::window::visit(e, &mut |node| {
-            if let Expr::Collate { collation, .. } = node
-                && crate::value::resolve_collation_name(collation)
-                    .is_some_and(|c| c != Collation::Binary)
-            {
-                found = true;
-            }
-        });
-    }
-    found
-}
-
 /// The text of a constant `group_concat`/`string_agg` separator, matching the
 /// tree-walker (which evaluates the separator argument in a rowless context and
 /// renders it with `to_text`). Returns `None` for a non-literal separator so the
@@ -1218,7 +1195,11 @@ fn compile_aggregate_select(
     // scanned row.
     gate_nonempty: bool,
 ) -> Result<Program> {
-    if !sel.order_by.is_empty() || sel.limit.is_some() || sel.offset.is_some() || sel.distinct {
+    // A bare aggregate (or a constant `GROUP BY`) yields at most one output row, so
+    // `DISTINCT` is a no-op here — accept it (its explicit projection `COLLATE`, which
+    // would only affect a dedup that never removes anything, is likewise irrelevant).
+    // `ORDER BY`/`LIMIT`/`OFFSET` are not no-ops, so those still defer.
+    if !sel.order_by.is_empty() || sel.limit.is_some() || sel.offset.is_some() {
         return Err(Error::Unsupported("VDBE: bare aggregate only"));
     }
     // The aggregate min/max reduction and DISTINCT dedup now fold under the
@@ -1426,6 +1407,7 @@ fn collect_aggregates(expr: &Expr, out: &mut Vec<Expr>) {
         Expr::Paren(inner)
         | Expr::Unary { expr: inner, .. }
         | Expr::IsNull { expr: inner, .. }
+        | Expr::Collate { expr: inner, .. }
         | Expr::Cast { expr: inner, .. } => collect_aggregates(inner, out),
         Expr::Binary { left, right, .. } => {
             collect_aggregates(left, out);
@@ -2739,15 +2721,9 @@ pub fn compile_table_select_opts(
     // A row-level DISTINCT dedups under each output column's collation. The plain
     // single-table scan resolves an explicit projection `COLLATE` into its
     // `DistinctCheck` (below), so `SELECT DISTINCT a COLLATE NOCASE FROM t` runs on
-    // the VDBE. The grouped / aggregate DISTINCT paths still dedup under BINARY, so
-    // an explicit `COLLATE` there defers to the tree-walker.
-    // A GROUP BY output's DISTINCT is collation-resolved by `compile_group_select`;
-    // only the *bare aggregate* + DISTINCT + explicit `COLLATE` case still defers.
-    let bare_aggregate =
-        sel.group_by.is_empty() && projections.iter().any(|(e, _)| is_aggregate_expr(e));
-    if sel.distinct && bare_aggregate && projections_have_explicit_collation(&projections) {
-        return Err(Error::Unsupported("VDBE: explicit COLLATE with DISTINCT"));
-    }
+    // the VDBE. A GROUP BY output's DISTINCT is collation-resolved by
+    // `compile_group_select`. A bare aggregate yields one row, so its DISTINCT (with
+    // or without an explicit `COLLATE`) is a no-op handled in `compile_aggregate_select`.
     // A constant `LIMIT 0` yields no rows for any query shape: emit a program
     // that halts immediately (the column labels are still reported).
     if matches!(&sel.limit, Some(Expr::Literal(Literal::Integer(0)))) {
