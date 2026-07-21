@@ -735,25 +735,32 @@ pub fn compile_const_select(sel: &Select) -> Result<Program> {
     // projection (and any `WHERE`) is still compiled even when suppressed, so a
     // bad column reference defers to the tree-walker's error rather than being
     // silently dropped (e.g. `SELECT x LIMIT 0` must still raise `no such column`).
-    let limit_zero = match &sel.limit {
-        None => false,
-        Some(e) => match fold_const_int(e) {
-            Some(n) => n == 0,
-            None => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
-        },
-    };
-    let offset_skips = match &sel.offset {
-        None => false,
-        Some(e) => match fold_const_int(e) {
-            Some(n) => n > 0,
-            None => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
-        },
-    };
-    if !(limit_zero || offset_skips) {
-        c.ops.push(Op::ResultRow { start: 0, count });
+    // Compile the bounds into registers (constant or not — a non-integer bound
+    // gets SQLite's `datatype mismatch` via `Op::MustBeInt`), then skip the single
+    // row when `OFFSET` is positive or `LIMIT` is exactly 0. A negative `LIMIT` is
+    // unlimited (emit) and a non-positive `OFFSET` skips nothing, both as in SQLite.
+    let limit_reg = c.compile_limit_reg(&sel.limit)?;
+    let offset_reg = c.compile_offset_reg(&sel.offset)?;
+    let mut row_skips: Vec<usize> = Vec::new();
+    if let Some(r) = offset_reg {
+        let at = c.ops.len();
+        c.ops.push(Op::IfPosDecr { reg: r, target: 0 }); // OFFSET > 0 skips the row
+        row_skips.push(at);
     }
+    if let Some(r) = limit_reg {
+        let at = c.ops.len();
+        c.ops.push(Op::IfFalse { reg: r, target: 0 }); // LIMIT 0 (false) skips the row
+        row_skips.push(at);
+    }
+    c.ops.push(Op::ResultRow { start: 0, count });
     let halt = c.ops.len();
     c.ops.push(Op::Halt);
+    for at in row_skips {
+        match &mut c.ops[at] {
+            Op::IfPosDecr { target, .. } | Op::IfFalse { target, .. } => *target = halt,
+            _ => {}
+        }
+    }
     if let Some(at) = skip
         && let Op::IfFalse { target, .. } = &mut c.ops[at]
     {
