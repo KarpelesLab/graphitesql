@@ -45545,7 +45545,7 @@ fn check_positional_terms(group_by: &[Expr], order_by: &[OrderTerm], ncols: usiz
 /// and in range. A non-integral real (`1.9`), text with trailing garbage
 /// (`'2abc'`), NULL, or a blob is a `datatype mismatch` error — SQLite does not
 /// silently truncate or treat NULL as zero here.
-fn must_be_int(v: Value) -> Result<i64> {
+pub(crate) fn must_be_int(v: Value) -> Result<i64> {
     fn real_exact(r: f64) -> Result<i64> {
         if r.is_finite()
             && r == crate::util::float::trunc(r)

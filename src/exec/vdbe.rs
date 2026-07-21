@@ -167,6 +167,11 @@ pub enum Op {
     IfMatched { cursor: usize, target: usize },
     /// Decrement `reg`; jump to `target` once it reaches zero (a `LIMIT` counter).
     DecrJumpZero { reg: usize, target: usize },
+    /// Coerce `reg` to an integer exactly as SQLite's `OP_MustBeInt` (used for a
+    /// non-constant `LIMIT`/`OFFSET`): an integer, a whole real, or numeric text
+    /// naming a whole number stays; anything else (NULL, blob, a fractional real,
+    /// non-numeric text) raises `datatype mismatch`. Runs once, before the scan.
+    MustBeInt { reg: usize },
     /// If `reg` is positive, decrement it and jump to `target` (an `OFFSET` skip).
     IfPosDecr { reg: usize, target: usize },
     /// `dest = -reg` (numeric negation).
@@ -2049,30 +2054,8 @@ fn compile_group_select(
     }
 
     // Optional LIMIT/OFFSET counters (constant integers only).
-    let limit_reg = match &sel.limit {
-        None => None,
-        Some(e) => match fold_const_int(e) {
-            // A negative LIMIT means "unlimited" in SQLite.
-            Some(n) if n < 0 => None,
-            Some(n) => {
-                let r = c.alloc();
-                c.ops.push(Op::Integer { value: n, dest: r });
-                Some(r)
-            }
-            None => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
-        },
-    };
-    let offset_reg = match &sel.offset {
-        None => None,
-        Some(e) => match fold_const_int(e) {
-            Some(n) => {
-                let r = c.alloc();
-                c.ops.push(Op::Integer { value: n, dest: r });
-                Some(r)
-            }
-            None => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
-        },
-    };
+    let limit_reg = c.compile_limit_reg(&sel.limit)?;
+    let offset_reg = c.compile_offset_reg(&sel.offset)?;
 
     // Resolve each ORDER BY term to an output-column expression where it names one
     // — by position, a result-column alias, or such a reference wrapped in
@@ -2814,32 +2797,10 @@ pub fn compile_table_select_opts(
     };
     // Optional LIMIT (constant integer only): a counter register decremented
     // after each emitted row, halting the loop at zero.
-    let limit_reg = match &sel.limit {
-        None => None,
-        Some(e) => match fold_const_int(e) {
-            // A negative LIMIT means "unlimited" in SQLite.
-            Some(n) if n < 0 => None,
-            Some(n) => {
-                let r = c.alloc();
-                c.ops.push(Op::Integer { value: n, dest: r });
-                Some(r)
-            }
-            None => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
-        },
-    };
+    let limit_reg = c.compile_limit_reg(&sel.limit)?;
     // Optional OFFSET (constant integer only): a counter decremented while it is
     // positive, skipping that many qualifying rows before any are emitted.
-    let offset_reg = match &sel.offset {
-        None => None,
-        Some(e) => match fold_const_int(e) {
-            Some(n) => {
-                let r = c.alloc();
-                c.ops.push(Op::Integer { value: n, dest: r });
-                Some(r)
-            }
-            None => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
-        },
-    };
+    let offset_reg = c.compile_offset_reg(&sel.offset)?;
     // With `ORDER BY`, the scan feeds a sorter and `LIMIT`/`OFFSET` apply to the
     // sorted emit loop instead of to the scan itself.
     let ordering = !sel.order_by.is_empty();
@@ -3226,30 +3187,8 @@ pub fn compile_join2(
     };
     // LIMIT / OFFSET counters (constant integer only; negative LIMIT = unlimited,
     // non-positive OFFSET = none).
-    let limit_reg = match &sel.limit {
-        None => None,
-        Some(e) => match fold_const_int(e) {
-            Some(n) if n < 0 => None,
-            Some(n) => {
-                let r = c.alloc();
-                c.ops.push(Op::Integer { value: n, dest: r });
-                Some(r)
-            }
-            None => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
-        },
-    };
-    let offset_reg = match &sel.offset {
-        None => None,
-        Some(e) => match fold_const_int(e) {
-            Some(n) if n <= 0 => None,
-            Some(n) => {
-                let r = c.alloc();
-                c.ops.push(Op::Integer { value: n, dest: r });
-                Some(r)
-            }
-            None => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
-        },
-    };
+    let limit_reg = c.compile_limit_reg(&sel.limit)?;
+    let offset_reg = c.compile_offset_reg(&sel.offset)?;
     // With ORDER BY, the nested loop stages each surviving row + its sort keys
     // into a sorter; LIMIT/OFFSET then apply to the sorted emit loop, not the
     // scan. Reserve contiguous key registers (one per ORDER BY term).
@@ -3727,30 +3666,8 @@ pub fn compile_left_join2(
         subqueries: Vec::new(),
         group_emit_keys: Vec::new(),
     };
-    let limit_reg = match &sel.limit {
-        None => None,
-        Some(e) => match fold_const_int(e) {
-            Some(n) if n < 0 => None,
-            Some(n) => {
-                let r = c.alloc();
-                c.ops.push(Op::Integer { value: n, dest: r });
-                Some(r)
-            }
-            None => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
-        },
-    };
-    let offset_reg = match &sel.offset {
-        None => None,
-        Some(e) => match fold_const_int(e) {
-            Some(n) if n <= 0 => None,
-            Some(n) => {
-                let r = c.alloc();
-                c.ops.push(Op::Integer { value: n, dest: r });
-                Some(r)
-            }
-            None => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
-        },
-    };
+    let limit_reg = c.compile_limit_reg(&sel.limit)?;
+    let offset_reg = c.compile_offset_reg(&sel.offset)?;
     let matched = c.alloc();
     // With ORDER BY, both emission points stage their row + sort keys into a
     // sorter; LIMIT/OFFSET then apply to the sorted emit loop, not the scan.
@@ -4147,30 +4064,8 @@ pub fn compile_full_join2(
         subqueries: Vec::new(),
         group_emit_keys: Vec::new(),
     };
-    let limit_reg = match &sel.limit {
-        None => None,
-        Some(e) => match fold_const_int(e) {
-            Some(n) if n < 0 => None,
-            Some(n) => {
-                let r = c.alloc();
-                c.ops.push(Op::Integer { value: n, dest: r });
-                Some(r)
-            }
-            None => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
-        },
-    };
-    let offset_reg = match &sel.offset {
-        None => None,
-        Some(e) => match fold_const_int(e) {
-            Some(n) if n <= 0 => None,
-            Some(n) => {
-                let r = c.alloc();
-                c.ops.push(Op::Integer { value: n, dest: r });
-                Some(r)
-            }
-            None => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
-        },
-    };
+    let limit_reg = c.compile_limit_reg(&sel.limit)?;
+    let offset_reg = c.compile_offset_reg(&sel.offset)?;
     let matched = c.alloc();
     // With ORDER BY, all three emission points stage their row + sort keys into one
     // sorter; LIMIT/OFFSET then apply to the sorted emit loop, not the two passes.
@@ -4656,30 +4551,8 @@ pub fn compile_left_join_n(
         subqueries: Vec::new(),
         group_emit_keys: Vec::new(),
     };
-    let limit_reg = match &sel.limit {
-        None => None,
-        Some(e) => match fold_const_int(e) {
-            Some(n) if n < 0 => None,
-            Some(n) => {
-                let r = c.alloc();
-                c.ops.push(Op::Integer { value: n, dest: r });
-                Some(r)
-            }
-            None => return Err(Error::Unsupported("VDBE: only constant integer LIMIT")),
-        },
-    };
-    let offset_reg = match &sel.offset {
-        None => None,
-        Some(e) => match fold_const_int(e) {
-            Some(n) if n <= 0 => None,
-            Some(n) => {
-                let r = c.alloc();
-                c.ops.push(Op::Integer { value: n, dest: r });
-                Some(r)
-            }
-            None => return Err(Error::Unsupported("VDBE: only constant integer OFFSET")),
-        },
-    };
+    let limit_reg = c.compile_limit_reg(&sel.limit)?;
+    let offset_reg = c.compile_offset_reg(&sel.offset)?;
     let matched_regs: Vec<usize> = (0..n_cursors - 1).map(|_| c.alloc()).collect();
     let ordering = !sel.order_by.is_empty();
     let key_specs = if ordering {
@@ -5040,6 +4913,53 @@ impl Compiler {
         let dest = self.alloc();
         self.compile_expr_into(expr, dest)?;
         Ok(dest)
+    }
+
+    /// Compile a `LIMIT` expression into a register holding its integer counter, or
+    /// `None` when absent or a compile-time-constant negative (unlimited in
+    /// SQLite). A constant fast-paths to `Op::Integer`; anything else compiles as a
+    /// rowless expression followed by `Op::MustBeInt` — SQLite's
+    /// `computeLimitRegisters`. Emit this once, before the scan loop.
+    fn compile_limit_reg(&mut self, limit: &Option<Expr>) -> Result<Option<usize>> {
+        let Some(e) = limit else { return Ok(None) };
+        match fold_const_int(e) {
+            Some(n) if n < 0 => Ok(None), // a constant negative LIMIT is unlimited
+            Some(n) => {
+                let r = self.alloc();
+                self.ops.push(Op::Integer { value: n, dest: r });
+                Ok(Some(r))
+            }
+            None => Ok(Some(self.compile_count_reg(e)?)),
+        }
+    }
+
+    /// Compile an `OFFSET` expression into a register (see
+    /// [`compile_limit_reg`](Self::compile_limit_reg)). A negative/zero offset
+    /// skips nothing at run time (`IfPosDecr` treats it as 0), so no
+    /// negative-to-`None` fast path is needed.
+    fn compile_offset_reg(&mut self, offset: &Option<Expr>) -> Result<Option<usize>> {
+        let Some(e) = offset else { return Ok(None) };
+        match fold_const_int(e) {
+            Some(n) => {
+                let r = self.alloc();
+                self.ops.push(Op::Integer { value: n, dest: r });
+                Ok(Some(r))
+            }
+            None => Ok(Some(self.compile_count_reg(e)?)),
+        }
+    }
+
+    /// Compile a non-constant `LIMIT`/`OFFSET` count into a register: a *rowless*
+    /// expression (a column reference bails via `forbid_raw_columns`, so an invalid
+    /// one defers to the tree-walker's exact `no such column`) plus `Op::MustBeInt`.
+    fn compile_count_reg(&mut self, e: &Expr) -> Result<usize> {
+        let prev = self.forbid_raw_columns;
+        self.forbid_raw_columns = true;
+        let r = self.compile_expr(e);
+        self.forbid_raw_columns = prev;
+        let r = r?;
+        self.ops.push(Op::MustBeInt { reg: r });
+        Ok(r)
     }
 
     /// Compile `expr` so its value lands in register `dest`.
@@ -5955,13 +5875,21 @@ fn run_rows_multi_impl(
                     pc = *target;
                 }
             }
+            Op::MustBeInt { reg } => {
+                regs[*reg] = Value::Integer(crate::exec::must_be_int(regs[*reg].clone())?);
+            }
             Op::DecrJumpZero { reg, target } => {
                 let n = match &regs[*reg] {
                     Value::Integer(i) => *i,
                     other => crate::exec::eval::to_i64(other),
                 };
                 regs[*reg] = Value::Integer(n - 1);
-                if n - 1 <= 0 {
+                // SQLite's `OP_DecrJumpZero` jumps only on an *exact* zero, so a
+                // negative counter (a run-time negative `LIMIT` = unlimited) never
+                // triggers. A positive `LIMIT` counts down and hits zero exactly;
+                // `LIMIT 0` is handled by the preceding `IfFalse` skip, so the
+                // counter here is never zero on entry.
+                if n - 1 == 0 {
                     pc = *target;
                 }
             }
