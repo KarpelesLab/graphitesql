@@ -5,10 +5,11 @@
 //! and the sorter — so dedup precedes ordering and the row counters, matching
 //! SQLite (dedup-then-sort-then-limit).
 //!
-//! Dedup compares output rows under BINARY. The table-wide collation guard already
-//! defers a non-BINARY declared column; an explicit `COLLATE` on an otherwise-
-//! BINARY output column is caught by a dedicated guard (see
-//! `distinct_collation_output_falls_back`).
+//! Dedup resolves each output column's collation into the `DistinctCheck`
+//! (`distinct_collations`), so a declared-NOCASE grouped column and an explicit
+//! projection `COLLATE` both run on the VDBE. Only a bare aggregate (no GROUP BY)
+//! with DISTINCT and an explicit `COLLATE` still defers, per the
+//! `bare_aggregate_distinct_collation_falls_back` test.
 //!
 //! `query_vdbe` errors on any fallback, so a passing query proves the VDBE ran the
 //! grouped DISTINCT itself. Checked against the tree-walker and sqlite3 3.50.4.
@@ -42,6 +43,9 @@ const QUERIES: &[&str] = &[
     "SELECT DISTINCT count(*) FROM t GROUP BY g HAVING count(*) >= 1 ORDER BY 1",
     // DISTINCT over a computed key with an aggregate alongside.
     "SELECT DISTINCT n%2, count(*) FROM t GROUP BY n%2 ORDER BY 1",
+    // An explicit `COLLATE NOCASE` on a DISTINCT output column dedups under NOCASE
+    // via the grouped `DistinctCheck`'s resolved collations (runs on the VDBE).
+    "SELECT DISTINCT a COLLATE NOCASE FROM t GROUP BY g ORDER BY 1",
 ];
 
 fn conn() -> Connection {
@@ -78,11 +82,11 @@ fn grouped_distinct_runs_on_vdbe_and_matches_tree_walker() {
 }
 
 #[test]
-fn distinct_collation_output_falls_back() {
+fn bare_aggregate_distinct_collation_falls_back() {
     let c = conn();
-    // An explicit `COLLATE NOCASE` on a DISTINCT output column would dedup
-    // case-insensitively; the VDBE's `DistinctCheck` is BINARY, so it defers.
-    let q = "SELECT DISTINCT a COLLATE NOCASE FROM t GROUP BY g ORDER BY 1";
+    // A *bare aggregate* (no GROUP BY) + DISTINCT + explicit `COLLATE` still
+    // defers — the bare-aggregate compiler resolves no post-row-dedup collation.
+    let q = "SELECT DISTINCT max(a) COLLATE NOCASE FROM t";
     assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
     assert!(c.query(q).is_ok(), "tree-walker should run {q}");
 }

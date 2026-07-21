@@ -5,9 +5,10 @@
 //! (declared `NOCASE`/`RTRIM`/custom). With all-BINARY collations the comparisons
 //! are byte-identical to the previous BINARY-only path.
 //!
-//! Still deferred to the tree-walker: a `SELECT DISTINCT … GROUP BY` (its
-//! post-group dedup compares output rows under BINARY) and an explicit `COLLATE`
-//! group key. Verified against sqlite3 3.50.4.
+//! A `SELECT DISTINCT … GROUP BY` now runs on the VDBE too — its post-group dedup
+//! resolves each output column's collation into the `DistinctCheck`. Still
+//! deferred: a *bare aggregate* (no GROUP BY) + `DISTINCT` + explicit `COLLATE`.
+//! Verified against sqlite3 3.50.4.
 
 #![cfg(feature = "std")]
 
@@ -78,6 +79,14 @@ fn grouped_over_collation_key_runs_on_vdbe() {
         // now runs on the VDBE — `group_key_collations` resolves the override.
         "SELECT c COLLATE NOCASE, count(*) FROM t GROUP BY c COLLATE NOCASE ORDER BY 1",
         "SELECT a COLLATE BINARY, count(*) FROM t GROUP BY a COLLATE BINARY ORDER BY 1",
+        // A `SELECT DISTINCT … GROUP BY` post-group dedup honors each output
+        // column's collation (`distinct_collations`), so a declared-NOCASE grouped
+        // column and an explicit projection `COLLATE` both run on the VDBE. (The `a`
+        // queries exclude the NULL row: the `-ascii` harness drops an all-empty
+        // single-column row, so it would spuriously differ.)
+        "SELECT DISTINCT a FROM t WHERE a IS NOT NULL GROUP BY a, x ORDER BY 1",
+        "SELECT DISTINCT a COLLATE NOCASE FROM t WHERE a IS NOT NULL GROUP BY a ORDER BY 1",
+        "SELECT DISTINCT c FROM t GROUP BY c, x ORDER BY 1",
     ] {
         let r = c
             .query_vdbe(q)
@@ -91,11 +100,11 @@ fn grouped_over_collation_key_runs_on_vdbe() {
 #[test]
 fn collation_sensitive_grouped_shapes_defer() {
     let c = conn();
-    // Still deferred: a `SELECT DISTINCT … GROUP BY` — its post-grouping dedup
-    // compares the output rows under BINARY (the grouped `DistinctCheck` carries no
-    // collations).
-    let q = "SELECT DISTINCT a FROM t GROUP BY a, x";
+    // Still deferred: a *bare aggregate* (no GROUP BY) + DISTINCT + explicit
+    // `COLLATE` — the bare-aggregate compiler does not resolve a post-row-dedup
+    // collation, so it falls back to the tree-walker.
+    let q = "SELECT DISTINCT max(c) COLLATE NOCASE FROM t";
     assert!(c.query_vdbe(q).is_err(), "expected VDBE to defer on {q}");
-    // The deferred result (tree-walker, unchanged by this feature) still runs.
+    // The deferred result (tree-walker) still runs.
     assert!(c.query(q).is_ok(), "tree-walker failed on {q}");
 }

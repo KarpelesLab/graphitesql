@@ -1732,14 +1732,11 @@ fn compile_group_select(
     allow_correlated: bool,
 ) -> Result<Program> {
     // Group-key matching/ordering, the min()/max() companion, and each aggregate's
-    // DISTINCT dedup / min-max reduction are now collation-aware (per-key collations
-    // on `GroupStep`/`sort_groups_by_key`; the argument collation on `AggSpec`). The
-    // one comparison still done under BINARY is a `SELECT DISTINCT … GROUP BY`'s
-    // post-grouping dedup (the grouped `DistinctCheck` carries no collations), so
-    // defer only that case when a projected column carries a non-BINARY collation.
-    if sel.distinct && collations.iter().any(|c| *c != Collation::Binary) {
-        return Err(Error::Unsupported("VDBE: non-BINARY collation in GROUP BY"));
-    }
+    // DISTINCT dedup / min-max reduction are collation-aware (per-key collations on
+    // `GroupStep`/`sort_groups_by_key`; the argument collation on `AggSpec`), and the
+    // post-grouping `SELECT DISTINCT` dedup now resolves each output column's
+    // collation into its `DistinctCheck` (`distinct_collations`), so a collated
+    // `GROUP BY` + `DISTINCT` runs on the VDBE.
     let has_having = sel.having.is_some();
     let has_order = !sel.order_by.is_empty();
     let has_limit = sel.limit.is_some() || sel.offset.is_some();
@@ -1839,20 +1836,8 @@ fn compile_group_select(
         })
         .collect();
 
-    // `SELECT DISTINCT` dedups output rows under BINARY (`DistinctCheck` below). An
-    // output expression carrying a non-BINARY collation — an explicit `COLLATE` on
-    // an otherwise-BINARY column — would dedup case-insensitively in SQLite (a
-    // non-BINARY *declared* column already bailed via the table-wide guard above),
-    // so defer that case to the tree-walker.
-    if sel.distinct
-        && projections
-            .iter()
-            .any(|(e, _)| c.col_collation(e).is_some_and(|co| co != Collation::Binary))
-    {
-        return Err(Error::Unsupported(
-            "VDBE: non-BINARY collation in DISTINCT output",
-        ));
-    }
+    // `SELECT DISTINCT` dedups output rows under each column's collation, resolved
+    // into the `DistinctCheck` below (`distinct_collations`).
 
     // The plain path (no HAVING / ORDER BY / LIMIT, all keys bare columns) keeps
     // its compact `GroupEmit`. A computed key needs the binding-driven general
@@ -2200,7 +2185,7 @@ fn compile_group_select(
             start: out_start,
             count,
             target: 0,
-            collations: alloc::vec::Vec::new(),
+            collations: c.distinct_collations(projections),
         });
         Some(at)
     } else {
@@ -2699,9 +2684,11 @@ pub fn compile_table_select_opts(
     // `DistinctCheck` (below), so `SELECT DISTINCT a COLLATE NOCASE FROM t` runs on
     // the VDBE. The grouped / aggregate DISTINCT paths still dedup under BINARY, so
     // an explicit `COLLATE` there defers to the tree-walker.
-    let grouped_or_aggregate =
-        !sel.group_by.is_empty() || projections.iter().any(|(e, _)| is_aggregate_expr(e));
-    if sel.distinct && grouped_or_aggregate && projections_have_explicit_collation(&projections) {
+    // A GROUP BY output's DISTINCT is collation-resolved by `compile_group_select`;
+    // only the *bare aggregate* + DISTINCT + explicit `COLLATE` case still defers.
+    let bare_aggregate =
+        sel.group_by.is_empty() && projections.iter().any(|(e, _)| is_aggregate_expr(e));
+    if sel.distinct && bare_aggregate && projections_have_explicit_collation(&projections) {
         return Err(Error::Unsupported("VDBE: explicit COLLATE with DISTINCT"));
     }
     // A constant `LIMIT 0` yields no rows for any query shape: emit a program
