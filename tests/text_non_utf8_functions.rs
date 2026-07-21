@@ -59,6 +59,19 @@ fn char_semantic_functions_on_non_utf8_match_sqlite3() {
         eprintln!("sqlite3 not found; skipping");
         return;
     }
+    // This test asserts SQLite's *byte-wise* handling of non-UTF-8 text (the
+    // ASCII/no-ICU build, which graphite matches and which CI pins). A Unicode/ICU
+    // sqlite build instead lossily decodes invalid bytes to U+FFFD before case
+    // folding / pattern matching (`upper(x'ff')` -> `EFBFBD`, and `LIKE` etc. then
+    // diverge), so the differential comparison is meaningless there. Feature-probe
+    // the oracle and skip on a Unicode build rather than differential-test a
+    // compile-time option (see the `ci-vs-local-sqlite-icu` lesson).
+    if sqlite3("SELECT hex(upper(x'ff'))") != "FF" {
+        eprintln!(
+            "oracle is a Unicode sqlite build (mangles invalid UTF-8); skipping byte-wise text test"
+        );
+        return;
+    }
     let mut g = Connection::open_memory().unwrap();
 
     // ---- length(): counts non-continuation bytes up to the first NUL. `||`
@@ -134,10 +147,9 @@ fn char_semantic_functions_on_non_utf8_match_sqlite3() {
     );
 
     // ---- upper()/lower() on a *non-UTF-8* text: fold ASCII letters byte-wise and
-    // preserve the invalid bytes (SQLite's byte-wise toupper/tolower). Only the
-    // non-UTF-8 path is asserted — it is byte-wise in both an ASCII-only and an
-    // ICU sqlite build (Unicode folding is undefined over invalid bytes), so this
-    // is oracle-independent, unlike *valid* non-ASCII folding (café → CAFÉ/CAFé).
+    // preserve the invalid bytes (SQLite's byte-wise toupper/tolower on an ASCII
+    // build; a Unicode build lossily decodes to U+FFFD first, handled by the
+    // whole-test oracle probe above).
     assert_matches(
         &mut g,
         &[
