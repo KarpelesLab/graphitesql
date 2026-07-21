@@ -6,9 +6,9 @@
 //! ORDER BY / LIMIT over the view, a view joined to a base table, and a join- or
 //! compound-bodied view all run without falling back.
 //!
-//! Deferred to the tree-walker (asserted separately), never run wrong:
-//!   * a view column carrying a *non-BINARY* collation — the VDBE compare / group paths
-//!     assume BINARY keys, so a `NOCASE` view column defers.
+//! A view column carrying a *non-BINARY* collation flows through to the VDBE's
+//! collation-aware compare / GROUP BY / DISTINCT / aggregate paths (like a base-table
+//! column), so a `NOCASE` view column runs — see `nocase_view_column_runs_on_vdbe`.
 //!
 //! A view has no rowid, so a `rowid` reference over the view resolves to nothing and the
 //! query defers (like a derived table) — but a view body that *projects* `rowid` under an
@@ -123,18 +123,30 @@ fn view_source_matches_sqlite3() {
 }
 
 #[test]
-fn nocase_view_column_defers() {
+fn nocase_view_column_runs_on_vdbe() {
     let mut c = conn();
     c.execute("CREATE TABLE w(k TEXT COLLATE NOCASE, val INTEGER)")
         .unwrap();
-    c.execute("INSERT INTO w VALUES ('A',1),('b',2)").unwrap();
+    c.execute("INSERT INTO w VALUES ('A',1),('a',2),('b',3)")
+        .unwrap();
     c.execute("CREATE VIEW vw AS SELECT k, val FROM w").unwrap();
-    // The view column `k` carries NOCASE, which the VDBE compare path can't honour —
-    // the view source defers to the tree-walker (which matches SQLite: `k='a'` finds 'A').
-    let q = "SELECT k FROM vw WHERE k = 'a'";
-    assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
-    assert_eq!(
-        c.query(q).unwrap().rows,
-        vec![vec![Value::Text("A".into())]]
-    );
+    // A view column carrying a non-BINARY collation now flows through to the VDBE's
+    // collation-aware compare / GROUP / DISTINCT paths (like a base-table column), so
+    // these run on the VDBE and honour NOCASE — `k='a'` matches 'A' and 'a', DISTINCT
+    // folds them together — matching the tree-walker and SQLite.
+    for q in [
+        "SELECT k FROM vw WHERE k = 'a' ORDER BY val",
+        "SELECT DISTINCT k FROM vw ORDER BY k",
+        "SELECT k, count(*) FROM vw GROUP BY k ORDER BY k",
+        "SELECT count(DISTINCT k) FROM vw",
+    ] {
+        let got = c
+            .query_vdbe(q)
+            .unwrap_or_else(|e| panic!("expected VDBE to run {q}: {e}"));
+        assert_eq!(
+            got.rows,
+            c.query(q).unwrap().rows,
+            "VDBE vs tree-walker on {q}"
+        );
+    }
 }

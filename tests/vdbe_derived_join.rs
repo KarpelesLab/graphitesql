@@ -5,11 +5,13 @@
 //! affinity-sensitive outer `WHERE` / `ORDER BY` over the derived column matches
 //! sqlite (a numeric base column keeps NUMERIC affinity, not the BLOB default).
 //!
+//! A body carrying a *non-BINARY* collation column runs — its collation flows
+//! through to the VDBE's collation-aware compare / GROUP / DISTINCT paths, exactly as
+//! a base-table column's does (see `plain_join_body_with_collation_column_runs_on_vdbe`).
+//!
 //! Deferred to the tree-walker (asserted separately), never run wrong:
 //!   * a NATURAL / USING join body — its shared column is coalesced, which a
 //!     bare-name origin lookup across both sources can't disambiguate.
-//!   * a body carrying a *non-BINARY* collation column — the VDBE grouped / aggregate
-//!     paths assume BINARY keys.
 //!   * a compound (UNION/…) body — no single positional origin per column.
 //!
 //! `query_vdbe` errors on any fallback, so a passing query proves the VDBE handled
@@ -117,20 +119,39 @@ fn derived_join_matches_sqlite3() {
 }
 
 #[test]
-fn natural_using_and_collation_bodies_defer() {
-    let mut c = conn();
-    c.execute("CREATE TABLE w(k TEXT COLLATE NOCASE, v INTEGER)")
-        .unwrap();
-    c.execute("INSERT INTO w VALUES ('A',1),('b',2)").unwrap();
-    // A NATURAL / USING join body (coalesced shared column) and a non-BINARY
-    // collation body each defer to the tree-walker, which still runs them. (A
-    // same-affinity compound body now runs — see `vdbe_derived_compound.rs`.)
+fn natural_using_bodies_defer() {
+    let c = conn();
+    // A NATURAL / USING join body coalesces the shared column, which
+    // `subquery_column_origins` can't resolve by a bare-name lookup — so the derived
+    // source defers to the tree-walker, which still runs it. (A same-affinity compound
+    // body now runs — see `vdbe_derived_compound.rs`.)
     for q in [
         "SELECT g FROM (SELECT g FROM t NATURAL JOIN u) x ORDER BY 1",
         "SELECT g FROM (SELECT g FROM t JOIN u USING(g)) x ORDER BY 1",
-        "SELECT x.k FROM (SELECT w.k, t.g FROM w JOIN t ON w.v=t.g) x WHERE x.k='a'",
     ] {
         assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
         assert!(c.query(q).is_ok(), "tree-walker should run {q}");
     }
+}
+
+#[test]
+fn plain_join_body_with_collation_column_runs_on_vdbe() {
+    let mut c = conn();
+    c.execute("CREATE TABLE w(k TEXT COLLATE NOCASE, v INTEGER)")
+        .unwrap();
+    c.execute("INSERT INTO w VALUES ('A',1),('b',2)").unwrap();
+    // A *plain* (explicit-ON, qualified-projection) join body resolves each output
+    // column's origin, so its non-BINARY `k` column carries NOCASE through to the
+    // VDBE's collation-aware compare — `x.k='a'` matches 'A', on the VDBE, exactly as
+    // the tree-walker and SQLite do.
+    let q = "SELECT x.k FROM (SELECT w.k, t.g FROM w JOIN t ON w.v=t.g) x WHERE x.k='a'";
+    let got = c
+        .query_vdbe(q)
+        .unwrap_or_else(|e| panic!("expected VDBE to run {q}: {e}"));
+    assert_eq!(
+        got.rows,
+        c.query(q).unwrap().rows,
+        "VDBE vs tree-walker on {q}"
+    );
+    assert_eq!(got.rows, vec![vec![Value::Text("A".into())]]);
 }

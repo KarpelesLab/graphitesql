@@ -9,8 +9,11 @@
 //! A `NATURAL`/`USING` join (coalesced columns) runs too — see the dedicated
 //! `vdbe_window_natural_join.rs` and `natural_join_view_window_runs_on_vdbe` below.
 //!
+//! A view column carrying a *non-BINARY* collation now runs — its collation flows
+//! through to the VDBE's collation-aware paths (see
+//! `nocase_view_in_join_window_runs_on_vdbe`).
+//!
 //! Deferred to the tree-walker (asserted separately), never run wrong:
-//!   * a view column carrying a *non-BINARY* collation (the base scan refuses it).
 //!   * a `rowid` reference (a joined row has no single rowid).
 //!
 //! `query_vdbe` errors on any fallback, so a passing query proves the VDBE handled the
@@ -123,15 +126,21 @@ fn natural_join_view_window_runs_on_vdbe() {
 }
 
 #[test]
-fn nocase_view_in_join_window_defers() {
+fn nocase_view_in_join_window_runs_on_vdbe() {
     let mut c = conn();
     c.execute("CREATE TABLE w(k TEXT COLLATE NOCASE, v INTEGER)")
         .unwrap();
     c.execute("INSERT INTO w VALUES ('A',1),('b',2)").unwrap();
     c.execute("CREATE VIEW vw AS SELECT k, v FROM w").unwrap();
-    // The view column `k` carries NOCASE — the base scan refuses it, so the join
-    // window query defers to the tree-walker.
+    // The view column `k` carries NOCASE; its collation flows through to the VDBE, so
+    // the windowed join over the view runs there — matching the tree-walker and SQLite.
     let q = "SELECT t.a, vw.k, count(*) OVER () FROM t JOIN vw ON t.g = vw.v";
-    assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
-    assert!(c.query(q).is_ok(), "tree-walker should run {q}");
+    let got = c
+        .query_vdbe(q)
+        .unwrap_or_else(|e| panic!("expected VDBE to run {q}: {e}"));
+    assert_eq!(
+        got.rows,
+        c.query(q).unwrap().rows,
+        "VDBE vs tree-walker on {q}"
+    );
 }

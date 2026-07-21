@@ -8,8 +8,11 @@
 //! materializes the joined rows. The window evaluation runs in the shared
 //! `finish_from_rows` tail.
 //!
+//! A derived column carrying a *non-BINARY* collation now runs — its collation flows
+//! through to the VDBE's collation-aware paths (see
+//! `nocase_derived_in_join_window_runs_on_vdbe`).
+//!
 //! Deferred to the tree-walker (asserted separately), never run wrong:
-//!   * a derived column carrying a *non-BINARY* collation (the base scan refuses it).
 //!   * a `NATURAL`/`USING` join (coalesced columns) — still resolved structurally.
 //!   * a `rowid` reference (a joined row has no single rowid).
 //!
@@ -114,14 +117,21 @@ fn window_derived_join_matches_sqlite3() {
 }
 
 #[test]
-fn nocase_derived_in_join_window_defers() {
+fn nocase_derived_in_join_window_runs_on_vdbe() {
     let mut c = conn();
     c.execute("CREATE TABLE w(k TEXT COLLATE NOCASE, v INTEGER)")
         .unwrap();
     c.execute("INSERT INTO w VALUES ('A',1),('b',2)").unwrap();
-    // The derived column `k` carries NOCASE — the base scan refuses it, so the join
-    // window query defers to the tree-walker.
+    // The derived column `k` carries NOCASE; its origin resolves through the derived
+    // body, so the collation flows through to the VDBE and the windowed join query
+    // runs there — matching the tree-walker and SQLite.
     let q = "SELECT x.k, count(*) OVER () FROM (SELECT k, v FROM w) x JOIN u ON x.v = u.g";
-    assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
-    assert!(c.query(q).is_ok(), "tree-walker should run {q}");
+    let got = c
+        .query_vdbe(q)
+        .unwrap_or_else(|e| panic!("expected VDBE to run {q}: {e}"));
+    assert_eq!(
+        got.rows,
+        c.query(q).unwrap().rows,
+        "VDBE vs tree-walker on {q}"
+    );
 }

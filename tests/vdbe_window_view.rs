@@ -5,10 +5,11 @@
 //! columns and rows stay in lockstep. The window evaluation itself runs in the shared
 //! `finish_from_rows` tail, exactly as for a plain-table window source.
 //!
+//! A view column carrying a *non-BINARY* collation now runs — its collation flows
+//! through to the VDBE's collation-aware paths (see
+//! `nocase_view_column_window_runs_on_vdbe`).
+//!
 //! Deferred to the tree-walker (asserted separately), never run wrong:
-//!   * a view column carrying a *non-BINARY* collation — the base scan's `scan_one`
-//!     refuses a NOCASE view column (the VDBE compare path assumes BINARY keys), so
-//!     the whole window query defers.
 //!   * a `rowid` reference over the view — a view has no rowid, so (like a derived /
 //!     CTE window source) any `rowid`/`_rowid_`/`oid` reference defers. A view body
 //!     that *projects* `rowid` under an alias exposes an ordinary column that runs.
@@ -115,17 +116,24 @@ fn window_view_matches_sqlite3() {
 }
 
 #[test]
-fn nocase_view_column_window_defers() {
+fn nocase_view_column_window_runs_on_vdbe() {
     let mut c = conn();
     c.execute("CREATE TABLE w(k TEXT COLLATE NOCASE, val INTEGER)")
         .unwrap();
     c.execute("INSERT INTO w VALUES ('A',1),('b',2)").unwrap();
     c.execute("CREATE VIEW vw AS SELECT k, val FROM w").unwrap();
-    // The view column `k` carries NOCASE, which the base scan refuses — the window
-    // query defers to the tree-walker (which still runs it).
+    // The view column `k` carries NOCASE; its collation flows through to the VDBE, so
+    // the windowed query over the view (with an ORDER BY on the collated column) runs
+    // there — matching the tree-walker and SQLite.
     let q = "SELECT k, count(*) OVER () FROM vw ORDER BY 1";
-    assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
-    assert!(c.query(q).is_ok(), "tree-walker should run {q}");
+    let got = c
+        .query_vdbe(q)
+        .unwrap_or_else(|e| panic!("expected VDBE to run {q}: {e}"));
+    assert_eq!(
+        got.rows,
+        c.query(q).unwrap().rows,
+        "VDBE vs tree-walker on {q}"
+    );
 }
 
 #[test]

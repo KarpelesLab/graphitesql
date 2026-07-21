@@ -655,15 +655,22 @@ fn subquery_from_matches_tree_walker() {
         );
     }
 
-    // A subquery over a non-BINARY base column defers (its derived collation can't
-    // be safely inherited); the tree-walker handles it.
+    // A subquery over a non-BINARY base column runs: the derived column inherits the
+    // base column's NOCASE collation, which flows through to the VDBE's collation-aware
+    // compare — `a = 'a'` finds 'A', matching the tree-walker and SQLite.
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE u(a TEXT COLLATE NOCASE)").unwrap();
     c.execute("INSERT INTO u VALUES ('A')").unwrap();
-    assert!(
-        c.query_vdbe("SELECT a FROM (SELECT a FROM u) WHERE a = 'a'")
-            .is_err()
+    let q = "SELECT a FROM (SELECT a FROM u) WHERE a = 'a'";
+    let got = c
+        .query_vdbe(q)
+        .unwrap_or_else(|e| panic!("expected VDBE to run {q}: {e}"));
+    assert_eq!(
+        got.rows,
+        c.query(q).unwrap().rows,
+        "VDBE vs tree-walker on {q}"
     );
+    assert_eq!(got.rows, vec![vec![Value::Text("A".into())]]);
 }
 
 #[test]

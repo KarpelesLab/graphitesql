@@ -2489,28 +2489,17 @@ impl Connection {
                 let origins = self
                     .subquery_column_origins(sub)
                     .ok_or(Error::Unsupported("VDBE: complex subquery source"))?;
-                // Keep the conservative all-BINARY collation posture (the VDBE
-                // grouped / aggregate paths assume BINARY group/agg keys); a
-                // non-BINARY derived column defers to the tree-walker.
-                if origins
-                    .iter()
-                    .any(|(_, c)| *c != crate::value::Collation::default())
-                {
-                    return Err(Error::Unsupported(
-                        "VDBE: subquery over a non-BINARY column",
-                    ));
-                }
                 let result = self.run_select(sub, &eval::Params::default())?;
                 if result.columns.len() != origins.len() {
                     return Err(Error::Unsupported("VDBE: subquery column count mismatch"));
                 }
                 let columns = result.columns;
                 let tables = columns.iter().map(|_| qualifier.clone()).collect();
+                // A derived column's `(affinity, collation)` flow through to the
+                // VDBE's collation-aware GROUP / DISTINCT / aggregate paths, exactly
+                // as a base table's declared collation does (see `vdbe_group_collate`).
                 let affinities = origins.iter().map(|(a, _)| *a).collect();
-                let collations = columns
-                    .iter()
-                    .map(|_| crate::value::Collation::default())
-                    .collect();
+                let collations = origins.iter().map(|(_, co)| *co).collect();
                 return Ok((columns, tables, affinities, collations, result.rows, None));
             }
             // `NOT INDEXED` forces a full table scan — exactly what the VDBE does,
@@ -2524,21 +2513,15 @@ impl Connection {
             // A view `FROM` source: materialize it exactly as the tree-walker does
             // (running its stored body), then expose the view's output columns — their
             // `(affinity, collation)` come from `try_view`'s origin resolution, so an
-            // outer `WHERE` / `ORDER BY` over a view column coerces correctly. Keep the
-            // conservative all-BINARY posture: a view column carrying a non-BINARY
-            // collation defers (the VDBE grouped / aggregate paths assume BINARY keys).
-            // A view has no rowid, so a `rowid` reference over it resolves to nothing
-            // and the query defers (like a derived table).
+            // outer `WHERE` / `ORDER BY` over a view column coerces correctly, and a
+            // non-BINARY view column flows through to the VDBE's collation-aware GROUP /
+            // DISTINCT / aggregate paths just like a base-table column (see
+            // `vdbe_group_collate`). A view has no rowid, so a `rowid` reference over it
+            // resolves to nothing and the query defers (like a derived table).
             if tr.schema.is_none() && self.is_view(&tr.name) {
                 let (cinfos, inrows) = self
                     .try_view(&tr.name, tr.alias.as_deref(), &eval::Params::default())?
                     .ok_or(Error::Unsupported("VDBE: view not found"))?;
-                if cinfos
-                    .iter()
-                    .any(|ci| ci.collation != crate::value::Collation::default())
-                {
-                    return Err(Error::Unsupported("VDBE: view over a non-BINARY column"));
-                }
                 let columns = cinfos.iter().map(|ci| ci.name.clone()).collect();
                 let tables = cinfos.iter().map(|ci| ci.table.clone()).collect();
                 let affinities = cinfos.iter().map(|ci| ci.affinity).collect();

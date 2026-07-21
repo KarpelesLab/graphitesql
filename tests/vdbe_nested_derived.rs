@@ -6,8 +6,9 @@
 //!
 //! A body that is a NATURAL/USING join, a compound, a view, a CTE, or a
 //! table-valued function still defers to the tree-walker (`subquery_column_origins`
-//! returns `None`), as does any derived column with a non-BINARY collation. (A
-//! *plain* join body now runs — see `vdbe_derived_join.rs`.)
+//! returns `None`). A derived column with a non-BINARY collation now runs — its
+//! collation flows through to the VDBE's collation-aware paths. (A *plain* join body
+//! also runs — see `vdbe_derived_join.rs`.)
 //!
 //! `query_vdbe` errors on any fallback, so a passing query proves the VDBE ran
 //! the nested source. Checked against the tree-walker and sqlite3 3.50.4.

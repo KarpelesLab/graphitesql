@@ -10,9 +10,10 @@
 //! WHERE v = '2'` returned no rows where SQLite (and now graphite) returns `[2]` — the
 //! view column `g`'s INTEGER affinity was lost across the wrapper.
 //!
-//! Deferred to the tree-walker (asserted separately), never run wrong:
-//!   * a view whose column carries a *non-BINARY* collation — the VDBE compare/group
-//!     paths assume BINARY keys, so a `NOCASE` view column body defers.
+//! A view whose column carries a *non-BINARY* collation runs: the origin resolves
+//! through the view to the base column, so the collation flows through to the VDBE's
+//! collation-aware compare / GROUP / DISTINCT paths (see
+//! `nocase_view_column_body_runs_on_vdbe`).
 //!
 //! `query_vdbe` errors on any fallback, so a passing query proves the VDBE handled the
 //! view-bodied derived source. Checked against the tree-walker and sqlite3 3.50.4.
@@ -135,19 +136,23 @@ fn derived_over_view_coerces_outer_predicate() {
 }
 
 #[test]
-fn nocase_view_column_body_defers() {
+fn nocase_view_column_body_runs_on_vdbe() {
     let mut c = conn();
     c.execute("CREATE TABLE w(k TEXT COLLATE NOCASE, v INTEGER)")
         .unwrap();
     c.execute("INSERT INTO w VALUES ('A',1),('b',2)").unwrap();
     c.execute("CREATE VIEW vw AS SELECT k, v FROM w").unwrap();
-    // The view column `k` carries NOCASE, which the VDBE compare path can't honour —
-    // the derived body defers to the tree-walker, which still runs it (and matches
-    // SQLite: `k = 'a'` finds 'A' under NOCASE).
+    // The view column `k` carries NOCASE; its origin resolves through the view to the
+    // base column, so the collation flows through to the VDBE's collation-aware
+    // compare — `k = 'a'` finds 'A' on the VDBE, matching the tree-walker and SQLite.
     let q = "SELECT k FROM (SELECT k FROM vw) x WHERE k = 'a'";
-    assert!(c.query_vdbe(q).is_err(), "expected VDBE fallback for {q}");
+    let got = c
+        .query_vdbe(q)
+        .unwrap_or_else(|e| panic!("expected VDBE to run {q}: {e}"));
     assert_eq!(
+        got.rows,
         c.query(q).unwrap().rows,
-        vec![vec![Value::Text("A".into())]]
+        "VDBE vs tree-walker on {q}"
     );
+    assert_eq!(got.rows, vec![vec![Value::Text("A".into())]]);
 }
