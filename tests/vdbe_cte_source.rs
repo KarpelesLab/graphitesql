@@ -2,8 +2,11 @@
 //! `WITH` is materialized into the CTE environment before scanning, so the CTE's
 //! rows are pulled straight from there (the CTE's name or alias is the row
 //! qualifier; an explicit `WITH name(cols…)` list renames the body's columns). The
-//! per-column affinity is resolved through the body — a constant/`VALUES` body
-//! carries none, otherwise it flows through the single-source chain.
+//! per-column affinity AND collation are resolved through the body — a
+//! constant/`VALUES` body carries none (BINARY), otherwise both flow through the
+//! single-source chain, so a CTE column referencing a `COLLATE NOCASE`/`RTRIM`
+//! base column dedups/groups under that collation on the VDBE's collation-aware
+//! paths (the same ones a base-table column uses).
 //!
 //! A body that reads a *single-level* sibling CTE now runs too (see
 //! `vdbe_cte_sibling.rs` for the full matrix); a two-or-more-level sibling chain,
@@ -22,7 +25,10 @@ const SETUP: &str = "\
     INSERT INTO t VALUES\n\
       (1,'x',10),(1,'y',20),\n\
       (2,'z',5),(2,'w',7),\n\
-      (3,'q',100);\n";
+      (3,'q',100);\n\
+    CREATE TABLE tc(u TEXT COLLATE NOCASE, r TEXT COLLATE RTRIM, k INTEGER);\n\
+    INSERT INTO tc VALUES\n\
+      ('A','p ',1),('a','p',2),('B','q',3),('a','p  ',4);\n";
 
 // Each query references a CTE in its FROM clause. ORDER BY keys are deterministic
 // so row order is stable for a direct comparison.
@@ -41,6 +47,17 @@ const QUERIES: &[&str] = &[
     "WITH c AS (SELECT g, n FROM t) SELECT n FROM c AS c2 WHERE n > 5 ORDER BY n",
     // Outer projection computes over CTE columns.
     "WITH c AS (SELECT g, n FROM t) SELECT g, n * 2 FROM c ORDER BY g, n",
+    // A CTE column inherits its base column's COLLATE, so a DISTINCT / GROUP BY /
+    // aggregate over it dedups under that collation on the VDBE — the same
+    // collation-aware paths a base-table column uses (`vdbe_group_collate`).
+    "WITH c AS (SELECT u FROM tc) SELECT DISTINCT u FROM c ORDER BY u",
+    "WITH c AS (SELECT r FROM tc) SELECT r, count(*) FROM c GROUP BY r ORDER BY r",
+    "WITH c AS (SELECT u, r FROM tc) SELECT count(DISTINCT u), count(DISTINCT r) FROM c",
+    "WITH c AS (SELECT u FROM tc) SELECT u, count(*) FROM c GROUP BY u HAVING count(*) > 1 ORDER BY u",
+    // An explicit COLLATE on the projection still overrides the inherited one.
+    "WITH c AS (SELECT u FROM tc) SELECT DISTINCT u COLLATE BINARY FROM c ORDER BY 1",
+    // A sibling CTE carries the inherited collation through the chain.
+    "WITH a AS (SELECT u FROM tc), b AS (SELECT u FROM a) SELECT DISTINCT u FROM b ORDER BY u",
 ];
 
 fn conn() -> Connection {

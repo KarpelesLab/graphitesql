@@ -2422,37 +2422,38 @@ impl Connection {
                 let qualifier = tr.alias.clone().unwrap_or_else(|| tr.name.clone());
                 // A constant / `VALUES` CTE body carries no affinity (BINARY
                 // collation), exactly like a constant derived subquery; otherwise
-                // resolve each output column's affinity through the body.
+                // resolve each output column's `(affinity, collation)` through the
+                // body. A non-BINARY column flows through to the VDBE's
+                // collation-aware GROUP / DISTINCT / aggregate paths, exactly as a
+                // base table's declared collation does (see `vdbe_group_collate`).
                 let const_body = c.select.from.is_none()
                     && c.select.compound.iter().all(|(_, s)| s.from.is_none());
-                let affinities: Vec<eval::Affinity> = if const_body {
-                    cinfos
-                        .iter()
-                        .map(|_| eval::Affinity::from_type(None))
-                        .collect()
-                } else {
-                    let origins = self
-                        .subquery_column_origins_in(&c.select, &sel.ctes)
-                        .ok_or(Error::Unsupported("VDBE: complex CTE body"))?;
-                    if origins.len() != cinfos.len() {
-                        return Err(Error::Unsupported("VDBE: CTE column count mismatch"));
-                    }
-                    // Keep the conservative all-BINARY collation posture (the VDBE
-                    // grouped / aggregate paths assume BINARY keys).
-                    if origins
-                        .iter()
-                        .any(|(_, co)| *co != crate::value::Collation::default())
-                    {
-                        return Err(Error::Unsupported("VDBE: CTE over a non-BINARY column"));
-                    }
-                    origins.iter().map(|(a, _)| *a).collect()
-                };
+                let (affinities, collations): (Vec<eval::Affinity>, Vec<crate::value::Collation>) =
+                    if const_body {
+                        (
+                            cinfos
+                                .iter()
+                                .map(|_| eval::Affinity::from_type(None))
+                                .collect(),
+                            cinfos
+                                .iter()
+                                .map(|_| crate::value::Collation::default())
+                                .collect(),
+                        )
+                    } else {
+                        let origins = self
+                            .subquery_column_origins_in(&c.select, &sel.ctes)
+                            .ok_or(Error::Unsupported("VDBE: complex CTE body"))?;
+                        if origins.len() != cinfos.len() {
+                            return Err(Error::Unsupported("VDBE: CTE column count mismatch"));
+                        }
+                        (
+                            origins.iter().map(|(a, _)| *a).collect(),
+                            origins.iter().map(|(_, co)| *co).collect(),
+                        )
+                    };
                 let columns: Vec<String> = cinfos.iter().map(|ci| ci.name.clone()).collect();
                 let tables = columns.iter().map(|_| qualifier.clone()).collect();
-                let collations = columns
-                    .iter()
-                    .map(|_| crate::value::Collation::default())
-                    .collect();
                 let rows = inrows.into_iter().map(|r| r.values).collect();
                 return Ok((columns, tables, affinities, collations, rows, None));
             }
