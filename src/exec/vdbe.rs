@@ -3633,12 +3633,9 @@ pub fn compile_left_join2(
         ));
     }
     let projections = expand_projections(sel, columns, tables)?;
-    // A row-level DISTINCT dedups under each output column's collation; the VDBE's
-    // DistinctCheck compares under BINARY, so an explicit `COLLATE` on a projection
-    // (`SELECT DISTINCT a COLLATE NOCASE`) must defer to the tree-walker.
-    if sel.distinct && projections_have_explicit_collation(&projections) {
-        return Err(Error::Unsupported("VDBE: explicit COLLATE with DISTINCT"));
-    }
+    // A row-level DISTINCT dedups under each output column's collation, resolved
+    // into the `DistinctCheck` below (`distinct_collations`), so an explicit
+    // projection `COLLATE` (`SELECT DISTINCT a COLLATE NOCASE`) runs on the VDBE.
     if projections.iter().any(|(e, _)| is_aggregate_expr(e)) {
         return Err(Error::Unsupported("VDBE: aggregate over a left join"));
     }
@@ -3739,7 +3736,7 @@ pub fn compile_left_join2(
             start: 0,
             count,
             target: 0,
-            collations: alloc::vec::Vec::new(),
+            collations: c.distinct_collations(&projections),
         });
         Some(at)
     } else {
@@ -3807,7 +3804,7 @@ pub fn compile_left_join2(
             start: 0,
             count,
             target: 0,
-            collations: alloc::vec::Vec::new(),
+            collations: c.distinct_collations(&projections),
         });
         Some(at)
     } else {
@@ -3964,7 +3961,7 @@ fn emit_output_row(
             start: 0,
             count,
             target: 0,
-            collations: alloc::vec::Vec::new(),
+            collations: c.distinct_collations(projections),
         });
         Some(at)
     } else {
@@ -4023,20 +4020,10 @@ pub fn compile_full_join2(
         ));
     }
     reject_aggregate_or_window_in_predicates(sel)?;
-    // DISTINCT compares output rows under BINARY; a non-BINARY column collation
-    // would diverge, so defer those to the tree-walker.
-    if sel.distinct && collations.iter().any(|cl| *cl != Collation::Binary) {
-        return Err(Error::Unsupported(
-            "VDBE: non-BINARY collation with DISTINCT",
-        ));
-    }
     let projections = expand_projections(sel, columns, tables)?;
-    // A row-level DISTINCT dedups under each output column's collation; the VDBE's
-    // DistinctCheck compares under BINARY, so an explicit `COLLATE` on a projection
-    // (`SELECT DISTINCT a COLLATE NOCASE`) must defer to the tree-walker.
-    if sel.distinct && projections_have_explicit_collation(&projections) {
-        return Err(Error::Unsupported("VDBE: explicit COLLATE with DISTINCT"));
-    }
+    // A row-level DISTINCT dedups under each output column's collation, resolved
+    // into the shared `emit_output_row`'s `DistinctCheck` (`distinct_collations`),
+    // so a declared or explicit `COLLATE` runs on the VDBE.
     if projections.iter().any(|(e, _)| is_aggregate_expr(e)) {
         return Err(Error::Unsupported("VDBE: aggregate over a full join"));
     }
@@ -4512,18 +4499,10 @@ pub fn compile_left_join_n(
         ));
     }
     reject_aggregate_or_window_in_predicates(sel)?;
-    if sel.distinct && collations.iter().any(|cl| *cl != Collation::Binary) {
-        return Err(Error::Unsupported(
-            "VDBE: non-BINARY collation with DISTINCT",
-        ));
-    }
     let projections = expand_projections(sel, columns, tables)?;
-    // A row-level DISTINCT dedups under each output column's collation; the VDBE's
-    // DistinctCheck compares under BINARY, so an explicit `COLLATE` on a projection
-    // (`SELECT DISTINCT a COLLATE NOCASE`) must defer to the tree-walker.
-    if sel.distinct && projections_have_explicit_collation(&projections) {
-        return Err(Error::Unsupported("VDBE: explicit COLLATE with DISTINCT"));
-    }
+    // A row-level DISTINCT dedups under each output column's collation, resolved
+    // into the shared `emit_output_row`'s `DistinctCheck` (`distinct_collations`),
+    // so a declared or explicit `COLLATE` runs on the VDBE.
     if projections.iter().any(|(e, _)| is_aggregate_expr(e)) {
         return Err(Error::Unsupported("VDBE: aggregate over an outer join"));
     }
@@ -4947,6 +4926,22 @@ impl Compiler {
             }
             None => Ok(Some(self.compile_count_reg(e)?)),
         }
+    }
+
+    /// The per-output-column collating sequences for a `SELECT DISTINCT` dedup:
+    /// an explicit projection `COLLATE`, else the column's declared collation, else
+    /// `BINARY` — the same resolution `build_sort_keys` uses for an `ORDER BY`
+    /// term. Passed to `Op::DistinctCheck` so a `NOCASE`/`RTRIM`/custom-collation
+    /// (or explicitly `COLLATE`d) output column dedups under its collation.
+    fn distinct_collations(&self, projections: &[(Expr, String)]) -> Vec<Collation> {
+        projections
+            .iter()
+            .map(|(e, _)| {
+                self.explicit_collation(e)
+                    .or_else(|| self.col_collation(e))
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     /// Compile a non-constant `LIMIT`/`OFFSET` count into a register: a *rowless*
