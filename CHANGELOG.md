@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/KarpelesLab/graphitesql/compare/v0.1.3...v0.1.4) - 2026-07-20
+
+### Added
+
+- *(json)* subtype() reports the JSON subtype (74) from the argument expression
+- *(rtree)* store aux columns in sqlite-compatible %_rowid shadow
+- *(pragma)* expose function_list/module_list/pragma_list/compile_options as table-valued functions
+- *(func)* sqlite_compileoption_used/get
+- *(pragma)* populate function_list
+- *(pragma)* populate pragma_list/module_list/compile_options and wire data_version
+- *(integrity)* whole-file page accounting like sqlite3BtreeIntegrityCheck
+
+### Fixed
+
+- *(vacuum)* match sqlite's VACUUM INTO existing-target semantics
+- *(cli)* classify trigger-body qualified-name error as prepare-time
+- *(parser)* accept a schema-qualified table in CREATE TRIGGER's ON clause
+- *(resolve)* honor the database qualifier for a 3-part column reference
+- *(json)* json_group_array/object resolve element JSON subtype per row
+- *(json)* resolve JSON subtype of single-path json_extract at runtime
+- *(cli)* classify "circular reference" as a prepare-time error
+- *(resolve)* correlated subquery over a CTE no longer falsely rejected
+- *(vtab)* pass CREATE VIRTUAL TABLE arguments to the module verbatim
+- *(trigger)* fire BEFORE INSERT trigger before constraint/conflict handling
+- *(pragma)* wire wal_checkpoint(mode) and byte-exact rtree constraint errors
+- *(tokenizer)* match sqlite tokenize.c on block-comment EOF, BOM, and #N register refs
+- *(wal)* port sqlite3WalCheckpoint modes, in-place log restart, and locked hot-journal recovery
+- *(rtree)* sqlite-exact rtreeInit errors and token-based column names
+- *(printf)* route float conversions through fpdecode
+- *(json)* emit TEXTRAW in jsonb writers like sqlite
+- *(pager)* refresh the header snapshot at write-transaction start like sqlite's pagerSharedLock
+- *(value)* NOCASE collation folds to lowercase like sqlite
+
+### Performance
+
+- *(insert)* seek unique secondary indexes for WITHOUT ROWID conflict checks
+- *(insert)* maintain WITHOUT ROWID secondary indexes incrementally
+- *(insert)* seek the clustered PK for WITHOUT ROWID conflict checks
+- *(insert)* detect UNIQUE/PK conflicts by seeking instead of scanning
+
+### Testing
+
+- *(vacuum)* assert sqlite's actual VACUUM INTO existing-target messages
+- *(stress)* raise WITHOUT ROWID fragmentation default now that inserts are O(n·log n)
+- *(stress)* process-kill crash + volume resilience suites and a scheduled workflow
+- *(wal)* request TRUNCATE explicitly in the crash harness
+
 ## [0.1.3](https://github.com/KarpelesLab/graphitesql/compare/v0.1.2...v0.1.3) - 2026-07-16
 
 ### Fixed
