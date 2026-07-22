@@ -3930,9 +3930,52 @@ impl Connection {
         if (self.in_tx || self.open_savepoints > 0)
             && let Backend::Write(w) = &self.backend
         {
-            w.begin_read_txn()?;
+            self.with_busy_retry(|| w.begin_read_txn())?;
         }
         Ok(())
+    }
+
+    /// Run a lock-acquisition `op`, honouring `PRAGMA busy_timeout`: on
+    /// [`Error::Busy`] (a foreign process holds an incompatible lock), sleep with
+    /// SQLite's default busy handler's escalating delay schedule and retry until the
+    /// timeout elapses, then give up with `Busy`. A zero/negative timeout does not
+    /// wait (the historical graphite behaviour). Only side-effect-free lock
+    /// *acquisition* points are wrapped — a retry re-attempts the acquisition, never
+    /// partially-applied work — so this is always safe. `no_std` cannot sleep, so it
+    /// runs `op` once (busy_timeout stays advisory there), matching the `std == CI`
+    /// build where it blocks.
+    #[cfg(feature = "std")]
+    fn with_busy_retry<T>(&self, mut op: impl FnMut() -> Result<T>) -> Result<T> {
+        let timeout_ms = self.busy_timeout.get();
+        if timeout_ms <= 0 {
+            return op();
+        }
+        // `sqlite3DefaultBusyCallback`'s delay schedule (milliseconds).
+        const DELAYS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
+        let start = std::time::Instant::now();
+        let mut n = 0usize;
+        loop {
+            match op() {
+                Err(Error::Busy) => {
+                    let elapsed = start.elapsed().as_millis() as i64;
+                    if elapsed >= timeout_ms {
+                        return Err(Error::Busy);
+                    }
+                    let want = DELAYS[n.min(DELAYS.len() - 1)];
+                    let remaining = (timeout_ms - elapsed) as u64;
+                    std::thread::sleep(core::time::Duration::from_millis(
+                        want.min(remaining).max(1),
+                    ));
+                    n += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn with_busy_retry<T>(&self, mut op: impl FnMut() -> Result<T>) -> Result<T> {
+        op()
     }
 
     /// Statement-boundary coherency hook (ROADMAP C8c-2): revalidate every
@@ -3973,7 +4016,7 @@ impl Connection {
             && self.open_savepoints == 0
             && let Backend::Write(w) = &self.backend
         {
-            w.begin_autocommit_read()?
+            self.with_busy_retry(|| w.begin_autocommit_read())?
         } else {
             false
         };
@@ -4227,10 +4270,13 @@ impl Connection {
             }
             "checkpoint_fullfsync" => Ok(single("checkpoint_fullfsync", Value::Integer(0))),
             "fullfsync" => Ok(single("fullfsync", Value::Integer(0))),
-            // `busy_timeout` round-trips the lock-wait timeout (graphite never
-            // blocks, so it is advisory). The set form clamps a negative value to 0
-            // and echoes it; the plain form reads it back — like sqlite. The result
-            // column is named "timeout".
+            // `busy_timeout` sets the lock-wait timeout: a blocked READ lock
+            // acquisition (a foreign process holds an incompatible lock) now retries
+            // with SQLite's escalating delay schedule until the timeout elapses,
+            // via `with_busy_retry` (std only). Writers still surface `Busy`
+            // immediately — the write-lock retry is a follow-up. The set form clamps
+            // a negative value to 0 and echoes it; the plain form reads it back —
+            // like sqlite. The result column is named "timeout".
             "busy_timeout" => {
                 if let Some(e) = &p.value {
                     let v = eval::to_i64(&eval::eval(e, &EvalCtx::rowless(&Params::default()))?);
