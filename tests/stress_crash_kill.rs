@@ -111,13 +111,24 @@ fn stress_writer_child() {
     let _ = conn.execute("PRAGMA synchronous=FULL");
     let _ = conn.execute("PRAGMA busy_timeout=2000");
 
-    // This owner's account ids.
-    let ids: Vec<i64> = conn
-        .query(&format!(
-            "SELECT id FROM acct WHERE owner={owner} ORDER BY id"
-        ))
-        .expect("select acct")
-        .rows
+    // This owner's account ids. graphite holds a whole-file Exclusive lock for the
+    // duration of each write transaction (it can't express SQLite's byte-range
+    // RESERVED lock that keeps readers during a write), so with several writers
+    // hammering, this initial read can be starved past `busy_timeout` and return
+    // `Busy`. A correct multi-process client retries on `Busy` — exactly as the
+    // transaction loop below does — rather than treating it as fatal.
+    let sql = format!("SELECT id FROM acct WHERE owner={owner} ORDER BY id");
+    let rows = loop {
+        match conn.query(&sql) {
+            Ok(r) => break r.rows,
+            Err(graphitesql::Error::Busy) => {
+                std::thread::sleep(Duration::from_millis(1 + rng.below(10)));
+                continue;
+            }
+            Err(e) => panic!("select acct: {e:?}"),
+        }
+    };
+    let ids: Vec<i64> = rows
         .iter()
         .map(|r| match r[0] {
             Value::Integer(i) => i,
