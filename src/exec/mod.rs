@@ -174,8 +174,14 @@ pub struct Connection {
     /// ignore_check_constraints`). NOT NULL, UNIQUE, and foreign keys are
     /// unaffected. Off by default, matching SQLite.
     ignore_check_constraints: bool,
-    /// Re-entrancy depth of trigger firing.
+    /// Re-entrancy depth of trigger firing (the total-recursion cap, SQLite's
+    /// `SQLITE_MAX_TRIGGER_DEPTH`).
     trigger_depth: core::cell::Cell<usize>,
+    /// Names of the triggers currently executing (the firing stack). With
+    /// `recursive_triggers = OFF` (the default) a trigger does not re-enter itself,
+    /// so a trigger already on this stack is skipped; a *different* trigger still
+    /// fires. Tracked by name so self- and cyclic recursion are both caught.
+    active_triggers: core::cell::RefCell<Vec<String>>,
     /// Nesting depth of foreign-key action application. Non-zero while a
     /// cascade/set-null/set-default runs, so a session records those writes as
     /// *indirect* (mirroring SQLite's preupdate-hook depth for FK actions).
@@ -612,6 +618,7 @@ impl Connection {
             query_only: false,
             ignore_check_constraints: false,
             trigger_depth: core::cell::Cell::new(0),
+            active_triggers: core::cell::RefCell::new(Vec::new()),
             fk_depth: core::cell::Cell::new(0),
             cascade_compact: core::cell::RefCell::new(alloc::collections::BTreeSet::new()),
             stmt_keep_partial: core::cell::Cell::new(false),
@@ -680,6 +687,7 @@ impl Connection {
             query_only: false,
             ignore_check_constraints: false,
             trigger_depth: core::cell::Cell::new(0),
+            active_triggers: core::cell::RefCell::new(Vec::new()),
             fk_depth: core::cell::Cell::new(0),
             cascade_compact: core::cell::RefCell::new(alloc::collections::BTreeSet::new()),
             stmt_keep_partial: core::cell::Cell::new(false),
@@ -10280,16 +10288,12 @@ impl Connection {
         params: &Params,
         changed_cols: Option<&[String]>,
     ) -> Result<bool> {
-        // Non-recursive by default; with PRAGMA recursive_triggers a trigger may
-        // fire others, bounded to avoid runaway recursion (SQLite caps at 1000).
+        // The total trigger-recursion depth is capped at SQLite's
+        // SQLITE_MAX_TRIGGER_DEPTH (1000), regardless of the recursive_triggers
+        // setting; exceeding it is an error, not silent truncation.
         let depth = self.trigger_depth.get();
-        let limit = if self.recursive_triggers { 1000 } else { 1 };
-        if depth >= limit {
-            return if self.recursive_triggers {
-                Err(Error::Error("too many levels of trigger recursion".into()))
-            } else {
-                Ok(false)
-            };
+        if depth >= 1000 {
+            return Err(Error::Error("too many levels of trigger recursion".into()));
         }
         let mut trigs = self.triggers_for(table, kind, timing)?;
         // An `UPDATE OF col, …` trigger fires only when one of its named columns
@@ -10301,6 +10305,15 @@ impl Connection {
                     .any(|c| changed.iter().any(|ch| ch.eq_ignore_ascii_case(c))),
                 _ => true,
             });
+        }
+        // With `recursive_triggers = OFF` (the default), a trigger does not re-enter
+        // ITSELF — but a *different* trigger fired from within a trigger body still
+        // runs (only self- and cyclic recursion are suppressed). So skip any trigger
+        // already on the firing stack. With the pragma ON, every trigger may re-enter,
+        // bounded only by the depth cap above.
+        if !self.recursive_triggers {
+            let active = self.active_triggers.borrow();
+            trigs.retain(|t| !active.iter().any(|n| n.eq_ignore_ascii_case(&t.name)));
         }
         if trigs.is_empty() {
             return Ok(false);
@@ -10591,36 +10604,51 @@ impl Connection {
                     continue;
                 }
             }
-            let schema = trig.schema.as_deref();
-            for stmt in &trig.body {
-                match stmt {
-                    Statement::Insert(ins) => {
-                        self.exec_insert(ins, params)
-                            .map_err(|e| qualify_trigger_missing_table(e, schema))?;
-                    }
-                    Statement::Update(u) => {
-                        self.exec_update(u, params)
-                            .map_err(|e| qualify_trigger_missing_table(e, schema))?;
-                    }
-                    Statement::Delete(d) => {
-                        self.exec_delete(d, params)
-                            .map_err(|e| qualify_trigger_missing_table(e, schema))?;
-                    }
-                    // A `SELECT` in a trigger body is side-effect free *except* for
-                    // a `RAISE(…)`, which aborts or ignores the firing operation.
-                    Statement::Select(sel) => {
-                        self.run_trigger_select(sel, params)?;
-                        // `RAISE(IGNORE)` abandons the row: stop running the rest of
-                        // this (and later) trigger program(s).
-                        if self.raise_ignore.get() {
-                            return Ok(());
-                        }
-                    }
-                    _ => return Err(Error::Unsupported("statement type in trigger body")),
-                }
+            // Mark this trigger active for the duration of its body so a nested DML
+            // that would re-enter it is suppressed under `recursive_triggers = OFF`
+            // (see `fire_triggers`). Popped even on an error / `RAISE(IGNORE)`.
+            self.active_triggers.borrow_mut().push(trig.name.clone());
+            let outcome = self.run_one_trigger_body(trig, params);
+            self.active_triggers.borrow_mut().pop();
+            // `RAISE(IGNORE)` abandons the row: stop running the rest of this (and the
+            // remaining) trigger program(s).
+            if outcome? {
+                return Ok(());
             }
         }
         Ok(())
+    }
+
+    /// Run one trigger's body. Returns `Ok(true)` when a `RAISE(IGNORE)` fired,
+    /// signalling the caller to stop the remaining trigger programs.
+    fn run_one_trigger_body(&mut self, trig: &CreateTrigger, params: &Params) -> Result<bool> {
+        let schema = trig.schema.as_deref();
+        for stmt in &trig.body {
+            match stmt {
+                Statement::Insert(ins) => {
+                    self.exec_insert(ins, params)
+                        .map_err(|e| qualify_trigger_missing_table(e, schema))?;
+                }
+                Statement::Update(u) => {
+                    self.exec_update(u, params)
+                        .map_err(|e| qualify_trigger_missing_table(e, schema))?;
+                }
+                Statement::Delete(d) => {
+                    self.exec_delete(d, params)
+                        .map_err(|e| qualify_trigger_missing_table(e, schema))?;
+                }
+                // A `SELECT` in a trigger body is side-effect free *except* for
+                // a `RAISE(…)`, which aborts or ignores the firing operation.
+                Statement::Select(sel) => {
+                    self.run_trigger_select(sel, params)?;
+                    if self.raise_ignore.get() {
+                        return Ok(true);
+                    }
+                }
+                _ => return Err(Error::Unsupported("statement type in trigger body")),
+            }
+        }
+        Ok(false)
     }
 
     /// Evaluate a trigger-body `SELECT` for a `RAISE(…)` call. A bare
