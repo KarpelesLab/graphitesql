@@ -6447,6 +6447,31 @@ impl Connection {
     }
 
     /// Execute a parsed non-transaction-control statement on the active database.
+    /// True when `stmt` is a DDL statement that will *definitely not write* — a
+    /// `CREATE … IF NOT EXISTS` whose name already names an object (so it no-ops or
+    /// errors without writing), or a `DROP … IF EXISTS` whose object is absent. Used
+    /// to skip the eager write-lock for such no-ops so an every-open
+    /// `CREATE … IF NOT EXISTS` does not contend. Deliberately conservative: it only
+    /// returns true for these provably-no-write shapes, and a false negative merely
+    /// takes the lock unnecessarily (harmless), never the reverse.
+    fn stmt_is_noop_ddl(&self, stmt: &Statement) -> bool {
+        let exists = |n: &str| {
+            self.schema
+                .objects()
+                .iter()
+                .any(|o| o.name.eq_ignore_ascii_case(n))
+        };
+        match stmt {
+            Statement::CreateTable(s) if s.if_not_exists => exists(&s.name),
+            Statement::CreateIndex(s) if s.if_not_exists => exists(&s.name),
+            Statement::CreateView(s) if s.if_not_exists => exists(&s.name),
+            Statement::CreateTrigger(s) if s.if_not_exists => exists(&s.name),
+            Statement::CreateVirtualTable(s) if s.if_not_exists => exists(&s.name),
+            Statement::Drop(s) if s.if_exists => !exists(&s.name),
+            _ => false,
+        }
+    }
+
     fn exec_parsed(&mut self, stmt: Statement, sql: &str, params: &Params) -> Result<usize> {
         // `PRAGMA query_only = ON` makes the connection read-only: any statement
         // that would open a write transaction (DML, every CREATE/DROP/ALTER,
@@ -6474,6 +6499,17 @@ impl Connection {
         // We realise this with an internal savepoint snapshotting the writer
         // overlay(s) before the statement and rolling back to it on an
         // abort-class error. (A no-op for DDL, which doesn't set `is_dml`.)
+        // Take the write lock (and refresh any foreign-committed state) BEFORE the
+        // statement navigates its b-tree, so a concurrent process's commit can't land
+        // between navigation and the write and be clobbered (see
+        // `WritePager::begin_write`). This covers DML *and* every data-navigating DDL:
+        // `CREATE INDEX`/`ANALYZE` scan the table before writing, `DROP` frees pages,
+        // `ALTER`/`VACUUM` rewrite. A provably-no-op `IF NOT EXISTS` / `IF EXISTS` DDL
+        // takes no lock — it never writes, and locking it would make an every-open
+        // `CREATE … IF NOT EXISTS` needlessly contend (and re-fail an open under load).
+        if statement_writes_db(&stmt) && !self.stmt_is_noop_ddl(&stmt) {
+            self.backend.writer()?.begin_write()?;
+        }
         if is_dml {
             self.stmt_keep_partial.set(false);
             self.stmt_rollback_tx.set(false);
@@ -6681,13 +6717,9 @@ impl Connection {
 
     fn run_dml_atomic(&mut self, stmt: Statement, params: &Params) -> Result<usize> {
         const SP: &str = "\u{0}graphite_stmt";
-        // Take the write lock (and refresh any foreign-committed state) BEFORE the
-        // statement navigates its b-tree. Otherwise a concurrent process could commit
-        // between this statement's navigation reads and its first page write, and that
-        // commit would be clobbered — the write stages over the pre-commit page images
-        // (see `WritePager::begin_write`). SQLite takes RESERVED at write-statement
-        // start for exactly this reason. Idempotent, so nested trigger/FK DML is fine.
-        self.backend.writer()?.begin_write()?;
+        // The write lock is taken in `exec_parsed` before this runs (so navigation
+        // happens under the lock — see `WritePager::begin_write`); the savepoint below
+        // then snapshots the already-refreshed committed state.
         self.backend.writer()?.savepoint(SP);
         self.savepoint_attached(SP)?;
         let result = match stmt {
