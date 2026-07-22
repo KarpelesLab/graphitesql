@@ -7649,7 +7649,11 @@ impl Connection {
             return self.exec_create_table_as_select(ct, select);
         }
         if let Some(e) = self.table_namespace_conflict(&ct.name) {
-            if ct.if_not_exists {
+            // `IF NOT EXISTS` suppresses only a collision with an existing *table or
+            // view* (they share the table namespace). A collision with an *index*
+            // still errors ("there is already an index named X"), even with
+            // `IF NOT EXISTS` — matching SQLite.
+            if ct.if_not_exists && self.schema.index(&ct.name).is_none() {
                 return Ok(());
             }
             return Err(e);
@@ -8107,7 +8111,11 @@ impl Connection {
     /// with the query's rows.
     fn exec_create_table_as_select(&mut self, ct: &CreateTable, select: &Select) -> Result<()> {
         if let Some(e) = self.table_namespace_conflict(&ct.name) {
-            if ct.if_not_exists {
+            // `IF NOT EXISTS` suppresses only a collision with an existing *table or
+            // view* (they share the table namespace). A collision with an *index*
+            // still errors ("there is already an index named X"), even with
+            // `IF NOT EXISTS` — matching SQLite.
+            if ct.if_not_exists && self.schema.index(&ct.name).is_none() {
                 return Ok(());
             }
             return Err(e);
