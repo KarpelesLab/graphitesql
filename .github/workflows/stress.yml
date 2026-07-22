@@ -76,6 +76,12 @@ jobs:
         run: sqlite3 --version
       - name: Crash-kill stress (single + multi-process, delete + WAL)
         run: cargo test --release --all-features --test stress_crash_kill -- --ignored --nocapture --test-threads=1
+      - name: Multi-process write integrity (concurrent writers, one db)
+        env:
+          GSQL_MP_WRITERS: "6"
+          GSQL_MP_TXNS: "400"
+          GSQL_MP_POOL: "80"
+        run: cargo test --release --all-features --test multiprocess_write_integrity -- --ignored --nocapture --test-threads=1
 
   volume:
     name: Volume / scale

@@ -857,6 +857,25 @@ impl WritePager {
     /// Take the write-intent (`RESERVED`) lock on the main file before staging
     /// changes, so a concurrent writer to the same file is rejected with
     /// [`Error::Busy`] rather than corrupting it. Idempotent within a transaction.
+    /// Acquire the write intent (`RESERVED`, which excludes any foreign writer) and
+    /// refresh a stale committed-state snapshot **now** — before a write statement
+    /// navigates its b-tree.
+    ///
+    /// SQLite takes `RESERVED` at the start of a write statement
+    /// (`sqlite3BtreeBeginTrans(WRITE)`), before reading any page on the write path.
+    /// graphite otherwise acquires the write lock lazily at the first page *write*,
+    /// so a write statement's b-tree navigation reads happen unlocked. A foreign
+    /// process committing between that navigation and the first write would then be
+    /// clobbered: the writer stages its change over the page images it read *before*
+    /// the foreign commit, and re-writing them drops the foreign commit's rows and
+    /// freelist/page-count updates — silent cross-process corruption (orphaned pages,
+    /// index/table desync). Taking the lock up front makes the whole statement's
+    /// navigation read fresh pages under the lock, with no window for a foreign
+    /// commit. Idempotent within a transaction (a no-op once `RESERVED` is held).
+    pub fn begin_write(&mut self) -> Result<()> {
+        self.acquire_write_intent()
+    }
+
     fn acquire_write_intent(&mut self) -> Result<()> {
         use crate::vfs::LockLevel;
         let entry = self.held.get();

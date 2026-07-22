@@ -6681,6 +6681,13 @@ impl Connection {
 
     fn run_dml_atomic(&mut self, stmt: Statement, params: &Params) -> Result<usize> {
         const SP: &str = "\u{0}graphite_stmt";
+        // Take the write lock (and refresh any foreign-committed state) BEFORE the
+        // statement navigates its b-tree. Otherwise a concurrent process could commit
+        // between this statement's navigation reads and its first page write, and that
+        // commit would be clobbered — the write stages over the pre-commit page images
+        // (see `WritePager::begin_write`). SQLite takes RESERVED at write-statement
+        // start for exactly this reason. Idempotent, so nested trigger/FK DML is fine.
+        self.backend.writer()?.begin_write()?;
         self.backend.writer()?.savepoint(SP);
         self.savepoint_attached(SP)?;
         let result = match stmt {
