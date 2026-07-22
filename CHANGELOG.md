@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/KarpelesLab/graphitesql/compare/v0.1.4...v0.1.5) - 2026-07-22
+
+### Added
+
+- *(txn)* honor PRAGMA busy_timeout for a blocked cross-process read
+- *(vdbe)* bare-aggregate DISTINCT (with explicit COLLATE) runs on the VDBE
+- *(vdbe)* bare aggregate runs when the projection is more than a single aggregate
+- *(vdbe)* bare-aggregate HAVING folds an aggregate that appears only in HAVING
+- *(vdbe)* derived / subquery / view FROM source over a non-BINARY column runs on the VDBE
+- *(vdbe)* CTE source over a non-BINARY column runs on the VDBE
+- *(vdbe)* non-constant LIMIT/OFFSET on the FROM-less SELECT path
+- *(vdbe)* DISTINCT with collation over grouped/aggregate joins
+- *(vdbe)* DISTINCT with collation over GROUP BY output
+- *(vdbe)* DISTINCT with collation over LEFT/FULL/N-table joins
+- *(vdbe)* compile non-constant LIMIT/OFFSET (port of computeLimitRegisters)
+
+### Fixed
+
+- *(txn)* take the write lock before a DML statement navigates its b-tree
+- *(resolve)* CTE columns inherit their body's affinity and collation
+
+### Testing
+
+- *(stress)* retry the writer child's setup read on Busy
+- *(func)* skip non-UTF-8 text differential on a Unicode sqlite oracle
+
 ## [0.1.4](https://github.com/KarpelesLab/graphitesql/compare/v0.1.3...v0.1.4) - 2026-07-20
 
 ### Added
