@@ -5467,9 +5467,6 @@ impl Connection {
         let mut rows = Vec::new();
         for table in &tables {
             let meta = self.table_meta(table, None)?;
-            if meta.without_rowid {
-                continue; // rowid-less FK reporting not modeled yet
-            }
             let fks = self.foreign_keys_of(table)?;
             if fks.is_empty() {
                 continue;
@@ -5482,15 +5479,31 @@ impl Connection {
                 }
             }
             let n = fks.len();
-            for (rowid, values) in self.scan_table(&meta)? {
-                for (i, fk) in fks.iter().enumerate() {
+            // A WITHOUT ROWID child has no rowid — SQLite reports its `rowid`
+            // column as NULL. Scan by storage kind and carry an optional rowid.
+            let scan: Vec<(Option<i64>, Vec<Value>)> = if meta.without_rowid {
+                self.scan_without_rowid(&meta)?
+                    .into_iter()
+                    .map(|v| (None, v))
+                    .collect()
+            } else {
+                self.scan_table(&meta)?
+                    .into_iter()
+                    .map(|(r, v)| (Some(r), v))
+                    .collect()
+            };
+            for (rowid, values) in scan {
+                // SQLite reports a child row's violated FKs in ascending `fkid`
+                // order. Our list is in declaration order and `fkid = n-1-i`, so
+                // iterate it in reverse to emit fkid 0, 1, … in order.
+                for (i, fk) in fks.iter().enumerate().rev() {
                     let Some(key) = self.child_key_values(&meta, fk, &values) else {
                         continue; // a NULL key column => satisfied
                     };
                     if !self.parent_has_key(fk, &key)? {
                         rows.push(alloc::vec![
                             Value::Text(table.clone().into()),
-                            Value::Integer(rowid),
+                            rowid.map(Value::Integer).unwrap_or(Value::Null),
                             Value::Text(fk.ref_table.clone().into()),
                             Value::Integer((n - 1 - i) as i64),
                         ]);
