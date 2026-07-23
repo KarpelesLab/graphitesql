@@ -207,6 +207,12 @@ pub struct Connection {
     /// cascade/set-null/set-default runs, so a session records those writes as
     /// *indirect* (mirroring SQLite's preupdate-hook depth for FK actions).
     fk_depth: core::cell::Cell<usize>,
+    /// `PRAGMA defer_foreign_keys`: when on, *every* foreign-key constraint
+    /// behaves as `DEFERRABLE INITIALLY DEFERRED` for the current transaction —
+    /// violations are checked at COMMIT rather than immediately. SQLite resets
+    /// this to off automatically at each COMMIT or ROLLBACK, so it must be
+    /// re-enabled per transaction.
+    defer_foreign_keys: core::cell::Cell<bool>,
     /// Names of tables whose b-tree had rows removed by a cascading delete
     /// (`delete_row_cascade`) during the current statement. Each such delete can
     /// leave an empty non-root leaf that SQLite's balancer would merge away, but
@@ -641,6 +647,7 @@ impl Connection {
             trigger_depth: core::cell::Cell::new(0),
             active_triggers: core::cell::RefCell::new(Vec::new()),
             fk_depth: core::cell::Cell::new(0),
+            defer_foreign_keys: core::cell::Cell::new(false),
             cascade_compact: core::cell::RefCell::new(alloc::collections::BTreeSet::new()),
             stmt_keep_partial: core::cell::Cell::new(false),
             stmt_rollback_tx: core::cell::Cell::new(false),
@@ -710,6 +717,7 @@ impl Connection {
             trigger_depth: core::cell::Cell::new(0),
             active_triggers: core::cell::RefCell::new(Vec::new()),
             fk_depth: core::cell::Cell::new(0),
+            defer_foreign_keys: core::cell::Cell::new(false),
             cascade_compact: core::cell::RefCell::new(alloc::collections::BTreeSet::new()),
             stmt_keep_partial: core::cell::Cell::new(false),
             stmt_rollback_tx: core::cell::Cell::new(false),
@@ -4410,11 +4418,14 @@ impl Connection {
                 &name,
                 Value::Integer(self.ignore_check_constraints as i64),
             )),
+            "defer_foreign_keys" => Ok(single(
+                &name,
+                Value::Integer(self.defer_foreign_keys.get() as i64),
+            )),
             "legacy_alter_table"
             | "count_changes"
             | "full_column_names"
             | "empty_result_callbacks"
-            | "defer_foreign_keys"
             | "reverse_unordered_selects"
             | "hard_heap_limit"
             | "writable_schema" => Ok(single(&name, Value::Integer(0))),
@@ -6150,6 +6161,7 @@ impl Connection {
                     self.rollback_attached()?;
                     self.in_tx = false;
                     self.open_savepoints = 0;
+                    self.defer_foreign_keys.set(false);
                     self.schema = Schema::read(self.backend.source())?;
                     self.fire_rollback_hook();
                     return Ok(0);
@@ -6160,6 +6172,9 @@ impl Connection {
                 self.commit_attached()?;
                 self.in_tx = false;
                 self.open_savepoints = 0;
+                // `PRAGMA defer_foreign_keys` is per-transaction: SQLite clears it
+                // at each COMMIT/ROLLBACK.
+                self.defer_foreign_keys.set(false);
                 return Ok(0);
             }
             Statement::Savepoint(name) => {
@@ -6200,6 +6215,9 @@ impl Connection {
                         self.commit_attached()?;
                         self.schema = Schema::read(self.backend.source())?;
                     }
+                    // Finalizing the implicit transaction returns to autocommit —
+                    // clear the per-transaction defer flag (as COMMIT does).
+                    self.defer_foreign_keys.set(false);
                 }
                 return Ok(0);
             }
@@ -6227,6 +6245,9 @@ impl Connection {
                 self.rollback_attached()?;
                 self.in_tx = false;
                 self.open_savepoints = 0;
+                // `PRAGMA defer_foreign_keys` is per-transaction: SQLite clears it
+                // at each COMMIT/ROLLBACK.
+                self.defer_foreign_keys.set(false);
                 // Nothing was written to the fts5 index during the transaction, so
                 // there is nothing to undo — just drop the pending flush set.
                 #[cfg(feature = "fts5")]
@@ -8328,6 +8349,12 @@ impl Connection {
             if let Some(e) = &p.value {
                 self.recursive_triggers = pragma_truth(e, params);
             }
+        } else if p.name.eq_ignore_ascii_case("defer_foreign_keys") {
+            // `ON` defers every FK check to COMMIT for the current transaction
+            // (SQLite resets it at the next COMMIT/ROLLBACK — see `end_tx_reset`).
+            if let Some(e) = &p.value {
+                self.defer_foreign_keys.set(pragma_truth(e, params));
+            }
         } else if p.name.eq_ignore_ascii_case("case_sensitive_like") {
             // `ON` makes the LIKE operator (and the `like()` function) compare
             // ASCII case-sensitively; the get form returns no rows (handled in the
@@ -8667,10 +8694,11 @@ impl Connection {
             if self.fk_is_mismatch(&fk)? {
                 return Err(Self::fk_mismatch_err(table, &fk.ref_table));
             }
-            // A `DEFERRABLE INITIALLY DEFERRED` key is checked at COMMIT, not now
-            // — but only inside an explicit transaction. In autocommit the
-            // statement *is* the transaction, so its implicit commit is immediate.
-            if fk.initially_deferred && self.in_tx {
+            // A `DEFERRABLE INITIALLY DEFERRED` key — or *any* key while
+            // `PRAGMA defer_foreign_keys` is on — is checked at COMMIT, not now,
+            // but only inside an explicit transaction. In autocommit the statement
+            // *is* the transaction, so its implicit commit is immediate.
+            if (fk.initially_deferred || self.defer_foreign_keys.get()) && self.in_tx {
                 continue;
             }
             let key = match self.child_key_values(meta, &fk, values) {
@@ -8691,6 +8719,10 @@ impl Connection {
         if !self.foreign_keys {
             return Ok(());
         }
+        // With `PRAGMA defer_foreign_keys` on, EVERY key was deferred this
+        // transaction, so all of them must be verified now — not just the ones
+        // declared `INITIALLY DEFERRED`.
+        let defer_all = self.defer_foreign_keys.get();
         for obj in self.schema.objects() {
             if obj.obj_type != crate::schema::ObjectType::Table {
                 continue;
@@ -8698,7 +8730,7 @@ impl Connection {
             let fks: Vec<ForeignKey> = self
                 .foreign_keys_of(&obj.name)?
                 .into_iter()
-                .filter(|fk| fk.initially_deferred)
+                .filter(|fk| defer_all || fk.initially_deferred)
                 .collect();
             if fks.is_empty() {
                 continue;
@@ -8895,9 +8927,13 @@ impl Connection {
                 fk.on_update
             };
             // A deferred FK's NO ACTION orphan check waits for COMMIT (inside an
-            // explicit transaction); RESTRICT and the data-changing actions
-            // (CASCADE / SET NULL / SET DEFAULT) always run now.
-            if action == FkAction::NoAction && fk.initially_deferred && self.in_tx {
+            // explicit transaction) — likewise for every FK while
+            // `PRAGMA defer_foreign_keys` is on. RESTRICT and the data-changing
+            // actions (CASCADE / SET NULL / SET DEFAULT) always run now.
+            if action == FkAction::NoAction
+                && (fk.initially_deferred || self.defer_foreign_keys.get())
+                && self.in_tx
+            {
                 continue;
             }
             // If this is an UPDATE that didn't change the referenced key, skip.
