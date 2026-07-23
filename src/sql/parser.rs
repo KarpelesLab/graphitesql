@@ -98,6 +98,41 @@ fn resolve_window_def_chains(defs: &mut [(String, WindowSpec)]) -> Result<()> {
     Ok(())
 }
 
+/// Reject `f(…) FILTER (WHERE …) OVER (…)` when `f` is a non-aggregate window
+/// function (a ranking/value function like `rank`, `row_number`, `first_value`,
+/// `lag`, …). `FILTER` is only meaningful on aggregate window functions, so
+/// SQLite raises "FILTER clause may only be used with aggregate window functions"
+/// at prepare time. Aggregate window functions (`sum`/`count`/… `OVER (…)`) keep
+/// their `FILTER`.
+fn reject_filter_on_nonaggregate_window(
+    name: &str,
+    filter: &Option<Box<Expr>>,
+    over: &Option<WindowSpec>,
+) -> Result<()> {
+    if filter.is_some()
+        && over.is_some()
+        && matches!(
+            name.to_ascii_lowercase().as_str(),
+            "row_number"
+                | "rank"
+                | "dense_rank"
+                | "percent_rank"
+                | "cume_dist"
+                | "ntile"
+                | "first_value"
+                | "last_value"
+                | "nth_value"
+                | "lag"
+                | "lead"
+        )
+    {
+        return Err(Error::Error(
+            "FILTER clause may only be used with aggregate window functions".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Parse exactly one statement, erroring if there is trailing input.
 pub fn parse_one(sql: &str) -> Result<Statement> {
     let mut stmts = parse(sql)?;
@@ -2771,6 +2806,7 @@ impl Parser {
             self.expect(&Token::RParen)?;
             let filter = self.filter_clause()?;
             let over = self.window_over()?;
+            reject_filter_on_nonaggregate_window(&name, &filter, &over)?;
             return Ok(Expr::Function {
                 name,
                 distinct: false,
@@ -2809,6 +2845,7 @@ impl Parser {
         self.expect(&Token::RParen)?;
         let filter = self.filter_clause()?;
         let over = self.window_over()?;
+        reject_filter_on_nonaggregate_window(&name, &filter, &over)?;
         // SQLite implements `iif(...)`/`if(...)` as a CASE expression: the
         // arguments are `(when, then)` pairs with an optional trailing ELSE,
         // evaluated with short-circuit semantics so an untaken branch is never
