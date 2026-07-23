@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/KarpelesLab/graphitesql/compare/v0.1.5...v0.1.6) - 2026-07-23
+
+### Documentation
+
+- *(wasm)* fix intra-doc links so `cargo doc --all-features` is clean
+
+### Fixed
+
+- *(trigger)* a trigger fired from within a trigger body now runs (recursive_triggers OFF)
+- *(ddl)* CREATE TABLE IF NOT EXISTS still errors on an index-name collision
+- *(txn)* take the write lock before DDL navigates its b-tree too
+
+### Refactor
+
+- fold the C-API and wasm bindings into the main crate as opt-in features
+
 ## [0.1.5](https://github.com/KarpelesLab/graphitesql/compare/v0.1.4...v0.1.5) - 2026-07-22
 
 ### Added
