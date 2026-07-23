@@ -133,6 +133,37 @@ fn reject_filter_on_nonaggregate_window(
     Ok(())
 }
 
+/// Wrap a `lag`/`lead` offset expression so a **non-integer** offset yields the
+/// function's default (SQLite's behavior): `lag(v, 1.9)` is `NULL` for every row,
+/// `lag(v, 2.5, 'D')` is `'D'`. SQLite requires the offset be integer-valued
+/// under numeric affinity — `2.0`, `'2'`, `'2x'`, and `1+1` all pass, but `1.9`,
+/// `1.5+0.5`… and `NULL` do not — and a non-integer makes the target row fall out
+/// of the partition, so the default is returned. We reproduce that without a
+/// runtime special-case by desugaring the offset to
+/// `CASE WHEN CAST(off AS INTEGER) = CAST(off AS REAL) THEN off ELSE <far> END`,
+/// where `<far>` is a sentinel larger than any partition so the shift always
+/// lands outside it (chosen to never overflow `i64` when added to a row index).
+fn lag_lead_offset_guard(off: Expr) -> Expr {
+    // 10^15: beyond any in-memory partition, yet `row_index + far` cannot overflow.
+    const FAR: i64 = 1_000_000_000_000_000;
+    let cast = |ty: &str| Expr::Cast {
+        expr: Box::new(off.clone()),
+        type_name: ty.into(),
+    };
+    Expr::Case {
+        operand: None,
+        when_then: alloc::vec![(
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(cast("INTEGER")),
+                right: Box::new(cast("REAL")),
+            },
+            off,
+        )],
+        else_result: Some(Box::new(Expr::Literal(Literal::Integer(FAR)))),
+    }
+}
+
 /// Parse exactly one statement, erroring if there is trailing input.
 pub fn parse_one(sql: &str) -> Result<Statement> {
     let mut stmts = parse(sql)?;
@@ -2877,6 +2908,15 @@ impl Parser {
                 when_then,
                 else_result,
             });
+        }
+        if over.is_some()
+            && args.len() >= 2
+            && (name.eq_ignore_ascii_case("lag") || name.eq_ignore_ascii_case("lead"))
+        {
+            args[1] = lag_lead_offset_guard(core::mem::replace(
+                &mut args[1],
+                Expr::Literal(Literal::Null),
+            ));
         }
         Ok(Expr::Function {
             name,
