@@ -785,22 +785,27 @@ impl Parser {
         })
     }
 
-    /// A PRAGMA argument: a normal expression, but also a bare keyword like
-    /// `ON`/`OFF`/`FULL` that SQLite accepts as a literal here.
+    /// A PRAGMA argument: a single name / string / number, or a bare keyword like
+    /// `ON`/`OFF`/`FULL`/`wal` that SQLite accepts as a literal here. SQLite's
+    /// grammar (`nmnum`) admits only ONE such token — never a dotted or compound
+    /// expression — so `PRAGMA table_info(main.t)` is rejected at the `.` with
+    /// `near ".": syntax error`.
     fn pragma_value(&mut self) -> Result<Expr> {
         if let Some(Token::Word(w)) = self.peek() {
             let w = w.clone();
-            // A bare word not followed by an operator/paren is a keyword literal.
-            if is_reserved_keyword(&w.to_ascii_lowercase()) {
-                self.pos += 1;
-                return Ok(Expr::Column {
-                    schema: None,
-                    table: None,
-                    column: w,
-                    quoted: false,
-                    span: Span::none(),
-                });
+            self.pos += 1;
+            // A `.` here would make a schema-qualified argument (`main.t`), which
+            // SQLite does not accept — the error points at the dot.
+            if matches!(self.peek(), Some(Token::Dot)) {
+                return Err(self.err("syntax error"));
             }
+            return Ok(Expr::Column {
+                schema: None,
+                table: None,
+                column: w,
+                quoted: false,
+                span: Span::none(),
+            });
         }
         self.expr()
     }
