@@ -43241,14 +43241,17 @@ fn range_value_bound(
     desc: bool,
     is_start: bool,
 ) -> usize {
-    // A NULL current value has no numeric range: NULLs form their own peer group,
-    // so a PRECEDING/FOLLOWING offset collapses to the current (NULL) peer group
-    // rather than spanning into the adjacent value groups — matching sqlite.
-    // (UNBOUNDED bounds are handled below and stay unbounded.)
+    // A numeric PRECEDING/FOLLOWING offset only ranges over a *numeric* ORDER BY
+    // value. When the current value is not numeric — NULL, TEXT (even
+    // numeric-looking text like '1'), or BLOB — there is no `value ± n` span, so
+    // the bound collapses to the current peer group (the rows equal to it),
+    // exactly as sqlite does. (UNBOUNDED bounds are handled below and stay
+    // unbounded.) Note the test is on the stored value's *type*, not whether it
+    // parses as a number: sqlite treats a TEXT '2' as its own peer, never as 2.0.
     if matches!(
         b,
         ResolvedBound::CurrentRow | ResolvedBound::Preceding(_) | ResolvedBound::Following(_)
-    ) && matches!(ovals[p], Value::Null)
+    ) && !matches!(ovals[p], Value::Integer(_) | Value::Real(_))
     {
         return group_bound(&ResolvedBound::CurrentRow, p, m, gid, is_start);
     }
