@@ -51,6 +51,53 @@ pub fn parse(sql: &str) -> Result<Vec<Statement>> {
     Ok(statements)
 }
 
+/// Resolve `WINDOW name AS (base …)` refinement chains in place (SQLite's
+/// `sqlite3WindowChain`). A definition that names a base window inherits the
+/// base's `PARTITION BY` / `ORDER BY`; it may **not** override them, nor supply a
+/// frame when the base already carries one — each is rejected with the same text
+/// SQLite uses, checked PARTITION → ORDER BY → frame. The frame itself is never
+/// inherited (a base with a frame is an error, so there is none to copy). A base
+/// that is not an *earlier* definition in the same clause is silently dropped, as
+/// SQLite ignores forward and unknown base references inside a `WINDOW` clause.
+fn resolve_window_def_chains(defs: &mut [(String, WindowSpec)]) -> Result<()> {
+    for i in 0..defs.len() {
+        let Some(base) = defs[i].1.base_name.clone() else {
+            continue;
+        };
+        // Only *earlier* definitions are visible (and are already resolved).
+        let Some(pexist) = defs[..i]
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(&base))
+            .map(|(_, s)| s.clone())
+        else {
+            defs[i].1.base_name = None;
+            continue;
+        };
+        let spec = &defs[i].1;
+        let zerr = if !spec.partition_by.is_empty() {
+            Some("PARTITION clause")
+        } else if !pexist.order_by.is_empty() && !spec.order_by.is_empty() {
+            Some("ORDER BY clause")
+        } else if pexist.frame.is_some() {
+            Some("frame specification")
+        } else {
+            None
+        };
+        if let Some(zerr) = zerr {
+            return Err(Error::Error(format!(
+                "cannot override {zerr} of window: {base}"
+            )));
+        }
+        let spec = &mut defs[i].1;
+        spec.partition_by = pexist.partition_by;
+        if !pexist.order_by.is_empty() {
+            spec.order_by = pexist.order_by;
+        }
+        spec.base_name = None;
+    }
+    Ok(())
+}
+
 /// Parse exactly one statement, erroring if there is trailing input.
 pub fn parse_one(sql: &str) -> Result<Statement> {
     let mut stmts = parse(sql)?;
@@ -984,6 +1031,7 @@ impl Parser {
                     break;
                 }
             }
+            resolve_window_def_chains(&mut window_defs)?;
         }
 
         Ok(Select {
