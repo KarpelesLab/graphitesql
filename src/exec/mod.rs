@@ -6908,8 +6908,20 @@ impl Connection {
             Statement::Delete(d) => &d.table,
             _ => unreachable!(),
         };
-        let meta = self.table_meta(table, None)?;
-        let columns = returning_labels(returning, &meta.columns);
+        // A view target (an `INSTEAD OF` trigger writes it) has no `TableMeta`;
+        // its RETURNING labels come from the view's own columns instead.
+        let view_cols = if self.is_view(table) {
+            Some(self.view_columns(table, params)?)
+        } else {
+            None
+        };
+        let columns = match &view_cols {
+            Some(cols) => returning_labels(returning, cols),
+            None => {
+                let meta = self.table_meta(table, None)?;
+                returning_labels(returning, &meta.columns)
+            }
+        };
         self.returning_rows.borrow_mut().clear();
         self.execute_params(sql, params)?;
         let rows = core::mem::take(&mut *self.returning_rows.borrow_mut());
@@ -10697,6 +10709,12 @@ impl Connection {
             if self.raise_ignore.replace(false) {
                 continue;
             }
+            // `INSERT INTO view … RETURNING …` projects the NEW row (the view's
+            // columns) — SQLite evaluates RETURNING against the values presented
+            // to the INSTEAD OF trigger, not any base-table row.
+            if !ins.returning.is_empty() {
+                self.collect_returning_cols(&ins.returning, &cols, &new, None, params)?;
+            }
             affected += 1;
         }
         Ok(affected)
@@ -11701,10 +11719,25 @@ impl Connection {
         rowid: Option<i64>,
         params: &Params,
     ) -> Result<()> {
-        let ctx = row_ctx(values, &meta.columns, rowid, params).with_subqueries(self);
+        self.collect_returning_cols(returning, &meta.columns, values, rowid, params)
+    }
+
+    /// Like [`collect_returning`](Self::collect_returning) but resolves the
+    /// `RETURNING` expressions against an explicit column list — used for an
+    /// `INSTEAD OF` view INSERT, whose "row" is the view's columns (a view has no
+    /// `TableMeta`).
+    fn collect_returning_cols(
+        &self,
+        returning: &[ResultColumn],
+        columns: &[ColumnInfo],
+        values: &[Value],
+        rowid: Option<i64>,
+        params: &Params,
+    ) -> Result<()> {
+        let ctx = row_ctx(values, columns, rowid, params).with_subqueries(self);
         let mut out = Vec::new();
         for col in returning {
-            project_column(col, &meta.columns, &ctx, &mut out)?;
+            project_column(col, columns, &ctx, &mut out)?;
         }
         self.returning_rows.borrow_mut().push(out);
         Ok(())
