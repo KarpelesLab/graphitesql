@@ -4583,10 +4583,30 @@ impl Connection {
         }
     }
 
+    /// Like [`pragma_db_schema`], but for an *unqualified* introspection PRAGMA
+    /// (no `<db>.` prefix) it first consults the TEMP catalog: a temp object
+    /// shadows a same-named `main` object, matching SQLite's unqualified-name
+    /// resolution order (temp, then main, then attached). A schema-qualified
+    /// PRAGMA (`PRAGMA temp.table_info(t)` / `PRAGMA main.table_info(t)`)
+    /// resolves exactly the named catalog.
+    ///
+    /// [`pragma_db_schema`]: Self::pragma_db_schema
+    fn pragma_db_schema_for(&self, p: &Pragma, name: &str) -> Result<&Schema> {
+        if p.schema.is_none()
+            && let Some(t) = self.temp_db.as_ref()
+            && t.schema
+                .objects()
+                .iter()
+                .any(|o| o.name.eq_ignore_ascii_case(name))
+        {
+            return Ok(&t.schema);
+        }
+        self.pragma_db_schema(p)
+    }
+
     /// `PRAGMA table_info(name)` → one row per column
     /// `(cid, name, type, notnull, dflt_value, pk)`.
     fn pragma_table_info(&self, p: &Pragma, extended: bool) -> Result<QueryResult> {
-        let sch = self.pragma_db_schema(p)?;
         let table = match &p.value {
             Some(Expr::Column { column, .. }) => column.clone(),
             Some(Expr::Literal(Literal::Str(s))) => s.clone(),
@@ -4597,6 +4617,7 @@ impl Connection {
             Some(Expr::Literal(Literal::Integer(n))) => n.to_string(),
             _ => String::new(),
         };
+        let sch = self.pragma_db_schema_for(p, &table)?;
         // The schema catalog is queryable but has no stored CREATE statement;
         // report its fixed five columns, as SQLite does for `sqlite_master` /
         // `sqlite_schema` (and their `sqlite_temp_*` aliases).
@@ -4999,9 +5020,9 @@ impl Connection {
     /// `PRAGMA index_list(table)` → `(seq, name, unique, origin, partial)`, newest
     /// index first (as SQLite lists them).
     fn pragma_index_list(&self, p: &Pragma) -> Result<QueryResult> {
-        let sch = self.pragma_db_schema(p)?;
         // A bare / non-name argument names no table → empty result (SQLite parity).
         let table = Self::pragma_arg_name(p).unwrap_or_default();
+        let sch = self.pragma_db_schema_for(p, &table)?;
         let objs: Vec<_> = sch.indexes_on(&table).collect();
 
         // To label an automatic index's origin `pk` vs `u`, find the PRIMARY KEY's
@@ -5099,7 +5120,7 @@ impl Connection {
                 .map(|s| String::from(*s))
                 .collect()
         };
-        let sch = self.pragma_db_schema(p)?;
+        let sch = self.pragma_db_schema_for(p, &index)?;
         // SQLite reports an unknown index name as an empty result, not an error.
         let Some(obj) = sch.index(&index) else {
             // A WITHOUT ROWID table's PRIMARY KEY is the table b-tree itself,
@@ -5300,9 +5321,9 @@ impl Connection {
     /// `PRAGMA foreign_key_list(table)` →
     /// `(id, seq, table, from, to, on_update, on_delete, match)`.
     fn pragma_foreign_key_list(&self, p: &Pragma) -> Result<QueryResult> {
-        let sch = self.pragma_db_schema(p)?;
         // A bare / non-name argument names no table → empty result (SQLite parity).
         let table = Self::pragma_arg_name(p).unwrap_or_default();
+        let sch = self.pragma_db_schema_for(p, &table)?;
         let columns: Vec<String> = [
             "id",
             "seq",
