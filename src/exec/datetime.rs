@@ -294,7 +294,16 @@ fn parse_hh_mm_ss(z: &str, p: &mut DateTime) -> bool {
             if i == start {
                 return false;
             }
-            sec += frac / scale;
+            // Truncate to at most 3 fractional digits, matching sqlite's
+            // `parseHhMmSs` (`if( ms>0.999 ) ms = 0.999`). Without this a value
+            // like `.9999` would round up on the later `(s*1000 + 0.5)` step and
+            // spill into the next second, rendering an impossible `:60` field;
+            // sqlite truncates instead (`.9999` → `.999`).
+            let mut ms = frac / scale;
+            if ms > 0.999 {
+                ms = 0.999;
+            }
+            sec += ms;
         }
     }
     // SQLite range-checks the clock fields: hour 0-24, minute 0-59, second in
