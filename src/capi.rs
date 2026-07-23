@@ -5,11 +5,12 @@
 //! so existing C/C++/FFI code that links `libsqlite3` can link this instead and
 //! drive graphitesql's engine.
 //!
-//! # Why a separate crate
+//! # The `capi` feature
 //!
 //! The core `graphitesql` crate is `#![forbid(unsafe_code)]`, `no_std`+alloc and
 //! zero-dependency. A C ABI needs `extern "C"`, raw pointers and `unsafe`, so this
-//! shim lives in its own workspace and opts out — exactly like `graphitesql-wasm`.
+//! module is gated behind the opt-in `capi` feature with a scoped
+//! `#[allow(unsafe_code)]`; the rest of the crate stays `deny(unsafe_code)`.
 //!
 //! # Scope
 //!
@@ -23,14 +24,21 @@
 //! Not (yet) covered: incremental BLOB I/O, online backup, and the
 //! authorizer/hooks.
 
-#![allow(unsafe_code)]
 #![allow(non_camel_case_types)]
+// The C ABI is documented by `include/sqlite3.h`, not rustdoc; the symbols
+// intentionally mirror libsqlite3's names/signatures.
+#![allow(missing_docs)]
 // C ABI names are fixed by SQLite; silence Rust's "fn arg" style lints on them.
 #![allow(clippy::missing_safety_doc)]
 
+use crate::exec::eval::Params;
+use crate::{Connection, QueryResult, UpdateOp, Value};
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 use core::ffi::{c_char, c_double, c_int, c_longlong, c_uchar, c_void};
-use graphitesql::exec::eval::Params;
-use graphitesql::{Connection, QueryResult, UpdateOp, Value};
 use std::ffi::{CStr, CString};
 
 // --- Result codes (subset of sqlite3.h) ---------------------------------------
@@ -80,7 +88,7 @@ impl sqlite3 {
     }
     /// Record an engine error, capturing its token byte offset (a syntax error
     /// carries one, like `sqlite3_error_offset`) when present.
-    fn set_error_e(&mut self, e: &graphitesql::Error) {
+    fn set_error_e(&mut self, e: &crate::Error) {
         self.set_error(SQLITE_ERROR, &e.to_string());
         self.error_offset = e.parse_offset().map_or(-1, |o| o as c_int);
     }
@@ -154,8 +162,8 @@ fn is_row_producer(sql: &str) -> bool {
 /// doesn't parse as an IUD returns false (it'll route to the mutation path, which
 /// reports the same parse error).
 fn has_returning(sql: &str) -> bool {
-    use graphitesql::sql::ast::Statement;
-    match graphitesql::sql::parser::parse_one(sql) {
+    use crate::sql::ast::Statement;
+    match crate::sql::parser::parse_one(sql) {
         Ok(Statement::Insert(i)) => !i.returning.is_empty(),
         Ok(Statement::Update(u)) => !u.returning.is_empty(),
         Ok(Statement::Delete(d)) => !d.returning.is_empty(),
@@ -309,7 +317,7 @@ fn value_to_text(v: &Value) -> Option<Vec<u8>> {
     match v {
         Value::Null => None,
         Value::Integer(i) => Some(i.to_string().into_bytes()),
-        Value::Real(f) => Some(graphitesql::exec::eval::format_real(*f).into_bytes()),
+        Value::Real(f) => Some(crate::exec::eval::format_real(*f).into_bytes()),
         Value::Text(s) => Some(s.clone().into_bytes()),
         Value::Blob(b) => Some(b.clone()),
     }
@@ -425,7 +433,7 @@ pub unsafe extern "C" fn sqlite3_errcode(db: *mut sqlite3) -> c_int {
 
 /// The byte offset of the most recent error's offending token within the SQL, or
 /// -1 when the error had no location (or there was no error) — mirrors SQLite's
-/// `sqlite3_error_offset` (available for a syntax error via [`Error::parse_offset`]).
+/// `sqlite3_error_offset` (available for a syntax error via [`crate::Error::parse_offset`]).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sqlite3_error_offset(db: *mut sqlite3) -> c_int {
     if db.is_null() {
@@ -1209,7 +1217,7 @@ pub unsafe extern "C" fn sqlite3_create_function(
                     );
                 }
                 match ctx.error {
-                    Some(e) => Err(graphitesql::Error::Error(e)),
+                    Some(e) => Err(crate::Error::Error(e)),
                     None => Ok(ctx.result),
                 }
             });
@@ -1285,8 +1293,8 @@ struct CAggregate {
     agg_buf: Vec<u8>,
 }
 
-impl graphitesql::AggregateFunction for CAggregate {
-    fn step(&mut self, args: &[Value]) -> graphitesql::Result<()> {
+impl crate::AggregateFunction for CAggregate {
+    fn step(&mut self, args: &[Value]) -> crate::Result<()> {
         let mut vals: Vec<sqlite3_value> = args
             .iter()
             .map(|v| sqlite3_value {
@@ -1309,12 +1317,12 @@ impl graphitesql::AggregateFunction for CAggregate {
         };
         unsafe { step_fn(&mut ctx, args.len() as c_int, ptrs.as_mut_ptr()) };
         match ctx.error {
-            Some(e) => Err(graphitesql::Error::Error(e)),
+            Some(e) => Err(crate::Error::Error(e)),
             None => Ok(()),
         }
     }
 
-    fn finalize(&mut self) -> graphitesql::Result<Value> {
+    fn finalize(&mut self) -> crate::Result<Value> {
         let final_fn = self.final_;
         let ud = self.user_data;
         let self_ptr = self as *mut CAggregate;
@@ -1326,7 +1334,7 @@ impl graphitesql::AggregateFunction for CAggregate {
         };
         unsafe { final_fn(&mut ctx) };
         match ctx.error {
-            Some(e) => Err(graphitesql::Error::Error(e)),
+            Some(e) => Err(crate::Error::Error(e)),
             None => Ok(ctx.result),
         }
     }
@@ -1510,9 +1518,8 @@ pub unsafe extern "C" fn sqlite3_result_error(
 
 // --- custom collating sequences -----------------------------------------------
 
-type XCompare = Option<
-    unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int,
->;
+type XCompare =
+    Option<unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int>;
 
 /// Register a custom collating sequence callable as `COLLATE zName` in SQL. The
 /// comparison receives the two operands as byte buffers and returns
@@ -1706,9 +1713,8 @@ const SQLITE_DELETE: c_int = 9;
 const SQLITE_INSERT: c_int = 18;
 const SQLITE_UPDATE: c_int = 23;
 
-type UpdateHookCb = Option<
-    unsafe extern "C" fn(*mut c_void, c_int, *const c_char, *const c_char, c_longlong),
->;
+type UpdateHookCb =
+    Option<unsafe extern "C" fn(*mut c_void, c_int, *const c_char, *const c_char, c_longlong)>;
 
 /// Register a data-change notification callback (`sqlite3_update_hook`): invoked
 /// once per inserted/updated/deleted row with the op code
@@ -1833,19 +1839,16 @@ pub unsafe extern "C" fn sqlite3_set_authorizer(
     match cb {
         Some(f) => {
             let a = arg as usize;
-            db.conn
-                .set_authorizer(move |action, a1, a2, dbn, trig| {
-                    // Convert each Option<&str> to a NUL-terminated C string kept
-                    // alive across the call; None → a null pointer.
-                    let c1 = a1.map(|s| CString::new(s).unwrap_or_default());
-                    let c2 = a2.map(|s| CString::new(s).unwrap_or_default());
-                    let c3 = dbn.map(|s| CString::new(s).unwrap_or_default());
-                    let c4 = trig.map(|s| CString::new(s).unwrap_or_default());
-                    let p = |c: &Option<CString>| {
-                        c.as_ref().map_or(core::ptr::null(), |s| s.as_ptr())
-                    };
-                    unsafe { f(a as *mut c_void, action, p(&c1), p(&c2), p(&c3), p(&c4)) }
-                });
+            db.conn.set_authorizer(move |action, a1, a2, dbn, trig| {
+                // Convert each Option<&str> to a NUL-terminated C string kept
+                // alive across the call; None → a null pointer.
+                let c1 = a1.map(|s| CString::new(s).unwrap_or_default());
+                let c2 = a2.map(|s| CString::new(s).unwrap_or_default());
+                let c3 = dbn.map(|s| CString::new(s).unwrap_or_default());
+                let c4 = trig.map(|s| CString::new(s).unwrap_or_default());
+                let p = |c: &Option<CString>| c.as_ref().map_or(core::ptr::null(), |s| s.as_ptr());
+                unsafe { f(a as *mut c_void, action, p(&c1), p(&c2), p(&c3), p(&c4)) }
+            });
         }
         None => db.conn.clear_authorizer(),
     }
@@ -1994,7 +1997,12 @@ fn quote_ident(s: &str) -> String {
 }
 
 /// Fetch the target cell's bytes and text-ness, or `None` if the row is absent.
-fn blob_fetch(db: &mut sqlite3, table: &str, column: &str, rowid: c_longlong) -> Option<(Vec<u8>, bool)> {
+fn blob_fetch(
+    db: &mut sqlite3,
+    table: &str,
+    column: &str,
+    rowid: c_longlong,
+) -> Option<(Vec<u8>, bool)> {
     let sql = format!(
         "SELECT {} FROM {} WHERE rowid = ?1",
         quote_ident(column),

@@ -19,6 +19,16 @@ name = "graphitesql"
 path = "src/bin/graphitesql.rs"
 required-features = ["std"]
 
+# NOTE: the `[lib]` crate-type is left at the default (`rlib`), so the default and
+# `no_std` builds stay pure Rust libraries. The `libsqlite3`-style shared/static
+# library and the WebAssembly module are produced ON DEMAND by overriding the
+# crate-type at build time (same pattern as the purecrypto FFI shim), e.g.:
+#   cargo rustc --release --features capi --crate-type cdylib      # libgraphitesql.so
+#   cargo rustc --release --features capi --crate-type staticlib   # libgraphitesql.a
+#   cargo rustc --release --features wasm --target wasm32-unknown-unknown --crate-type cdylib
+# This keeps `cargo build --no-default-features` (a bare no_std rlib) working — a
+# no_std cdylib/staticlib would otherwise need a global allocator + panic handler.
+
 [features]
 # `std` is on by default and brings the std-backed VFS (real files) plus
 # std::error::Error impls. Turn it off for no_std targets (wasm, embedded);
@@ -34,9 +44,23 @@ fts5 = []
 # like a sqlite3 built with the ICU extension. Off by default so the default
 # build stays behavior-identical to stock sqlite3; turn it on for Unicode text.
 unicode = []
+# `capi` exports a `libsqlite3`-compatible C ABI (`extern "C"` `sqlite3_*`) from
+# the cdylib/staticlib. Needs the std VFS (file databases), so it pulls in `std`.
+# Off by default (the engine has no FFI without it); uses `unsafe` (raw pointers).
+capi = ["std"]
+# `wasm` builds the WebAssembly (browser) bindings (`wasm-bindgen` + an OPFS VFS).
+# Off by default; uses `unsafe` (wasm-bindgen glue) and the js-sys/web-sys deps.
+wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:web-sys"]
 
 [dependencies]
-# Intentionally none. graphitesql is pure Rust over `core` + `alloc` only.
+# The default build is zero-dependency (pure `core` + `alloc`). These are OPT-IN,
+# pulled only by the `wasm` feature for the browser bindings.
+wasm-bindgen = { version = "0.2", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+  "FileSystemSyncAccessHandle",
+  "FileSystemReadWriteOptions",
+] }
 
 [profile.release]
 opt-level = 3
@@ -44,6 +68,7 @@ lto = true
 panic = "abort"
 
 [lints.rust]
-# The whole point of the project: no `unsafe` anywhere in the crate.
-unsafe_code = "forbid"
+# The engine is `unsafe`-free. `deny` (not `forbid`) so the opt-in `capi`/`wasm`
+# FFI modules can carry a localized `#[allow(unsafe_code)]`; nothing else may.
+unsafe_code = "deny"
 missing_docs = "warn"

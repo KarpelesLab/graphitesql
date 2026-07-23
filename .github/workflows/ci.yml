@@ -128,15 +128,14 @@ jobs:
       # regressions.
       - name: cargo build --no-default-features --target wasm32-unknown-unknown
         run: cargo build --no-default-features --target wasm32-unknown-unknown
-      # The `graphitesql-wasm` sibling crate (wasm-bindgen JS bindings + OPFS VFS,
-      # ROADMAP D6) is its own workspace, so build & clippy it explicitly. It opts
-      # out of the core's zero-dep / forbid-unsafe rules on purpose.
-      - name: graphitesql-wasm build + clippy
-        working-directory: graphitesql-wasm
+      # The `wasm` feature (wasm-bindgen JS bindings + OPFS VFS, ROADMAP D6) is an
+      # opt-in FFI module of the main crate, built as a cdylib on demand. It uses
+      # `unsafe` (wasm-bindgen glue) behind a scoped `#[allow(unsafe_code)]`.
+      - name: wasm bindings build + clippy (cdylib)
         run: |
           rustup component add clippy
-          cargo build --target wasm32-unknown-unknown --release
-          cargo clippy --target wasm32-unknown-unknown --release -- -D warnings
+          cargo rustc --lib --release --features wasm --target wasm32-unknown-unknown --crate-type cdylib
+          cargo clippy --lib --release --features wasm --target wasm32-unknown-unknown -- -D warnings
 
   capi:
     name: C-API shim (D7)
@@ -151,15 +150,15 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: capi
-      # The `graphitesql-capi` sibling crate (a libsqlite3-compatible C ABI over the
-      # engine, ROADMAP D7) is its own workspace. Build + clippy it, then compile the
-      # C consumer test against the cdylib and run it (end-to-end C-ABI parity). It
-      # opts out of the core's zero-dep / forbid-unsafe rules on purpose.
-      - name: graphitesql-capi build + clippy + C test
-        working-directory: graphitesql-capi
+      # The `capi` feature (a libsqlite3-compatible C ABI over the engine, ROADMAP
+      # D7) is an opt-in FFI module of the main crate, built as a cdylib/staticlib on
+      # demand. It uses `unsafe` (raw C pointers) behind a scoped `#[allow(unsafe_code)]`.
+      # Clippy the shim, then compile the C consumer test against the cdylib and run
+      # it (end-to-end C-ABI parity).
+      - name: C-ABI shim clippy + C consumer test
         run: |
-          cargo clippy --release --all-targets -- -D warnings
-          bash tests/run.sh
+          cargo clippy --lib --release --features capi -- -D warnings
+          bash tests/capi/run.sh
 
   msrv:
     name: MSRV (1.89)
@@ -172,7 +171,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: msrv
-      - name: cargo build (default + no_std) on MSRV
+      - name: cargo build (default + capi + no_std) on MSRV
+        # Not `--all-features`: the `wasm` feature's wasm-bindgen toolchain has its
+        # own (newer) MSRV. The engine + C-ABI shim hold the crate's 1.89 MSRV.
         run: |
-          cargo build --all-features
+          cargo build --features "capi unicode"
           cargo build --no-default-features

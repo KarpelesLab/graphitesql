@@ -1,6 +1,7 @@
-// Node smoke test for the in-memory path of graphitesql-wasm.
+// Node smoke test for the in-memory path of graphitesql's `wasm` feature.
+// Build first: wasm-pack build --target nodejs --features wasm (outputs pkg/).
 // (OPFS is browser-only; this exercises Database.new/exec/query/serialize/deserialize.)
-import { Database } from "../pkg-node/graphitesql_wasm.js";
+import { Database } from "../pkg/graphitesql.js";
 
 let failures = 0;
 function check(name, cond) {

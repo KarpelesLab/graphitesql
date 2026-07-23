@@ -20,10 +20,14 @@
 //!
 //! * **File-format compatible.** A database created by SQLite must be readable
 //!   and writable by graphitesql and vice-versa, byte for byte.
-//! * **Safe.** `#![forbid(unsafe_code)]`. No FFI, no C, no `unsafe` blocks.
+//! * **Safe.** `#![deny(unsafe_code)]` — the entire SQL/storage engine is
+//!   `unsafe`-free. The only `unsafe` in the crate lives in the two opt-in FFI
+//!   binding shims (`capi`, `wasm`), each `#[allow(unsafe_code)]` and off by
+//!   default; the default build contains no `unsafe` and no FFI.
 //! * **Portable.** `#![no_std]` + `alloc`. Optional `std` feature adds a
 //!   file-backed VFS and `std::error::Error` integration.
-//! * **Single crate.** Everything (storage, B-tree, SQL, VM) lives here.
+//! * **Single crate.** Everything (storage, B-tree, SQL, VM, and the optional
+//!   C-ABI / WebAssembly bindings) lives here.
 //!
 //! ## Feature flags
 //!
@@ -32,6 +36,10 @@
 //! * `fts5` *(default)* — registers the built-in FTS5 full-text-search virtual
 //!   table (the `MATCH` query language, `bm25()`/`rank` ranking, `highlight()`).
 //!   Disable to drop full-text search and shrink the build.
+//! * `capi` — a `libsqlite3`-compatible C ABI (`extern "C"` `sqlite3_*` symbols);
+//!   builds the `cdylib`/`staticlib`. Pulls in `std`. Uses `unsafe` (raw pointers).
+//! * `wasm` — WebAssembly (browser) bindings via `wasm-bindgen`, with an
+//!   OPFS-backed VFS. Uses `unsafe` (wasm-bindgen glue) and `js-sys`/`web-sys`.
 //!
 //! ## Attribution
 //!
@@ -43,7 +51,11 @@
 //! [SQLite]: https://www.sqlite.org/
 
 #![no_std]
-#![forbid(unsafe_code)]
+// The engine is `unsafe`-free. `deny` (not `forbid`) so the two opt-in FFI shims
+// below (`capi`, `wasm`) can carry a localized `#[allow(unsafe_code)]` — a C ABI
+// needs raw pointers and wasm-bindgen generates `unsafe` glue. The default build
+// (neither feature) contains no `unsafe`.
+#![deny(unsafe_code)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 extern crate alloc;
@@ -51,9 +63,21 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+/// A `libsqlite3`-compatible C ABI (subset) over the engine — `extern "C"`
+/// `sqlite3_*` symbols. Opt-in (`capi` feature); uses `unsafe` (raw pointers).
+#[cfg(feature = "capi")]
+#[allow(unsafe_code)]
+pub mod capi;
+
+/// WebAssembly (browser) bindings via `wasm-bindgen`, with an OPFS-backed VFS.
+/// Opt-in (`wasm` feature); uses `unsafe` (wasm-bindgen glue).
+#[cfg(feature = "wasm")]
+#[allow(unsafe_code)]
+pub mod wasm;
+
 pub mod error;
-// Low-level implementation modules are `pub` only so the sibling crates
-// (`graphitesql-capi`, `graphitesql-wasm`) and the test suite can reach them;
+// Low-level implementation modules are `pub` only so the FFI binding modules
+// (`capi`, `wasm`) and the test suite can reach them;
 // they are NOT part of graphitesql's stable, SQLite-compatible public API. Mark
 // them `#[doc(hidden)]` so they are excluded from the generated docs and from
 // `cargo-semver-checks` — internal churn (e.g. a new field on `vtab::Fts5Tok`)

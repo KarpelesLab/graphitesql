@@ -1,8 +1,23 @@
 # Project working agreement (graphitesql)
 
-A pure-Rust, `#![forbid(unsafe_code)]`, `#![no_std]`+alloc, zero-dependency
-reimplementation of SQLite, byte-compatible with the SQLite 3 file format.
-MSRV 1.89.
+A pure-Rust, `#![deny(unsafe_code)]`, `#![no_std]`+alloc reimplementation of SQLite,
+byte-compatible with the SQLite 3 file format. MSRV 1.89. The default build is
+zero-dependency and 100% `unsafe`-free — the engine (storage, B-tree, SQL, VM)
+never uses `unsafe`. The only `unsafe` lives in two **opt-in FFI shims**, each a
+module behind a feature flag with a scoped `#[allow(unsafe_code)]`:
+
+- `capi` — a `libsqlite3`-compatible C ABI (`extern "C"` `sqlite3_*`), `src/capi.rs`.
+  Pulls in `std`. Build the C lib on demand:
+  `cargo rustc --lib --features capi --crate-type cdylib` (or `staticlib`).
+- `wasm` — browser bindings via `wasm-bindgen` + an OPFS VFS, `src/wasm.rs`. Adds the
+  `wasm-bindgen`/`js-sys`/`web-sys` deps. Build:
+  `cargo rustc --lib --features wasm --target wasm32-unknown-unknown --crate-type cdylib`.
+
+The `[lib]` crate-type stays `rlib` (so `--no-default-features` is a bare no_std
+library); the cdylib/staticlib are produced only via the `cargo rustc --crate-type`
+commands above (same pattern as the purecrypto FFI shim). This is why
+`#![deny]`, not `#![forbid]` — `forbid` can't be locally overridden, and the two
+FFI modules need `unsafe`. Nothing outside those two modules may use `unsafe`.
 
 ## CHANGELOG.md is owned by release-plz — NEVER edit it by hand
 

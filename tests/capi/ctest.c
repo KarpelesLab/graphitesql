@@ -1,5 +1,5 @@
 /*
-** End-to-end C test for graphitesql-capi: drives the library exactly as a real
+** End-to-end C test for graphitesql's `capi` feature: drives the library exactly as a real
 ** libsqlite3 consumer would (open, exec, prepare/bind/step/column, finalize,
 ** close) and checks results. Compiled and run by tests/run.sh against both this
 ** shim and (when present) the real libsqlite3 to confirm behavioural parity.

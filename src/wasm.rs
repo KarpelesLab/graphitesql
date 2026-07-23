@@ -7,13 +7,14 @@
 //! * **OPFS** — [`Database::open_opfs`], persistent, backed by the browser's
 //!   Origin-Private File System *synchronous access handles*.
 //!
-//! # Why this is a separate crate
+//! # The `wasm` feature
 //!
 //! The core `graphitesql` crate is `#![forbid(unsafe_code)]`, `#![no_std]`+alloc
-//! and zero-dependency. `wasm-bindgen` generates `unsafe` glue and pulls in
-//! `js-sys`/`web-sys`, so the JS boundary lives here, out of the core, exactly as
-//! the ROADMAP requires. The core is consumed with `default-features = false`
-//! (its `std` VFS and OS file locks do not exist on `wasm32-unknown-unknown`).
+//! and zero-dependency by default. `wasm-bindgen` generates `unsafe` glue and
+//! pulls in `js-sys`/`web-sys`, so this JS boundary is gated behind the opt-in
+//! `wasm` feature with a scoped `#[allow(unsafe_code)]`, keeping the default build
+//! safe and dependency-free. Build it as a cdylib with
+//! `cargo rustc --lib --features wasm --target wasm32-unknown-unknown --crate-type cdylib`.
 //!
 //! # OPFS and the synchronous-VFS trick
 //!
@@ -28,13 +29,17 @@
 //! See `worker.js` and `index.html` in this crate for a runnable browser example.
 
 // wasm-bindgen's generated glue is `unsafe`; opt out of the workspace-wide ban.
-#![allow(unsafe_code)]
 
-use graphitesql::vfs::{File, OpenFlags, Vfs};
-use graphitesql::{Connection, Error, Value};
+use crate::vfs::{File, OpenFlags, Vfs};
+use crate::{Connection, Error, Value};
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use core::cell::RefCell;
 use js_sys::{Array, Object, Reflect, Uint8Array};
-use std::cell::RefCell;
-use std::collections::BTreeMap;
+
 use wasm_bindgen::prelude::*;
 use web_sys::{FileSystemReadWriteOptions, FileSystemSyncAccessHandle};
 
@@ -61,7 +66,7 @@ fn value_to_js(v: &Value) -> JsValue {
 
 /// Build the `{ columns: string[], rows: any[][] }` object returned by
 /// [`Database::query`].
-fn query_result_to_js(qr: &graphitesql::QueryResult) -> Result<JsValue, JsValue> {
+fn query_result_to_js(qr: &crate::QueryResult) -> Result<JsValue, JsValue> {
     let obj = Object::new();
     let cols = Array::new();
     for c in &qr.columns {
@@ -173,7 +178,7 @@ impl OpfsFile {
 }
 
 impl File for OpfsFile {
-    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> graphitesql::Result<()> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> crate::Result<()> {
         let opts = Self::opts_at(offset);
         let n = self
             .handle
@@ -188,7 +193,7 @@ impl File for OpfsFile {
         Ok(())
     }
 
-    fn write_all_at(&mut self, buf: &[u8], offset: u64) -> graphitesql::Result<()> {
+    fn write_all_at(&mut self, buf: &[u8], offset: u64) -> crate::Result<()> {
         let opts = Self::opts_at(offset);
         let n = self
             .handle
@@ -200,19 +205,19 @@ impl File for OpfsFile {
         Ok(())
     }
 
-    fn truncate(&mut self, size: u64) -> graphitesql::Result<()> {
+    fn truncate(&mut self, size: u64) -> crate::Result<()> {
         self.handle
             .truncate_with_f64(size as f64)
             .map_err(|_| Error::Io("OPFS truncate failed".into()))
     }
 
-    fn sync(&mut self) -> graphitesql::Result<()> {
+    fn sync(&mut self) -> crate::Result<()> {
         self.handle
             .flush()
             .map_err(|_| Error::Io("OPFS flush failed".into()))
     }
 
-    fn size(&self) -> graphitesql::Result<u64> {
+    fn size(&self) -> crate::Result<u64> {
         self.handle
             .get_size()
             .map(|s| s as u64)
@@ -268,7 +273,7 @@ impl OpfsVfs {
 }
 
 impl Vfs for OpfsVfs {
-    fn open(&self, path: &str, flags: OpenFlags) -> graphitesql::Result<Box<dyn File>> {
+    fn open(&self, path: &str, flags: OpenFlags) -> crate::Result<Box<dyn File>> {
         let mut files = self.files.borrow_mut();
         match files.get_mut(path) {
             Some(entry) => {
@@ -293,7 +298,7 @@ impl Vfs for OpfsVfs {
         }
     }
 
-    fn delete(&self, path: &str) -> graphitesql::Result<()> {
+    fn delete(&self, path: &str) -> crate::Result<()> {
         if let Some(entry) = self.files.borrow_mut().get_mut(path) {
             entry
                 .handle
@@ -304,7 +309,7 @@ impl Vfs for OpfsVfs {
         Ok(())
     }
 
-    fn exists(&self, path: &str) -> graphitesql::Result<bool> {
+    fn exists(&self, path: &str) -> crate::Result<bool> {
         Ok(self
             .files
             .borrow()

@@ -1,5 +1,5 @@
 /*
-** Subset of the sqlite3 C API implemented by graphitesql-capi (ROADMAP D7).
+** Subset of the sqlite3 C API implemented by graphitesql's `capi` feature (ROADMAP D7).
 ** Declarations match the official sqlite3.h so existing consumers compile
 ** unchanged for the covered surface. See src/lib.rs for the authoritative list.
 */

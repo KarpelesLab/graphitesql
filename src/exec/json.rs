@@ -383,7 +383,7 @@ fn jsonb_header_len(n: usize) -> usize {
         2
     } else if n <= 0xFFFF {
         3
-    } else if n <= 0xFFFF_FFFF {
+    } else if n as u64 <= 0xFFFF_FFFF {
         5
     } else {
         9
@@ -471,7 +471,7 @@ fn push_jsonb(out: &mut Vec<u8>, ty: u8, payload: &[u8]) {
     } else if n <= 0xFFFF {
         out.push((13 << 4) | ty);
         out.extend_from_slice(&(n as u16).to_be_bytes());
-    } else if n <= 0xFFFF_FFFF {
+    } else if n as u64 <= 0xFFFF_FFFF {
         out.push((14 << 4) | ty);
         out.extend_from_slice(&(n as u32).to_be_bytes());
     } else {
