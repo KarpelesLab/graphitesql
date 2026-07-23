@@ -1,10 +1,10 @@
 //! WebAssembly (browser) bindings for [graphitesql](https://crates.io/crates/graphitesql).
 //!
 //! This crate is the D6 "wasm" track: it exposes graphitesql's engine to
-//! JavaScript through [`wasm-bindgen`], with two storage backends:
+//! JavaScript through [`wasm-bindgen`](https://docs.rs/wasm-bindgen), with two storage backends:
 //!
-//! * **in-memory** — [`Database::new`], always available, needs no host support;
-//! * **OPFS** — [`Database::open_opfs`], persistent, backed by the browser's
+//! * **in-memory** — `Database::new`, always available, needs no host support;
+//! * **OPFS** — `Database::open_opfs`, persistent, backed by the browser's
 //!   Origin-Private File System *synchronous access handles*.
 //!
 //! # The `wasm` feature
@@ -18,12 +18,12 @@
 //!
 //! # OPFS and the synchronous-VFS trick
 //!
-//! graphitesql's [`Vfs`]/[`File`] traits are **synchronous**. Browser file APIs
+//! graphitesql's [`Vfs`](crate::vfs::Vfs)/[`File`](crate::vfs::File) traits are **synchronous**. Browser file APIs
 //! are overwhelmingly async — *except* `FileSystemSyncAccessHandle`, whose
 //! `read`/`write`/`truncate`/`flush`/`getSize` are synchronous and only available
 //! inside a **Web Worker**. Acquiring a handle is still async, so the pattern is:
 //! the worker's JS acquires a handle per database file up front, hands the set to
-//! [`Database::open_opfs`], and from then on all I/O is synchronous Rust calling
+//! `Database::open_opfs`, and from then on all I/O is synchronous Rust calling
 //! synchronous JS. No async rework of the engine is needed.
 //!
 //! See `worker.js` and `index.html` in this crate for a runnable browser example.
@@ -164,7 +164,7 @@ impl Database {
 
 /// A file backed by an OPFS `FileSystemSyncAccessHandle`. All of the handle's
 /// I/O methods are synchronous (Worker-only), which is exactly what the sync
-/// [`File`] trait needs.
+/// [`File`](crate::vfs::File) trait needs.
 struct OpfsFile {
     handle: FileSystemSyncAccessHandle,
 }
