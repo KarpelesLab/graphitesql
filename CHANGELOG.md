@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/KarpelesLab/graphitesql/compare/v0.1.6...v0.1.7) - 2026-07-23
+
+### Added
+
+- *(fk)* honor PRAGMA defer_foreign_keys
+
+### Fixed
+
+- *(fk)* foreign_key_check covers WITHOUT ROWID children and orders fkid
+- *(parser)* reject a schema-qualified PRAGMA argument (main.t)
+- *(trigger)* RETURNING on an INSTEAD OF view INSERT
+- *(fk)* foreign-key actions fire the child row's triggers
+- *(exec)* total_changes() counts trigger-body and FK-action rows
+- *(parser)* reject CREATE TEMP INDEX / TEMP VIRTUAL TABLE as syntax errors
+- *(fk)* DROP TABLE enforces foreign keys like sqlite's implicit delete
+- *(window)* RANGE offset over a non-numeric ORDER BY collapses to peers
+- *(window)* non-integer lag/lead offset yields the default
+- *(window)* reject FILTER on a non-aggregate window function
+- *(window)* named-window refinement inherits the base window
+- *(exec)* bound trigger/FK-cascade recursion instead of overflowing the stack
+- *(datetime)* truncate sub-millisecond fractional seconds like sqlite
+- *(json)* preserve the JSON integer -0 sign
+- *(pragma)* introspection PRAGMAs see TEMP tables (temp shadows main)
+- *(ddl)* a trigger may share its name with a table/view/index
+
+### Testing
+
+- *(window)* fix RANGE-over-text test to bind a mutable Connection
+
 ## [0.1.6](https://github.com/KarpelesLab/graphitesql/compare/v0.1.5...v0.1.6) - 2026-07-23
 
 ### Documentation
