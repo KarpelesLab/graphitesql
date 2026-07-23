@@ -9078,14 +9078,14 @@ impl Connection {
                 let new_key: Vec<Value> =
                     parent_pos.iter().map(|&p| new_parent[p].clone()).collect();
                 for rowid in matches {
-                    self.update_child_key(&cmeta, child_table, rowid, &cpos, &new_key)?;
+                    self.update_child_key(&cmeta, child_table, rowid, &cpos, &new_key, params)?;
                 }
                 Ok(())
             }
             FkAction::SetNull => {
                 let nulls = alloc::vec![Value::Null; cpos.len()];
                 for rowid in matches {
-                    self.update_child_key(&cmeta, child_table, rowid, &cpos, &nulls)?;
+                    self.update_child_key(&cmeta, child_table, rowid, &cpos, &nulls, params)?;
                 }
                 Ok(())
             }
@@ -9094,7 +9094,7 @@ impl Connection {
                     &cmeta, &pmeta, fk, old_key, new_parent, parent_pos, &cpos, params,
                 )?;
                 for rowid in matches {
-                    self.update_child_key(&cmeta, child_table, rowid, &cpos, &defaults)?;
+                    self.update_child_key(&cmeta, child_table, rowid, &cpos, &defaults, params)?;
                 }
                 Ok(())
             }
@@ -9279,7 +9279,27 @@ impl Connection {
     ) -> Result<()> {
         // Read the row so its own dependents can be enforced.
         let old = self.read_row(meta, rowid)?;
+        // An FK-action row deletion (`fk_depth > 0`) fires the child's own
+        // BEFORE/AFTER DELETE triggers, as SQLite does — unlike the non-FK caller
+        // (INSERT OR REPLACE's conflict-delete), which is not an FK action.
+        let fk_action = self.fk_depth.get() > 0;
         if let Some(old) = &old {
+            if fk_action {
+                self.fire_triggers(
+                    table,
+                    TrigEvent::Delete,
+                    TriggerTiming::Before,
+                    &meta.columns,
+                    Some((old, rowid)),
+                    None,
+                    params,
+                    None,
+                )?;
+                // A BEFORE DELETE `RAISE(IGNORE)` spares the row (and its cascade).
+                if self.raise_ignore.replace(false) {
+                    return Ok(());
+                }
+            }
             self.enforce_parent_change(table, old, None, params)?;
         }
         delete_table(self.backend.writer()?, meta.root, rowid)?;
@@ -9308,6 +9328,18 @@ impl Connection {
                 None,
             );
         }
+        if fk_action && let Some(old) = &old {
+            self.fire_triggers(
+                table,
+                TrigEvent::Delete,
+                TriggerTiming::After,
+                &meta.columns,
+                Some((old, rowid)),
+                None,
+                params,
+                None,
+            )?;
+        }
         Ok(())
     }
 
@@ -9319,18 +9351,40 @@ impl Connection {
         rowid: i64,
         positions: &[usize],
         new_vals: &[Value],
+        params: &Params,
     ) -> Result<()> {
-        let Some(mut row) = self.read_row(meta, rowid)? else {
+        let Some(old_full) = self.read_row(meta, rowid)? else {
             return Ok(());
         };
-        // Snapshot the pre-update row for session recording (FK context only).
-        let old_row = if self.fk_depth.get() > 0 {
-            Some(row.clone())
-        } else {
-            None
-        };
+        let mut row = old_full.clone();
+        // FK-action updates run with `fk_depth > 0`; snapshot for session
+        // recording and for the child's own UPDATE triggers (fired like SQLite).
+        let fk_action = self.fk_depth.get() > 0;
+        let old_row = if fk_action { Some(old_full) } else { None };
         for (&p, v) in positions.iter().zip(new_vals) {
             row[p] = v.clone();
+        }
+        // Fire the child's BEFORE UPDATE triggers (SQLite fires FK-action row
+        // triggers). The changed columns are the FK columns being rewritten.
+        if let Some(old_row) = &old_row {
+            let changed: Vec<String> = positions
+                .iter()
+                .map(|&p| meta.columns[p].name.clone())
+                .collect();
+            self.fire_triggers(
+                table,
+                TrigEvent::Update,
+                TriggerTiming::Before,
+                &meta.columns,
+                Some((old_row, rowid)),
+                Some((&row, rowid)),
+                params,
+                Some(&changed),
+            )?;
+            // A BEFORE UPDATE `RAISE(IGNORE)` spares the row (FK column unchanged).
+            if self.raise_ignore.replace(false) {
+                return Ok(());
+            }
         }
         // Re-encode and rewrite the row (rowid unchanged here).
         let mut stored = row.clone();
@@ -9357,6 +9411,20 @@ impl Connection {
                 Some(old_row.as_slice()),
                 Some(row.as_slice()),
             );
+            let changed: Vec<String> = positions
+                .iter()
+                .map(|&p| meta.columns[p].name.clone())
+                .collect();
+            self.fire_triggers(
+                table,
+                TrigEvent::Update,
+                TriggerTiming::After,
+                &meta.columns,
+                Some((old_row, rowid)),
+                Some((&row, rowid)),
+                params,
+                Some(&changed),
+            )?;
         }
         Ok(())
     }
