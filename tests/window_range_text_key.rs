@@ -24,7 +24,7 @@ fn col_i64(c: &Connection, sql: &str) -> Vec<i64> {
 
 #[test]
 fn range_offset_over_text_key_uses_peer_group() {
-    let c = Connection::open_memory().unwrap();
+    let mut c = Connection::open_memory().unwrap();
     c.execute_batch(
         "CREATE TABLE t(g TEXT, v);
          INSERT INTO t VALUES('a',10),('a',20),('b',30),('b',27),('c',5);",
@@ -43,7 +43,7 @@ fn range_offset_over_text_key_uses_peer_group() {
 
 #[test]
 fn range_offset_over_numeric_looking_text_is_not_numeric() {
-    let c = Connection::open_memory().unwrap();
+    let mut c = Connection::open_memory().unwrap();
     c.execute_batch("CREATE TABLE t(g TEXT, v); INSERT INTO t VALUES('1',10),('2',20),('3',30);")
         .unwrap();
     // '1','2','3' are TEXT, so each is its own peer (not 1.0/2.0/3.0).
@@ -59,7 +59,7 @@ fn range_offset_over_numeric_looking_text_is_not_numeric() {
 
 #[test]
 fn range_offset_over_blob_key_uses_peer_group() {
-    let c = Connection::open_memory().unwrap();
+    let mut c = Connection::open_memory().unwrap();
     c.execute_batch("CREATE TABLE t(g, v); INSERT INTO t VALUES(x'01',10),(x'02',20);")
         .unwrap();
     assert_eq!(
@@ -74,7 +74,7 @@ fn range_offset_over_blob_key_uses_peer_group() {
 #[test]
 fn range_offset_over_numeric_key_still_ranges() {
     // Regression guard: genuine numeric keys keep the value-range semantics.
-    let c = Connection::open_memory().unwrap();
+    let mut c = Connection::open_memory().unwrap();
     c.execute_batch("CREATE TABLE t(g INT, v); INSERT INTO t VALUES(1,10),(2,20),(3,30);")
         .unwrap();
     assert_eq!(
