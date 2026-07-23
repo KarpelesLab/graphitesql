@@ -152,8 +152,14 @@ impl Json {
             Json::Null => push_jsonb(out, JSONB_NULL, &[]),
             Json::Bool(true) => push_jsonb(out, JSONB_TRUE, &[]),
             Json::Bool(false) => push_jsonb(out, JSONB_FALSE, &[]),
-            // A hexadecimal source form is stored verbatim under INT5; a strict
-            // decimal integer is the canonical text under INT.
+            // A retained *strict* decimal form (the sole case being `-0`, whose
+            // sign `i64` can't carry) is stored verbatim under INT — sqlite keeps
+            // `-0` distinct from `0` (`jsonb('-0') != jsonb('0')`). A JSON5-only
+            // hexadecimal source form is stored verbatim under INT5. Otherwise the
+            // canonical decimal text goes under INT.
+            Json::Int(_, Some(raw)) if is_strict_json_number(raw) => {
+                push_jsonb(out, JSONB_INT, raw.as_bytes())
+            }
             Json::Int(_, Some(raw)) => push_jsonb(out, JSONB_INT5, raw.as_bytes()),
             Json::Int(i, None) => push_jsonb(out, JSONB_INT, i.to_string().as_bytes()),
             Json::Real(r, src) => {
@@ -307,6 +313,10 @@ impl Json {
             Json::Null => out.push_str("null"),
             Json::Bool(true) => out.push_str("true"),
             Json::Bool(false) => out.push_str("false"),
+            // A retained *strict* decimal integer form (`-0`, whose sign `i64`
+            // can't carry) renders verbatim, matching sqlite's `json('-0')` → `-0`.
+            // A JSON5-only hex form (`0x1f`) renders in canonical decimal (`31`).
+            Json::Int(_, Some(raw)) if is_strict_json_number(raw) => out.push_str(raw),
             Json::Int(i, _) => out.push_str(&i.to_string()),
             // Preserve a *strict* number's verbatim source text (`1e2`, `1.50`,
             // `-0.0`); a JSON5-only form (`.5`, `5.`) and a computed value render
@@ -1451,7 +1461,14 @@ impl Parser<'_> {
             return Err(start);
         };
         if !is_real && let Ok(i) = tok.parse::<i64>() {
-            return Ok(Json::Int(i, None));
+            // Retain the verbatim token when it is a *strict* decimal form that
+            // does not match the canonical rendering of `i`. The only such case is
+            // `-0`, whose sign an `i64` `0` can't carry: sqlite preserves it as a
+            // distinct value (`json('-0')` → `-0`, `jsonb('-0') != jsonb('0')`). A
+            // JSON5-only leading-`+` form (`+5`) is *not* strict, so it normalizes.
+            let raw =
+                (is_strict_json_number(tok) && tok != i.to_string()).then(|| String::from(tok));
+            return Ok(Json::Int(i, raw));
         }
         // `f64::parse` rejects a leading `+` and a leading/trailing `.`; build a
         // normalized form so JSON5 numbers like `+.5` / `5.` parse.
