@@ -87,31 +87,28 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
         run: |
           cargo build --release --bin graphitesql --target ${{ matrix.target }}
-          # FFI: once a C library lands, also build the static + shared libs:
-          # cargo rustc --lib --release --features ffi --crate-type staticlib --target ${{ matrix.target }}
-          # cargo rustc --lib --release --features ffi --crate-type cdylib --target ${{ matrix.target }}
+          # The libsqlite3-compatible C ABI (`capi` feature): static + shared libs.
+          cargo rustc --lib --release --features capi --crate-type staticlib --target ${{ matrix.target }}
+          cargo rustc --lib --release --features capi --crate-type cdylib --target ${{ matrix.target }}
 
       - name: Stage archive contents
         shell: bash
         run: |
-          mkdir -p staging/bin
+          mkdir -p staging/bin staging/lib staging/include
           cp README.md LICENSE staging/
-          # FFI: stage the C header + libraries alongside the binary:
-          # mkdir -p staging/lib staging/include
-          # cp include/graphitesql.h staging/include/
+          # The libsqlite3-compatible header: link the C libraries with `-lgraphitesql`.
+          cp include/sqlite3.h staging/include/
           td="target/${{ matrix.target }}/release"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "$td/graphitesql.exe" staging/bin/
-            # FFI (Windows):
-            # cp "$td/graphitesql.lib" staging/lib/ 2>/dev/null || true      # static library
-            # cp "$td/graphitesql.dll" staging/lib/ 2>/dev/null || true      # shared library
-            # cp "$td/graphitesql.dll.lib" staging/lib/ 2>/dev/null || true  # import library for the DLL
+            cp "$td/graphitesql.lib" staging/lib/ 2>/dev/null || true      # static library
+            cp "$td/graphitesql.dll" staging/lib/ 2>/dev/null || true      # shared library
+            cp "$td/graphitesql.dll.lib" staging/lib/ 2>/dev/null || true  # import library for the DLL
           else
             cp "$td/graphitesql" staging/bin/
-            # FFI (Unix):
-            # cp "$td/libgraphitesql.a" staging/lib/
-            # cp "$td"/libgraphitesql.so staging/lib/ 2>/dev/null || true    # Linux
-            # cp "$td"/libgraphitesql.dylib staging/lib/ 2>/dev/null || true # macOS
+            cp "$td/libgraphitesql.a" staging/lib/
+            cp "$td"/libgraphitesql.so staging/lib/ 2>/dev/null || true    # Linux
+            cp "$td"/libgraphitesql.dylib staging/lib/ 2>/dev/null || true # macOS
           fi
           ls -R staging
 
@@ -150,30 +147,27 @@ jobs:
         with:
           key: macos-universal
 
-      - name: Build both Apple slices (CLI)
+      - name: Build both Apple slices (CLI + C library)
         run: |
           for t in x86_64-apple-darwin aarch64-apple-darwin; do
             cargo build --release --bin graphitesql --target "$t"
-            # FFI: also build the per-slice libraries to lipo together below:
-            # cargo rustc --lib --release --features ffi --crate-type staticlib --target "$t"
-            # cargo rustc --lib --release --features ffi --crate-type cdylib --target "$t"
+            cargo rustc --lib --release --features capi --crate-type staticlib --target "$t"
+            cargo rustc --lib --release --features capi --crate-type cdylib --target "$t"
           done
 
-      - name: Lipo into a universal binary
+      - name: Lipo into universal artifacts
         run: |
-          mkdir -p staging/bin
+          mkdir -p staging/bin staging/lib staging/include
           lipo -create -output staging/bin/graphitesql \
             target/x86_64-apple-darwin/release/graphitesql \
             target/aarch64-apple-darwin/release/graphitesql
-          # FFI: lipo the libraries and stage the header too:
-          # mkdir -p staging/lib staging/include
-          # lipo -create -output staging/lib/libgraphitesql.a \
-          #   target/x86_64-apple-darwin/release/libgraphitesql.a \
-          #   target/aarch64-apple-darwin/release/libgraphitesql.a
-          # lipo -create -output staging/lib/libgraphitesql.dylib \
-          #   target/x86_64-apple-darwin/release/libgraphitesql.dylib \
-          #   target/aarch64-apple-darwin/release/libgraphitesql.dylib
-          # cp include/graphitesql.h staging/include/
+          lipo -create -output staging/lib/libgraphitesql.a \
+            target/x86_64-apple-darwin/release/libgraphitesql.a \
+            target/aarch64-apple-darwin/release/libgraphitesql.a
+          lipo -create -output staging/lib/libgraphitesql.dylib \
+            target/x86_64-apple-darwin/release/libgraphitesql.dylib \
+            target/aarch64-apple-darwin/release/libgraphitesql.dylib
+          cp include/sqlite3.h staging/include/
           cp README.md LICENSE staging/
           file staging/bin/graphitesql
 
