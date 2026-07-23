@@ -6463,19 +6463,39 @@ impl Connection {
     /// returns true for these provably-no-write shapes, and a false negative merely
     /// takes the lock unnecessarily (harmless), never the reverse.
     fn stmt_is_noop_ddl(&self, stmt: &Statement) -> bool {
-        let exists = |n: &str| {
+        use crate::schema::ObjectType;
+        // A `CREATE … IF NOT EXISTS` is a no-op (or a no-write error) only when the
+        // name collides in the SAME namespace: tables/views/indexes share one
+        // namespace, triggers have their own. A trigger-name match does NOT stop a
+        // `CREATE TABLE`, and a table-name match does NOT stop a `CREATE TRIGGER` —
+        // those still write, so they must NOT be reported as no-ops (which would skip
+        // the eager write lock). `exists_as` checks the right namespace.
+        let exists_as = |n: &str, types: &[ObjectType]| {
             self.schema
                 .objects()
                 .iter()
-                .any(|o| o.name.eq_ignore_ascii_case(n))
+                .any(|o| o.name.eq_ignore_ascii_case(n) && types.contains(&o.obj_type))
         };
+        const TABLEISH: &[ObjectType] = &[ObjectType::Table, ObjectType::View, ObjectType::Index];
         match stmt {
-            Statement::CreateTable(s) if s.if_not_exists => exists(&s.name),
-            Statement::CreateIndex(s) if s.if_not_exists => exists(&s.name),
-            Statement::CreateView(s) if s.if_not_exists => exists(&s.name),
-            Statement::CreateTrigger(s) if s.if_not_exists => exists(&s.name),
-            Statement::CreateVirtualTable(s) if s.if_not_exists => exists(&s.name),
-            Statement::Drop(s) if s.if_exists => !exists(&s.name),
+            Statement::CreateTable(s) if s.if_not_exists => exists_as(&s.name, TABLEISH),
+            Statement::CreateIndex(s) if s.if_not_exists => exists_as(&s.name, TABLEISH),
+            Statement::CreateView(s) if s.if_not_exists => exists_as(&s.name, TABLEISH),
+            Statement::CreateVirtualTable(s) if s.if_not_exists => exists_as(&s.name, TABLEISH),
+            Statement::CreateTrigger(s) if s.if_not_exists => {
+                exists_as(&s.name, &[ObjectType::Trigger])
+            }
+            // A `DROP … IF EXISTS` writes only if the object is present; over-locks
+            // (harmlessly) if a same-name object of another kind exists.
+            Statement::Drop(s) if s.if_exists => !exists_as(
+                &s.name,
+                &[
+                    ObjectType::Table,
+                    ObjectType::View,
+                    ObjectType::Index,
+                    ObjectType::Trigger,
+                ],
+            ),
             _ => false,
         }
     }
@@ -10088,12 +10108,13 @@ impl Connection {
             }
             None => sql_text,
         };
-        if self
-            .schema
-            .objects()
-            .iter()
-            .any(|o| o.name.eq_ignore_ascii_case(&ct.name))
-        {
+        // A trigger has its OWN name namespace, separate from tables/views/indexes
+        // (SQLite lets a trigger share a name with a table/view/index). So a
+        // `CREATE TRIGGER` only conflicts with an existing *trigger* of that name.
+        if self.schema.objects().iter().any(|o| {
+            o.name.eq_ignore_ascii_case(&ct.name)
+                && o.obj_type == crate::schema::ObjectType::Trigger
+        }) {
             if ct.if_not_exists {
                 return Ok(());
             }
