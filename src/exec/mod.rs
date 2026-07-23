@@ -8789,6 +8789,72 @@ impl Connection {
         new_vals: Option<&[Value]>,
         params: &Params,
     ) -> Result<()> {
+        self.enforce_parent_change_impl(parent_table, old_vals, new_vals, params, false)
+    }
+
+    /// The implicit `DELETE`-then-drop foreign-key pass SQLite runs when a table
+    /// is dropped with foreign keys enabled: enforce every OTHER table's
+    /// reference to each of this table's rows (as parent deletions), which
+    /// cleans up `ON DELETE CASCADE`/`SET NULL` children and raises
+    /// `FOREIGN KEY constraint failed` for a `RESTRICT`/`NO ACTION` child that
+    /// still points here. Self-references are skipped — the whole table is going
+    /// away. No triggers fire (SQLite's implicit delete is trigger-silent).
+    fn fk_enforce_table_drop(&mut self, table: &str, params: &Params) -> Result<()> {
+        // Nothing references this table ⇒ nothing to enforce (also spares the
+        // scan for the overwhelmingly-common no-inbound-FK case).
+        let referenced = self
+            .schema
+            .objects()
+            .iter()
+            .filter(|o| {
+                o.obj_type == crate::schema::ObjectType::Table
+                    && !o.name.eq_ignore_ascii_case(table)
+            })
+            .map(|o| o.name.clone())
+            .collect::<Vec<_>>();
+        let mut any_inbound = false;
+        for name in &referenced {
+            if self
+                .foreign_keys_of(name)?
+                .iter()
+                .any(|fk| fk.ref_table.eq_ignore_ascii_case(table))
+            {
+                any_inbound = true;
+                break;
+            }
+        }
+        if !any_inbound {
+            return Ok(());
+        }
+        let meta = self.table_meta(table, None)?;
+        let rows: Vec<Vec<Value>> = if meta.without_rowid {
+            self.scan_without_rowid(&meta)?
+        } else {
+            self.scan_table(&meta)?
+                .into_iter()
+                .map(|(_, r)| r)
+                .collect()
+        };
+        for row in rows {
+            self.enforce_parent_change_impl(table, &row, None, params, true)?;
+        }
+        Ok(())
+    }
+
+    /// Core of [`enforce_parent_change`]. `skip_self` drops foreign keys a table
+    /// declares onto *itself* — used by `DROP TABLE`, whose implicit row deletion
+    /// must not fault a self-reference (the whole table, referencing rows and
+    /// all, is going away), while still enforcing references from OTHER tables.
+    ///
+    /// [`enforce_parent_change`]: Self::enforce_parent_change
+    fn enforce_parent_change_impl(
+        &mut self,
+        parent_table: &str,
+        old_vals: &[Value],
+        new_vals: Option<&[Value]>,
+        params: &Params,
+        skip_self: bool,
+    ) -> Result<()> {
         if !self.foreign_keys {
             return Ok(());
         }
@@ -8802,6 +8868,9 @@ impl Connection {
             .collect();
         let mut referencing: Vec<(String, ForeignKey)> = Vec::new();
         for name in table_names {
+            if skip_self && name.eq_ignore_ascii_case(parent_table) {
+                continue;
+            }
             for fk in self.foreign_keys_of(&name)? {
                 if fk.ref_table.eq_ignore_ascii_case(parent_table) {
                     referencing.push((name.clone(), fk));
@@ -15314,6 +15383,36 @@ impl Connection {
             };
             return Err(Error::Error(format!("no such {kind}: {}", d.name)));
         };
+
+        // With foreign keys enabled, SQLite performs an implicit row-by-row
+        // DELETE of the table before removing it (firing FK actions / raising
+        // violations, but NOT the table's own triggers). So dropping a parent
+        // that other rows still reference fails, `ON DELETE CASCADE`/`SET NULL`
+        // children are cleaned up, and a purely self-referential table drops
+        // freely. Run that pass here, before the b-tree is freed.
+        if want == ObjectType::Table && self.foreign_keys {
+            // The FK pass mutates OTHER tables (CASCADE/SET NULL) and may fault
+            // partway through (a RESTRICT child after an already-cascaded one).
+            // Unlike ordinary DDL — which writes atomically at the end — this
+            // must roll its partial changes back on failure, so wrap it in a
+            // statement savepoint the same way `run_dml_atomic` wraps DML.
+            const DSP: &str = "\u{0}graphite_drop";
+            self.backend.writer()?.savepoint(DSP);
+            self.savepoint_attached(DSP)?;
+            match self.fk_enforce_table_drop(&obj.name, &Params::default()) {
+                Ok(()) => {
+                    let _ = self.backend.writer()?.release_savepoint(DSP);
+                    let _ = self.release_attached(DSP);
+                }
+                Err(e) => {
+                    let _ = self.backend.writer()?.rollback_to_savepoint(DSP);
+                    let _ = self.backend.writer()?.release_savepoint(DSP);
+                    let _ = self.rollback_to_attached(DSP);
+                    let _ = self.release_attached(DSP);
+                    return Err(e);
+                }
+            }
+        }
 
         // Collect the schema rows (by rowid) and b-tree roots to drop.
         let mut roots_to_free = Vec::new();
