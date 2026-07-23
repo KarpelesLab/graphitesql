@@ -78,6 +78,27 @@ impl Backend {
     }
 }
 
+/// Maximum trigger-recursion depth (SQLite's `SQLITE_MAX_TRIGGER_DEPTH` is 1000).
+///
+/// graphitesql runs triggers by native recursion through the tree-walking
+/// evaluator — one level fires the next by re-entering the DML path — so each
+/// level costs real native stack, unlike SQLite's bytecode VM, which keeps its
+/// frames on the heap. A runaway (or maliciously deep) recursive trigger would
+/// therefore overflow the native stack and *abort the process* long before it
+/// reached 1000. We instead cap the depth well below that point so it errors
+/// cleanly with SQLite's `too many levels of trigger recursion` message.
+///
+/// The cap is chosen to stay safe even on a small (2 MiB) thread stack — the
+/// kind a Tokio/thread-pool worker gets by default. Debug builds carry much
+/// larger frames than release, so their cap is lower. This mirrors the parser's
+/// `MAX_PARSE_DEPTH` tradeoff: capping below SQLite's limit is the house rule for
+/// the recursive-descent / tree-walking paths, and any realistic trigger cascade
+/// is orders of magnitude shallower than either cap.
+#[cfg(debug_assertions)]
+const MAX_TRIGGER_DEPTH: usize = 48;
+#[cfg(not(debug_assertions))]
+const MAX_TRIGGER_DEPTH: usize = 400;
+
 /// A database connection. Supports reading (`query`) and writing (`execute`),
 /// over a file or in memory.
 ///
@@ -8837,6 +8858,15 @@ impl Connection {
         action: FkAction,
         params: &Params,
     ) -> Result<()> {
+        // A foreign-key action (`ON DELETE/UPDATE CASCADE`/`SET NULL`/…) is a
+        // recursive sub-program in SQLite, counted against the same recursion
+        // limit as triggers — a self-referential cascade chain otherwise recurses
+        // through the native stack until it overflows. Bound the *combined* native
+        // recursion (triggers may fire cascades and vice-versa) and surface
+        // SQLite's message rather than aborting the process.
+        if self.fk_depth.get() + self.trigger_depth.get() >= MAX_TRIGGER_DEPTH {
+            return Err(Error::Error("too many levels of trigger recursion".into()));
+        }
         // Mark writes made by this FK action as indirect for any active session
         // (SQLite's preupdate depth is non-zero inside FK-action sub-programs).
         self.fk_depth.set(self.fk_depth.get() + 1);
@@ -10319,6 +10349,7 @@ impl Connection {
     /// values and rowid before/after the change. Non-recursive: triggers fire
     /// only at the top level (matching `recursive_triggers = OFF`).
     #[allow(clippy::too_many_arguments)]
+    #[allow(rustdoc::private_intra_doc_links)]
     fn fire_triggers(
         &mut self,
         table: &str,
@@ -10330,11 +10361,12 @@ impl Connection {
         params: &Params,
         changed_cols: Option<&[String]>,
     ) -> Result<bool> {
-        // The total trigger-recursion depth is capped at SQLite's
-        // SQLITE_MAX_TRIGGER_DEPTH (1000), regardless of the recursive_triggers
-        // setting; exceeding it is an error, not silent truncation.
+        // The total trigger-recursion depth is capped ([`MAX_TRIGGER_DEPTH`])
+        // regardless of the recursive_triggers setting; exceeding it is an error
+        // (SQLite's "too many levels of trigger recursion"), not silent
+        // truncation — and, crucially, not a native stack overflow.
         let depth = self.trigger_depth.get();
-        if depth >= 1000 {
+        if depth >= MAX_TRIGGER_DEPTH {
             return Err(Error::Error("too many levels of trigger recursion".into()));
         }
         let mut trigs = self.triggers_for(table, kind, timing)?;
