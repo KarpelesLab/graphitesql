@@ -1805,11 +1805,13 @@ impl Parser {
             }
             return Ok(Statement::CreateTable(ct));
         }
-        if self.eat_kw("index") {
-            let mut ci = self.create_index(unique)?;
-            if temp && ci.schema.is_none() {
-                ci.schema = Some("temp".into());
-            }
+        // `TEMP`/`TEMPORARY` is only valid before TABLE / VIEW / TRIGGER — never
+        // an INDEX or VIRTUAL TABLE. SQLite rejects `CREATE TEMP INDEX` /
+        // `CREATE TEMP VIRTUAL TABLE` with `near "<next>": syntax error`, so a
+        // `temp` prefix makes these branches fall through to that syntax error
+        // (raised at the current token below) rather than being accepted.
+        if !temp && self.eat_kw("index") {
+            let ci = self.create_index(unique)?;
             return Ok(Statement::CreateIndex(ci));
         }
         if unique {
@@ -1835,12 +1837,9 @@ impl Parser {
             }
             return Ok(Statement::CreateTrigger(ct));
         }
-        if self.eat_kw("virtual") {
+        if !temp && self.eat_kw("virtual") {
             self.expect_kw("table")?;
-            let mut cvt = self.create_virtual_table()?;
-            if temp && cvt.schema.is_none() {
-                cvt.schema = Some("temp".into());
-            }
+            let cvt = self.create_virtual_table()?;
             return Ok(Statement::CreateVirtualTable(cvt));
         }
         Err(self.err("expected TABLE, INDEX, VIEW, TRIGGER, or VIRTUAL TABLE after CREATE"))
