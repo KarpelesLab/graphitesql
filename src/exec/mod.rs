@@ -9216,6 +9216,7 @@ impl Connection {
                 let kept = live.into_iter().filter(|r| !victims.contains(r));
                 self.rewrite_without_rowid(cmeta, kept)?;
                 self.rebuild_wr_indexes(cmeta, child_table)?;
+                self.bump_total_changes(victims.len());
                 Ok(())
             }
             _ => {
@@ -9254,9 +9255,18 @@ impl Connection {
                 // b-tree; the whole-table rewrite handles that transparently.
                 self.rewrite_without_rowid(cmeta, out.into_iter())?;
                 self.rebuild_wr_indexes(cmeta, child_table)?;
+                self.bump_total_changes(matched.len());
                 Ok(())
             }
         }
+    }
+
+    /// Add `n` to `total_changes()` (SQLite's lifetime row-change counter)
+    /// without touching `changes()`. Used by the paths that modify rows *outside*
+    /// the outer statement's direct count — trigger bodies and FK actions — so
+    /// the lifetime total matches SQLite while `changes()` stays the outer count.
+    fn bump_total_changes(&self, n: usize) {
+        self.total_changes.set(self.total_changes.get() + n as i64);
     }
 
     /// Delete one child row by rowid, first cascading to its own children.
@@ -9273,6 +9283,8 @@ impl Connection {
             self.enforce_parent_change(table, old, None, params)?;
         }
         delete_table(self.backend.writer()?, meta.root, rowid)?;
+        // An `ON DELETE CASCADE` row deletion counts toward `total_changes()`.
+        self.bump_total_changes(1);
         // This delete can leave an empty leaf in the child b-tree; the top-level
         // DML compacts it once the statement finishes (per-row compaction here
         // would be O(rows²)).
@@ -9327,6 +9339,9 @@ impl Connection {
         }
         let record = encode_record(&stored);
         insert_table(self.backend.writer()?, meta.root, rowid, &record)?;
+        // An FK-action row update (SET NULL / SET DEFAULT / cascade key change)
+        // counts toward `total_changes()`.
+        self.bump_total_changes(1);
         let indexes = self.indexes_of(table)?;
         if !indexes.is_empty() {
             self.rebuild_indexes(meta, &indexes)?;
@@ -10804,17 +10819,28 @@ impl Connection {
         let schema = trig.schema.as_deref();
         for stmt in &trig.body {
             match stmt {
+                // A trigger-body row change counts toward `total_changes()` (but
+                // NOT `changes()`, which reports only the outer statement's direct
+                // rows). Nested triggers add their own rows the same way, so the
+                // total accumulates across the whole firing program — matching
+                // SQLite. `exec_*` return only their direct row count here.
                 Statement::Insert(ins) => {
-                    self.exec_insert(ins, params)
+                    let n = self
+                        .exec_insert(ins, params)
                         .map_err(|e| qualify_trigger_missing_table(e, schema))?;
+                    self.bump_total_changes(n);
                 }
                 Statement::Update(u) => {
-                    self.exec_update(u, params)
+                    let n = self
+                        .exec_update(u, params)
                         .map_err(|e| qualify_trigger_missing_table(e, schema))?;
+                    self.bump_total_changes(n);
                 }
                 Statement::Delete(d) => {
-                    self.exec_delete(d, params)
+                    let n = self
+                        .exec_delete(d, params)
                         .map_err(|e| qualify_trigger_missing_table(e, schema))?;
+                    self.bump_total_changes(n);
                 }
                 // A `SELECT` in a trigger body is side-effect free *except* for
                 // a `RAISE(…)`, which aborts or ignores the firing operation.
