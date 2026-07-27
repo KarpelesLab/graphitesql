@@ -2622,6 +2622,15 @@ fn is_prepare_error(e: &graphitesql::Error, msg: &str, sql: &str) -> bool {
                 "ON CONFLICT clause does not match",
                 "RANGE with offset",
                 "GROUPS with offset",
+                // A malformed foreign key (parent column not a unique key, arity
+                // mismatch) is diagnosed when the DML is compiled.
+                "foreign key mismatch",
+                // `RAISE()` is only meaningful inside a trigger program; SQLite
+                // rejects it while compiling any other statement.
+                "RAISE() may only be used within a trigger-program",
+                // `DISTINCT` inside a window function's argument list is a compile
+                // error.
+                "DISTINCT is not supported for window functions",
             ];
             // Patterns that carry a leading ordinal / function name, so a prefix
             // match won't do (`2nd ORDER BY term out of range`, `abs() may not be

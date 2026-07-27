@@ -122,6 +122,15 @@ fn one_shot_error_rendering_matches_sqlite() {
         "DELETE FROM sqlite_temp_schema",
         "INSERT INTO sqlite_temp_master VALUES(1,2,3,4,5)",
         "SELECT",
+        // A malformed foreign key, `RAISE()` outside a trigger, and `DISTINCT`
+        // inside a window function are all compiled-away (prepare-time), no caret.
+        "PRAGMA foreign_keys=ON; CREATE TABLE p(a, b); CREATE TABLE c(x REFERENCES p(a)); \
+         INSERT INTO c VALUES(1)",
+        "PRAGMA foreign_keys=ON; CREATE TABLE p(a PRIMARY KEY); \
+         CREATE TABLE c(x, y, FOREIGN KEY(x,y) REFERENCES p); INSERT INTO c VALUES(1,2)",
+        "SELECT RAISE(ABORT,'x')",
+        "SELECT RAISE(IGNORE)",
+        "SELECT count(DISTINCT x) OVER () FROM (SELECT 1 x)",
         // Step-time errors (constraints carry the (19) code, a datatype mismatch
         // the (20) SQLITE_MISMATCH code; a plain error carries none).
         "CREATE TABLE t(a); SELECT a FROM t LIMIT 'x'", // datatype mismatch (20)
