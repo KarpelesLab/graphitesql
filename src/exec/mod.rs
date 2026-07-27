@@ -9321,6 +9321,18 @@ impl Connection {
                             continue;
                         }
                     }
+                    // A SET NULL / SET DEFAULT landing a NULL in a NOT NULL column
+                    // fails like an ordinary UPDATE. In a WITHOUT ROWID table every
+                    // PRIMARY KEY column is implicitly NOT NULL too.
+                    for &c in &cmeta.storage_order[..cmeta.pk_len] {
+                        if matches!(out[i][c], Value::Null) {
+                            return Err(Error::Constraint(format!(
+                                "NOT NULL constraint failed: {}.{}",
+                                cmeta.columns[c].table, cmeta.columns[c].name
+                            )));
+                        }
+                    }
+                    check_not_null(cmeta, &out[i])?;
                     if self.fk_depth.get() > 0 {
                         self.record_session_change(
                             child_table,
@@ -9480,6 +9492,10 @@ impl Connection {
                 return Ok(());
             }
         }
+        // A SET NULL / SET DEFAULT action that lands a NULL in a NOT NULL child
+        // column fails the same way an ordinary UPDATE would — SQLite raises
+        // "NOT NULL constraint failed", it does not silently store the NULL.
+        check_not_null(meta, &row)?;
         // Re-encode and rewrite the row (rowid unchanged here).
         let mut stored = row.clone();
         if let Some(ipk) = meta.ipk {
