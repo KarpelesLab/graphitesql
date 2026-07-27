@@ -9220,9 +9220,28 @@ impl Connection {
             FkAction::Cascade if new_parent.is_none() => {
                 // DELETE CASCADE: cascade each matched row to its own dependents
                 // first (this may recurse — under a self-referential FK, back into
-                // this same table), then drop the matched rows.
+                // this same table), then drop the matched rows. The child's own
+                // BEFORE/AFTER DELETE triggers fire per row (SQLite semantics); a
+                // BEFORE `RAISE(IGNORE)` spares the row.
                 let victims: Vec<Vec<Value>> = matched.iter().map(|&i| rows[i].clone()).collect();
+                let has_del = self.has_row_triggers(child_table, TrigEvent::Delete);
+                let mut removed: Vec<Vec<Value>> = Vec::new();
                 for row in &victims {
+                    if has_del {
+                        self.fire_triggers(
+                            child_table,
+                            TrigEvent::Delete,
+                            TriggerTiming::Before,
+                            &cmeta.columns,
+                            Some((row, 0)),
+                            None,
+                            params,
+                            None,
+                        )?;
+                        if self.raise_ignore.replace(false) {
+                            continue;
+                        }
+                    }
                     self.enforce_parent_change(child_table, row, None, params)?;
                     if self.fk_depth.get() > 0 {
                         self.record_session_change(
@@ -9234,14 +9253,27 @@ impl Connection {
                             None,
                         );
                     }
+                    if has_del {
+                        self.fire_triggers(
+                            child_table,
+                            TrigEvent::Delete,
+                            TriggerTiming::After,
+                            &cmeta.columns,
+                            Some((row, 0)),
+                            None,
+                            params,
+                            None,
+                        )?;
+                    }
+                    removed.push(row.clone());
                 }
                 // Re-scan live: a recursive cascade may have already rewritten this
-                // table. Keep every row that is not one of the victims.
+                // table. Keep every row that was not actually removed.
                 let live = self.scan_without_rowid(cmeta)?;
-                let kept = live.into_iter().filter(|r| !victims.contains(r));
+                let kept = live.into_iter().filter(|r| !removed.contains(r));
                 self.rewrite_without_rowid(cmeta, kept)?;
                 self.rebuild_wr_indexes(cmeta, child_table)?;
-                self.bump_total_changes(victims.len());
+                self.bump_total_changes(removed.len());
                 Ok(())
             }
             _ => {
@@ -9259,11 +9291,35 @@ impl Connection {
                     )?,
                     FkAction::NoAction | FkAction::Restrict => unreachable!(),
                 };
+                let has_upd = self.has_row_triggers(child_table, TrigEvent::Update);
+                let changed_cols: Vec<String> = cpos
+                    .iter()
+                    .map(|&p| cmeta.columns[p].name.clone())
+                    .collect();
                 let mut out = rows.to_vec();
+                let mut changed = 0usize;
                 for &i in matched {
                     let original = rows[i].clone();
                     for (&p, v) in cpos.iter().zip(&new_vals) {
                         out[i][p] = v.clone();
+                    }
+                    // The child's BEFORE/AFTER UPDATE triggers fire per row; a
+                    // BEFORE `RAISE(IGNORE)` reverts the row's key change.
+                    if has_upd {
+                        self.fire_triggers(
+                            child_table,
+                            TrigEvent::Update,
+                            TriggerTiming::Before,
+                            &cmeta.columns,
+                            Some((&original, 0)),
+                            Some((&out[i], 0)),
+                            params,
+                            Some(&changed_cols),
+                        )?;
+                        if self.raise_ignore.replace(false) {
+                            out[i] = original;
+                            continue;
+                        }
                     }
                     if self.fk_depth.get() > 0 {
                         self.record_session_change(
@@ -9275,12 +9331,25 @@ impl Connection {
                             Some(&out[i]),
                         );
                     }
+                    if has_upd {
+                        self.fire_triggers(
+                            child_table,
+                            TrigEvent::Update,
+                            TriggerTiming::After,
+                            &cmeta.columns,
+                            Some((&original, 0)),
+                            Some((&out[i], 0)),
+                            params,
+                            Some(&changed_cols),
+                        )?;
+                    }
+                    changed += 1;
                 }
                 // A change to a FK column that is part of the PK re-clusters the
                 // b-tree; the whole-table rewrite handles that transparently.
                 self.rewrite_without_rowid(cmeta, out.into_iter())?;
                 self.rebuild_wr_indexes(cmeta, child_table)?;
-                self.bump_total_changes(matched.len());
+                self.bump_total_changes(changed);
                 Ok(())
             }
         }
@@ -10484,6 +10553,18 @@ impl Connection {
     }
 
     /// Triggers on `table` matching `kind`/`timing`, parsed from their schema SQL.
+    /// Whether the table has any `BEFORE` or `AFTER` row trigger for `event`.
+    /// Used by the WITHOUT ROWID DML paths to fire triggers only when present
+    /// (their whole-table-rewrite model otherwise skips per-row trigger firing).
+    fn has_row_triggers(&self, table: &str, event: TrigEvent) -> bool {
+        let any = |timing| {
+            self.triggers_for(table, event, timing)
+                .map(|t| !t.is_empty())
+                .unwrap_or(false)
+        };
+        any(TriggerTiming::Before) || any(TriggerTiming::After)
+    }
+
     fn triggers_for(
         &self,
         table: &str,
@@ -33184,6 +33265,7 @@ impl Connection {
         // This keeps a bulk WITHOUT ROWID load O(n·log n) instead of rebuilding
         // every index on every statement (O(n²) across many single-row inserts).
         let secondary_indexes = self.indexes_of(&ins.table)?;
+        let has_insert_triggers = self.has_row_triggers(&ins.table, TrigEvent::Insert);
         let mut did_rewrite = false;
         let mut affected = 0;
         for row_exprs in rows {
@@ -33196,6 +33278,24 @@ impl Connection {
                 ));
             }
             let values = self.build_insert_row(meta, &target, row_exprs, params)?;
+            // BEFORE INSERT fires ahead of the constraint/conflict handling (as in
+            // the rowid path). A WITHOUT ROWID row has no rowid, so a synthetic 0
+            // is passed (never surfaced). `RAISE(IGNORE)` abandons this row.
+            if has_insert_triggers {
+                self.fire_triggers(
+                    &ins.table,
+                    TrigEvent::Insert,
+                    TriggerTiming::Before,
+                    &meta.columns,
+                    None,
+                    Some((&values, 0)),
+                    params,
+                    None,
+                )?;
+                if self.raise_ignore.replace(false) {
+                    continue;
+                }
+            }
             // PRIMARY KEY / NOT NULL / CHECK constraints. `INSERT OR IGNORE`
             // skips a violating row; any other policy lets the error propagate.
             {
@@ -33346,6 +33446,21 @@ impl Connection {
             if !ins.returning.is_empty() {
                 self.collect_returning(&ins.returning, meta, &values, None, params)?;
             }
+            // AFTER INSERT fires once the row is stored (interleaved per row, like
+            // the rowid path). Reached by the plain-insert and REPLACE paths; the
+            // `ON CONFLICT DO UPDATE` and `OR IGNORE` branches `continue` earlier.
+            if has_insert_triggers {
+                self.fire_triggers(
+                    &ins.table,
+                    TrigEvent::Insert,
+                    TriggerTiming::After,
+                    &meta.columns,
+                    None,
+                    Some((&values, 0)),
+                    params,
+                    None,
+                )?;
+            }
             affected += 1;
         }
         // Only a rewrite (REPLACE / upsert DO UPDATE) invalidates the incremental
@@ -33477,6 +33592,9 @@ impl Connection {
         // removes the parent row first, then enforces — so a `SET DEFAULT` that
         // names the just-deleted key correctly sees it gone).
         let mut victims: Vec<Vec<Value>> = Vec::new();
+        // A WITHOUT ROWID table has no rowid; SQLite's triggers see `NEW`/`OLD`
+        // columns but no rowid, so a synthetic 0 is passed (never surfaced).
+        let has_triggers = self.has_row_triggers(&del.table, TrigEvent::Delete);
         for row in all {
             let keep = match &del.where_clause {
                 Some(p) => {
@@ -33488,6 +33606,26 @@ impl Connection {
             if keep {
                 kept.push(row);
             } else {
+                // BEFORE DELETE fires ahead of the row's removal; `RAISE(IGNORE)`
+                // spares it. (Interleaved BEFORE/AFTER per row matches SQLite's
+                // ordering for the common logging case; the single physical
+                // rewrite is deferred to statement end.)
+                if has_triggers {
+                    self.fire_triggers(
+                        &del.table,
+                        TrigEvent::Delete,
+                        TriggerTiming::Before,
+                        &meta.columns,
+                        Some((&row, 0)),
+                        None,
+                        params,
+                        None,
+                    )?;
+                    if self.raise_ignore.replace(false) {
+                        kept.push(row);
+                        continue;
+                    }
+                }
                 if !del.returning.is_empty() {
                     self.collect_returning(&del.returning, meta, &row, None, params)?;
                 }
@@ -33499,6 +33637,18 @@ impl Connection {
                     Some(&row),
                     None,
                 );
+                if has_triggers {
+                    self.fire_triggers(
+                        &del.table,
+                        TrigEvent::Delete,
+                        TriggerTiming::After,
+                        &meta.columns,
+                        Some((&row, 0)),
+                        None,
+                        params,
+                        None,
+                    )?;
+                }
                 victims.push(row);
             }
         }
@@ -33561,6 +33711,11 @@ impl Connection {
             None => Vec::new(),
         };
         let all = self.scan_without_rowid(meta)?;
+        let has_update_triggers = self.has_row_triggers(&upd.table, TrigEvent::Update);
+        // The columns the SET clause changes, for `UPDATE OF col …` trigger
+        // filtering (SQLite fires such a trigger only when one of its columns is
+        // assigned).
+        let changed_cols: Vec<String> = upd.assignments.iter().map(|(c, _)| c.clone()).collect();
         // `out` starts as the original rows and is updated in place, in scan
         // order. SQLite updates a WITHOUT ROWID table one row at a time and checks
         // uniqueness immediately after each write, so a *transient* duplicate — one
@@ -33656,6 +33811,24 @@ impl Connection {
             }
             apply_column_affinity(meta, &mut row);
             self.materialize_generated(meta, &mut row, params)?;
+            // BEFORE UPDATE fires with OLD/NEW once the new row is computed, ahead
+            // of the constraint and FK checks (as in the rowid path). A WITHOUT
+            // ROWID row has no rowid → synthetic 0. `RAISE(IGNORE)` spares the row.
+            if has_update_triggers {
+                self.fire_triggers(
+                    &upd.table,
+                    TrigEvent::Update,
+                    TriggerTiming::Before,
+                    &meta.columns,
+                    Some((&original, 0)),
+                    Some((&row, 0)),
+                    params,
+                    Some(&changed_cols),
+                )?;
+                if self.raise_ignore.replace(false) {
+                    continue;
+                }
+            }
             // PRIMARY KEY columns are implicitly NOT NULL in a WITHOUT ROWID table
             // (a NULL would corrupt the clustered key); sqlite rejects an UPDATE
             // that nulls one.
@@ -33703,6 +33876,20 @@ impl Connection {
                 Some(&original),
                 Some(&row),
             );
+            // AFTER UPDATE fires once the new row is committed to `out` (per row,
+            // interleaved, like the rowid path). The physical rewrite is deferred.
+            if has_update_triggers {
+                self.fire_triggers(
+                    &upd.table,
+                    TrigEvent::Update,
+                    TriggerTiming::After,
+                    &meta.columns,
+                    Some((&original, 0)),
+                    Some((&row, 0)),
+                    params,
+                    Some(&changed_cols),
+                )?;
+            }
             out[i] = row;
             affected += 1;
         }
