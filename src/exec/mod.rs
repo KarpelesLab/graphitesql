@@ -33782,11 +33782,17 @@ impl Connection {
         // still original) reproduces that; a batch check of only the final state
         // would miss it.
         let mut out = all.clone();
+        // Rows deleted by an `UPDATE OR REPLACE` whose new key collided with them.
+        let mut removed = alloc::vec![false; all.len()];
         let mut affected = 0;
         // RETURNING rows are held back until the update fully succeeds, so an
         // aborted UPDATE emits nothing.
         let mut returned: Vec<Vec<Value>> = Vec::new();
         for i in 0..all.len() {
+            // A row already deleted by an earlier `OR REPLACE` cannot be updated.
+            if removed[i] {
+                continue;
+            }
             // Match the row (and, under FROM, capture the joined row that satisfies
             // WHERE — those columns feed the SET expressions).
             let (matches, matched_from) = match &from_data {
@@ -33901,16 +33907,46 @@ impl Connection {
             self.check_strict_types(meta, &row)?;
             self.check_constraints(meta, &row, None, params)?;
             // Immediate uniqueness check against the current state of every OTHER
-            // row (see the note on `out` above): reject transient duplicates.
+            // (live) row (see the note on `out` above): reject transient
+            // duplicates. `UPDATE OR IGNORE` skips a conflicting row; `UPDATE OR
+            // REPLACE` deletes the row(s) it collides with, then applies the update.
+            let mut conflict_js: Vec<usize> = Vec::new();
             for (j, other) in out.iter().enumerate() {
-                if j == i {
+                if j == i || removed[j] {
                     continue;
                 }
                 if unique_match(meta, &row, other)
                     || self.wr_index_collision(&upd.table, meta, &row, other, params)?
                 {
-                    let m = self.wr_conflict_message(&upd.table, meta, &row, other, params)?;
-                    return Err(Error::Constraint(m));
+                    conflict_js.push(j);
+                }
+            }
+            if !conflict_js.is_empty() {
+                let oc = if upd.on_conflict_explicit {
+                    upd.on_conflict
+                } else {
+                    OnConflict::Abort
+                };
+                match oc {
+                    OnConflict::Ignore => continue,
+                    OnConflict::Replace => {
+                        for &j in &conflict_js {
+                            removed[j] = true;
+                            self.record_session_change(
+                                &upd.table,
+                                meta,
+                                crate::session::ChangeOp::Delete,
+                                0,
+                                Some(&out[j]),
+                                None,
+                            );
+                        }
+                    }
+                    oc @ (OnConflict::Abort | OnConflict::Fail | OnConflict::Rollback) => {
+                        let other = &out[conflict_js[0]];
+                        let m = self.wr_conflict_message(&upd.table, meta, &row, other, params)?;
+                        return Err(self.conflict_error(oc, &m));
+                    }
                 }
             }
             // Foreign keys (same as the rowid UPDATE path): this row as a child
@@ -33954,7 +33990,13 @@ impl Connection {
             self.collect_returning(&upd.returning, meta, r, None, params)?;
         }
         if affected > 0 {
-            self.rewrite_without_rowid(meta, out.into_iter())?;
+            // Drop any rows an `OR REPLACE` deleted before rewriting.
+            let kept = out
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| !removed[*i])
+                .map(|(_, r)| r);
+            self.rewrite_without_rowid(meta, kept)?;
             self.rebuild_wr_indexes(meta, &upd.table)?;
             // A cascade to a rowid child may have emptied its leaves.
             if self.foreign_keys {
