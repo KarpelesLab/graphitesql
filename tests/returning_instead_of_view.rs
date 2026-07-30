@@ -1,8 +1,9 @@
-//! `INSERT INTO <view> … RETURNING …`, where the view has an `INSTEAD OF INSERT`
-//! trigger, projects the NEW row (the view's columns) — the values presented to
-//! the trigger — exactly as SQLite does. graphite previously errored
-//! "no such table: <view>" because the RETURNING path looked the view up as a
-//! table. Byte-verified against sqlite3 3.50.4.
+//! `RETURNING` on a view whose modification runs through an `INSTEAD OF` trigger
+//! projects the view's columns — the NEW row for INSERT/UPDATE, the OLD row for
+//! DELETE — exactly as SQLite does. graphite previously errored
+//! "no such table: <view>" (the RETURNING path looked the view up as a table)
+//! or, for UPDATE/DELETE views, returned nothing. Byte-verified against
+//! sqlite3 3.50.4.
 
 #![cfg(feature = "std")]
 
@@ -14,10 +15,45 @@ fn view_conn() -> Connection {
         "CREATE TABLE t(a, b);
          CREATE VIEW v AS SELECT a, b FROM t;
          CREATE TRIGGER vt INSTEAD OF INSERT ON v
-           BEGIN INSERT INTO t VALUES(NEW.a, NEW.b); END;",
+           BEGIN INSERT INTO t VALUES(NEW.a, NEW.b); END;
+         CREATE TRIGGER vu INSTEAD OF UPDATE ON v
+           BEGIN UPDATE t SET b = NEW.b WHERE a = OLD.a; END;
+         CREATE TRIGGER vd INSTEAD OF DELETE ON v
+           BEGIN DELETE FROM t WHERE a = OLD.a; END;",
     )
     .unwrap();
     c
+}
+
+#[test]
+fn update_view_returning_projects_new_row() {
+    let mut c = view_conn();
+    c.execute("INSERT INTO t VALUES(1, 2), (3, 4)").unwrap();
+    let r = c
+        .execute_returning(
+            "UPDATE v SET b = 9 WHERE a = 1 RETURNING a, b",
+            &Default::default(),
+        )
+        .unwrap();
+    assert_eq!(r.rows, [[Value::Integer(1), Value::Integer(9)]]);
+    assert_eq!(
+        c.query("SELECT b FROM t WHERE a = 1").unwrap().rows[0][0],
+        Value::Integer(9)
+    );
+}
+
+#[test]
+fn delete_view_returning_projects_old_row() {
+    let mut c = view_conn();
+    c.execute("INSERT INTO t VALUES(1, 2), (3, 4)").unwrap();
+    let r = c
+        .execute_returning("DELETE FROM v WHERE a = 1 RETURNING b", &Default::default())
+        .unwrap();
+    assert_eq!(r.rows, [[Value::Integer(2)]]);
+    assert_eq!(
+        c.query("SELECT count(*) FROM t").unwrap().rows[0][0],
+        Value::Integer(1)
+    );
 }
 
 #[test]

@@ -10866,6 +10866,10 @@ impl Connection {
             if self.raise_ignore.replace(false) {
                 continue;
             }
+            // `DELETE FROM view … RETURNING …` projects the deleted (OLD) view row.
+            if !del.returning.is_empty() {
+                self.collect_returning_cols(&del.returning, &cols, &row.values, None, params)?;
+            }
             affected += 1;
         }
         Ok(affected)
@@ -10977,6 +10981,10 @@ impl Connection {
             )?;
             if self.raise_ignore.replace(false) {
                 continue;
+            }
+            // `UPDATE view … RETURNING …` projects the updated (NEW) view row.
+            if !upd.returning.is_empty() {
+                self.collect_returning_cols(&upd.returning, &cols, &new, None, params)?;
             }
             affected += 1;
         }
