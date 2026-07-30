@@ -33552,6 +33552,27 @@ impl Connection {
         }
         apply_column_affinity(meta, &mut new_row);
         self.materialize_generated(meta, &mut new_row, params)?;
+        // An `ON CONFLICT DO UPDATE` that fires fires the table's UPDATE triggers
+        // (BEFORE INSERT already fired for the attempted insert; AFTER INSERT does
+        // not — SQLite converts the row to an UPDATE). BEFORE UPDATE runs ahead of
+        // the constraint checks; `RAISE(IGNORE)` leaves the row unchanged.
+        let has_update_triggers = self.has_row_triggers(table, TrigEvent::Update);
+        let changed_cols: Vec<String> = assignments.iter().map(|(c, _)| c.clone()).collect();
+        if has_update_triggers {
+            self.fire_triggers(
+                table,
+                TrigEvent::Update,
+                TriggerTiming::Before,
+                &meta.columns,
+                Some((&old_row, 0)),
+                Some((&new_row, 0)),
+                params,
+                Some(&changed_cols),
+            )?;
+            if self.raise_ignore.replace(false) {
+                return Ok(false);
+            }
+        }
         // PRIMARY KEY columns are implicitly NOT NULL in a WITHOUT ROWID table.
         for &c in &meta.storage_order[..meta.pk_len] {
             if matches!(new_row[c], Value::Null) {
@@ -33588,6 +33609,18 @@ impl Connection {
         let mut rebuilt = existing;
         rebuilt[target] = new_row.clone();
         self.rewrite_without_rowid(meta, rebuilt.into_iter())?;
+        if has_update_triggers {
+            self.fire_triggers(
+                table,
+                TrigEvent::Update,
+                TriggerTiming::After,
+                &meta.columns,
+                Some((&old_row, 0)),
+                Some((&new_row, 0)),
+                params,
+                Some(&changed_cols),
+            )?;
+        }
         if !returning.is_empty() {
             self.collect_returning(returning, meta, &new_row, None, params)?;
         }

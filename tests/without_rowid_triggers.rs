@@ -100,6 +100,39 @@ fn before_insert_raise_ignore_skips_row() {
 }
 
 #[test]
+fn upsert_do_update_fires_update_triggers() {
+    // `INSERT … ON CONFLICT DO UPDATE` that converts to an update fires the
+    // BEFORE INSERT trigger (for the attempted insert) then BEFORE/AFTER UPDATE —
+    // never AFTER INSERT. Matches sqlite's `bib, buab, auab` sequence.
+    let l = log(
+        "CREATE TRIGGER bi BEFORE INSERT ON t BEGIN INSERT INTO log VALUES('bi'||NEW.v); END;
+         CREATE TRIGGER ai AFTER INSERT ON t BEGIN INSERT INTO log VALUES('ai'||NEW.v); END;
+         CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES('bu'||OLD.v||NEW.v); END;
+         CREATE TRIGGER au AFTER UPDATE ON t BEGIN INSERT INTO log VALUES('au'||OLD.v||NEW.v); END;
+         INSERT INTO t VALUES(1,'a');",
+        "INSERT INTO t VALUES(1,'b') ON CONFLICT(k) DO UPDATE SET v=excluded.v;",
+    );
+    assert_eq!(l, ["bia", "aia", "bib", "buab", "auab"]);
+}
+
+#[test]
+fn upsert_do_update_before_raise_ignore_keeps_old_row() {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute_batch(
+        "CREATE TABLE t(k PRIMARY KEY, v) WITHOUT ROWID;
+         INSERT INTO t VALUES(1,'a');
+         CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN SELECT RAISE(IGNORE); END;",
+    )
+    .unwrap();
+    c.execute("INSERT INTO t VALUES(1,'b') ON CONFLICT(k) DO UPDATE SET v=excluded.v")
+        .unwrap();
+    assert_eq!(
+        c.query("SELECT v FROM t").unwrap().rows[0][0],
+        Value::Text("a".into())
+    );
+}
+
+#[test]
 fn fk_cascade_into_wr_child_fires_child_triggers() {
     let mut c = Connection::open_memory().unwrap();
     c.execute_batch(
