@@ -33395,7 +33395,15 @@ impl Connection {
                         }
                     }
                 }
-                match ins.on_conflict {
+                // The statement's `OR <action>` wins; otherwise the declared
+                // `ON CONFLICT` action of the constraint the row collides on
+                // applies (matching the rowid path's `find_conflicts`).
+                let effective_oc = if ins.on_conflict_explicit {
+                    ins.on_conflict
+                } else {
+                    wr_collision_action(meta, &values, &existing[collide[0]])
+                };
+                match effective_oc {
                     oc @ (OnConflict::Abort | OnConflict::Fail | OnConflict::Rollback) => {
                         let m = self.wr_conflict_message(
                             &ins.table,
@@ -33925,7 +33933,7 @@ impl Connection {
                 let oc = if upd.on_conflict_explicit {
                     upd.on_conflict
                 } else {
-                    OnConflict::Abort
+                    wr_collision_action(meta, &row, &out[conflict_js[0]])
                 };
                 match oc {
                     OnConflict::Ignore => continue,
@@ -45862,6 +45870,27 @@ fn unique_match(meta: &TableMeta, a: &[Value], b: &[Value]) -> bool {
                 && crate::value::cmp_values_coll(&a[c], &b[c], meta.columns[c].collation).is_eq()
         })
     })
+}
+
+/// The declared `ON CONFLICT` action of the first inline UNIQUE / PRIMARY KEY
+/// constraint that `new_row` collides with `other` on — used on the WITHOUT
+/// ROWID paths when the statement carries no `OR <action>` of its own (mirrors
+/// the rowid path's `find_conflicts` `constraint_oc`). A collision only on a
+/// standalone unique index — which cannot declare an action — defaults to
+/// `Abort`.
+fn wr_collision_action(meta: &TableMeta, new_row: &[Value], other: &[Value]) -> OnConflict {
+    for (set, oc, _) in &meta.unique {
+        if set.iter().any(|&c| matches!(new_row[c], Value::Null)) {
+            continue; // a NULL makes the key distinct
+        }
+        let same = set.iter().all(|&c| {
+            crate::value::cmp_values_coll(&other[c], &new_row[c], meta.columns[c].collation).is_eq()
+        });
+        if same {
+            return *oc;
+        }
+    }
+    OnConflict::Abort
 }
 
 /// Whether building a UNIQUE index over `tuples` (the indexed key values of each
