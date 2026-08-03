@@ -12043,6 +12043,11 @@ impl Connection {
         // The declared `ON CONFLICT` action of the first inline UNIQUE/PRIMARY KEY
         // set the new row collides on (used when the statement has no `OR <action>`).
         let mut action: Option<OnConflict> = None;
+        // Whether the new row duplicates the rowid (the INTEGER PRIMARY KEY), and
+        // whether it also collides on any *other* constraint. The IPK's declared
+        // action applies only when the rowid is the *sole* conflict.
+        let mut rowid_conflict = false;
+        let mut other_conflict = false;
         // Only the handful of rows that could possibly collide (found by seeking
         // the rowid + each unique index), NOT the whole table — this is what keeps
         // INSERT O(n·log n) instead of O(n²). Each candidate is re-confirmed below.
@@ -12052,6 +12057,7 @@ impl Connection {
             }
             if er == rowid {
                 out.push(er);
+                rowid_conflict = true;
                 continue;
             }
             let mut conflicted = false;
@@ -12067,6 +12073,7 @@ impl Connection {
                 if conflict {
                     out.push(er);
                     action.get_or_insert(*set_oc);
+                    other_conflict = true;
                     conflicted = true;
                     break;
                 }
@@ -12090,11 +12097,20 @@ impl Connection {
                         });
                 if conflict {
                     out.push(er);
+                    other_conflict = true;
                     break;
                 }
             }
         }
-        Ok((out, action.unwrap_or(OnConflict::Abort)))
+        // Resolve the action for a statement with no `OR <clause>`: an inline
+        // UNIQUE/PK set's declared action if one was hit, otherwise the IPK's
+        // declared action when the rowid is the *sole* conflict, else Abort.
+        let oc = match action {
+            Some(a) => a,
+            None if rowid_conflict && !other_conflict => meta.ipk_on_conflict,
+            None => OnConflict::Abort,
+        };
+        Ok((out, oc))
     }
 
     /// SQLite's UNIQUE-violation message for the *first* unique constraint the new
@@ -39201,6 +39217,31 @@ impl Connection {
         // handled separately). Order matches SQLite's auto-index numbering.
         let unique = collect_unique_sets(&ct, ipk);
 
+        // The IPK's declared `ON CONFLICT` action (`INTEGER PRIMARY KEY ON
+        // CONFLICT REPLACE`, …), used only for a sole-rowid conflict. Read it
+        // from the IPK column's `PRIMARY KEY` constraint, or a table-level
+        // single-column `PRIMARY KEY(col) ON CONFLICT …` naming it.
+        let ipk_on_conflict = ipk
+            .and_then(|i| {
+                ct.columns[i]
+                    .constraints
+                    .iter()
+                    .find_map(|k| match k {
+                        ColumnConstraint::PrimaryKey { on_conflict, .. } => Some(*on_conflict),
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        ct.constraints.iter().find_map(|tc| match tc {
+                            TableConstraint::PrimaryKey(cols, oc) if cols.len() == 1 => columns
+                                .get(i)
+                                .is_some_and(|ci| cols[0].0.eq_ignore_ascii_case(&ci.name))
+                                .then_some(*oc),
+                            _ => None,
+                        })
+                    })
+            })
+            .unwrap_or(OnConflict::Abort);
+
         // WITHOUT ROWID: derive the PK-first storage order.
         let (without_rowid, storage_order, pk_len, pk_descending) = if ct.without_rowid {
             let pk_dir = primary_key_positions_dir(&ct);
@@ -39257,6 +39298,7 @@ impl Connection {
             checks,
             unique,
             ipk,
+            ipk_on_conflict,
             generated,
             without_rowid,
             storage_order,
@@ -39575,6 +39617,15 @@ struct TableMeta {
     /// flags order the auto-created `sqlite_autoindex_*` b-tree.
     unique: Vec<(Vec<usize>, OnConflict, Vec<bool>)>,
     ipk: Option<usize>,
+    /// The `ON CONFLICT` action declared on the `INTEGER PRIMARY KEY` (rowid
+    /// alias), applied when a rowid duplicate is the *only* thing the new row
+    /// collides on and the statement has no `OR <action>` of its own. `Abort`
+    /// when none is declared or there is no IPK. The IPK is not a `unique` entry
+    /// (it is the rowid), so its action is tracked here. Only used for a
+    /// sole-rowid conflict — a collision on any other constraint keeps the
+    /// existing resolution (SQLite's multi-constraint precedence is order-based
+    /// and not modelled; see `conflict-resolution-gaps`).
+    ipk_on_conflict: OnConflict,
     /// Per-column generated-column spec `(expr, stored)`, if the column is
     /// `… AS (expr) [STORED|VIRTUAL]`. `VIRTUAL` (stored = false) columns are not
     /// written to disk; `STORED` ones are. Aligned with `columns`.
@@ -40199,6 +40250,7 @@ fn schema_table_meta(label: &str) -> TableMeta {
         checks: Vec::new(),
         unique: Vec::new(),
         ipk: None,
+        ipk_on_conflict: OnConflict::Abort,
         generated: alloc::vec![None; n],
         without_rowid: false,
         storage_order: Vec::new(),
