@@ -12165,6 +12165,117 @@ impl Connection {
         alloc::format!("UNIQUE constraint failed: {detail}")
     }
 
+    /// [`find_conflicts_ordered`] for a WITHOUT ROWID table: the row's violated
+    /// uniqueness constraints in SQLite's check order — standalone unique indexes
+    /// in reverse creation order, then inline UNIQUE/PK sets (which include the
+    /// clustered PRIMARY KEY) in reverse declaration order. There is no separate
+    /// rowid step. `rows` on each [`Violation`] holds POSITIONS into `existing`
+    /// (a WITHOUT ROWID row has no rowid); `exclude` skips the row being updated.
+    /// Reuses [`resolve_conflict`]/[`violation_message`], which are identifier-
+    /// agnostic.
+    ///
+    /// [`resolve_conflict`]: Self::resolve_conflict
+    /// [`violation_message`]: Self::violation_message
+    fn wr_conflicts_ordered(
+        &self,
+        table: &str,
+        meta: &TableMeta,
+        values: &[Value],
+        existing: &[Vec<Value>],
+        skip: impl Fn(usize) -> bool,
+        params: &Params,
+    ) -> Result<Vec<Violation>> {
+        let live = |p: usize| !skip(p);
+        let mut violations: Vec<Violation> = Vec::new();
+
+        // Standalone unique indexes, reverse creation order (always Abort).
+        let indexes = self.indexes_of(table)?;
+        for idx in indexes
+            .iter()
+            .rev()
+            .filter(|i| i.unique && autoindex_number(&i.name, table).is_none())
+        {
+            if !self
+                .row_in_index(idx, meta, values, None, params)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Ok(new_key) = self.index_key_values(idx, meta, values, 0, params) else {
+                continue;
+            };
+            if new_key.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
+            }
+            let mut rows = Vec::new();
+            for (p, ev) in existing.iter().enumerate() {
+                if !live(p)
+                    || !self
+                        .row_in_index(idx, meta, ev, None, params)
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
+                let Ok(ek) = self.index_key_values(idx, meta, ev, 0, params) else {
+                    continue;
+                };
+                let same = ek.len() == new_key.len()
+                    && ek
+                        .iter()
+                        .zip(&new_key)
+                        .zip(&idx.collations)
+                        .all(|((a, b), &coll)| {
+                            crate::value::cmp_values_coll(a, b, coll) == core::cmp::Ordering::Equal
+                        });
+                if same {
+                    rows.push(p as i64);
+                }
+            }
+            if !rows.is_empty() {
+                let name = if idx.key_exprs.is_some() {
+                    ViolationName::Index(idx.name.clone())
+                } else {
+                    ViolationName::Columns(idx.cols.clone())
+                };
+                violations.push(Violation {
+                    declared: OnConflict::Abort,
+                    rows,
+                    name,
+                });
+            }
+        }
+
+        // Inline UNIQUE / PRIMARY KEY sets (incl. the clustered PK), reverse
+        // declaration order.
+        for (set, set_oc, _) in meta.unique.iter().rev() {
+            if set.iter().any(|&i| matches!(values[i], Value::Null)) {
+                continue;
+            }
+            let mut rows = Vec::new();
+            for (p, ev) in existing.iter().enumerate() {
+                if !live(p) {
+                    continue;
+                }
+                let same = set.iter().all(|&i| {
+                    crate::value::cmp_values_coll(&ev[i], &values[i], meta.columns[i].collation)
+                        == core::cmp::Ordering::Equal
+                });
+                if same {
+                    rows.push(p as i64);
+                }
+            }
+            if !rows.is_empty() {
+                violations.push(Violation {
+                    declared: *set_oc,
+                    rows,
+                    name: ViolationName::Columns(set.clone()),
+                });
+            }
+        }
+
+        Ok(violations)
+    }
+
     /// Backward-compatible flat view of [`find_conflicts_ordered`]: the deduped set
     /// of conflicting rowids plus the first violated constraint's declared action.
     /// Used where only "is there any conflict" matters (the upsert re-check path).
@@ -33482,33 +33593,31 @@ impl Connection {
                         }
                     }
                 }
-                // The statement's `OR <action>` wins; otherwise the declared
-                // `ON CONFLICT` action of the constraint the row collides on
-                // applies (matching the rowid path's `find_conflicts`).
-                let effective_oc = if ins.on_conflict_explicit {
-                    ins.on_conflict
-                } else {
-                    wr_collision_action(meta, &values, &existing[collide[0]])
-                };
-                match effective_oc {
-                    oc @ (OnConflict::Abort | OnConflict::Fail | OnConflict::Rollback) => {
-                        let m = self.wr_conflict_message(
-                            &ins.table,
-                            meta,
-                            &existing[collide[0]],
-                            &values,
-                            params,
-                        )?;
-                        return Err(self.conflict_error(oc, &m));
-                    }
-                    OnConflict::Ignore => continue,
-                    OnConflict::Replace => {
+                // Resolve the conflict in SQLite's constraint-check order (the
+                // statement's `OR <action>` overrides the constraints' declared
+                // actions). `Violation::rows` are positions into `existing`.
+                let violations = self.wr_conflicts_ordered(
+                    &ins.table,
+                    meta,
+                    &values,
+                    &existing,
+                    |_| false,
+                    params,
+                )?;
+                let override_oc = ins.on_conflict_explicit.then_some(ins.on_conflict);
+                match self.resolve_conflict(&violations, override_oc, meta) {
+                    ConflictOutcome::None => {}
+                    ConflictOutcome::Error(oc, m) => return Err(self.conflict_error(oc, &m)),
+                    ConflictOutcome::Skip => continue,
+                    ConflictOutcome::Replace(positions) => {
                         // Rebuild without the conflicting row(s), then insert.
                         // Record each removed row as a session DELETE (a same-PK
                         // REPLACE coalesces DELETE+INSERT into an UPDATE; a
                         // different-PK conflict yields a DELETE + this INSERT).
+                        let del: alloc::collections::BTreeSet<usize> =
+                            positions.iter().map(|&p| p as usize).collect();
                         if self.session.borrow().is_some() {
-                            for &ci in &collide {
+                            for &ci in &del {
                                 let old = existing[ci].clone();
                                 self.record_session_change(
                                     &ins.table,
@@ -33523,7 +33632,7 @@ impl Connection {
                         let kept: Vec<Vec<Value>> = existing
                             .into_iter()
                             .enumerate()
-                            .filter(|(i, _)| !collide.contains(i))
+                            .filter(|(i, _)| !del.contains(i))
                             .map(|(_, r)| r)
                             .collect();
                         self.rewrite_without_rowid(meta, kept.into_iter())?;
@@ -34003,44 +34112,35 @@ impl Connection {
             self.check_constraints(meta, &row, None, params)?;
             // Immediate uniqueness check against the current state of every OTHER
             // (live) row (see the note on `out` above): reject transient
-            // duplicates. `UPDATE OR IGNORE` skips a conflicting row; `UPDATE OR
-            // REPLACE` deletes the row(s) it collides with, then applies the update.
-            let mut conflict_js: Vec<usize> = Vec::new();
-            for (j, other) in out.iter().enumerate() {
-                if j == i || removed[j] {
-                    continue;
-                }
-                if unique_match(meta, &row, other)
-                    || self.wr_index_collision(&upd.table, meta, &row, other, params)?
-                {
-                    conflict_js.push(j);
-                }
-            }
-            if !conflict_js.is_empty() {
-                let oc = if upd.on_conflict_explicit {
-                    upd.on_conflict
-                } else {
-                    wr_collision_action(meta, &row, &out[conflict_js[0]])
-                };
-                match oc {
-                    OnConflict::Ignore => continue,
-                    OnConflict::Replace => {
-                        for &j in &conflict_js {
-                            removed[j] = true;
-                            self.record_session_change(
-                                &upd.table,
-                                meta,
-                                crate::session::ChangeOp::Delete,
-                                0,
-                                Some(&out[j]),
-                                None,
-                            );
-                        }
-                    }
-                    oc @ (OnConflict::Abort | OnConflict::Fail | OnConflict::Rollback) => {
-                        let other = &out[conflict_js[0]];
-                        let m = self.wr_conflict_message(&upd.table, meta, &row, other, params)?;
-                        return Err(self.conflict_error(oc, &m));
+            // duplicates. Resolved in SQLite's constraint-check order; `UPDATE OR
+            // IGNORE` skips a conflicting row, `UPDATE OR REPLACE` deletes the
+            // row(s) it collides with, then applies the update. `Violation::rows`
+            // are positions into `out`.
+            let violations = self.wr_conflicts_ordered(
+                &upd.table,
+                meta,
+                &row,
+                &out,
+                |p| p == i || removed[p],
+                params,
+            )?;
+            let override_oc = upd.on_conflict_explicit.then_some(upd.on_conflict);
+            match self.resolve_conflict(&violations, override_oc, meta) {
+                ConflictOutcome::None => {}
+                ConflictOutcome::Error(oc, m) => return Err(self.conflict_error(oc, &m)),
+                ConflictOutcome::Skip => continue,
+                ConflictOutcome::Replace(positions) => {
+                    for p in positions {
+                        let j = p as usize;
+                        removed[j] = true;
+                        self.record_session_change(
+                            &upd.table,
+                            meta,
+                            crate::session::ChangeOp::Delete,
+                            0,
+                            Some(&out[j]),
+                            None,
+                        );
                     }
                 }
             }
@@ -46032,27 +46132,6 @@ fn unique_match(meta: &TableMeta, a: &[Value], b: &[Value]) -> bool {
                 && crate::value::cmp_values_coll(&a[c], &b[c], meta.columns[c].collation).is_eq()
         })
     })
-}
-
-/// The declared `ON CONFLICT` action of the first inline UNIQUE / PRIMARY KEY
-/// constraint that `new_row` collides with `other` on — used on the WITHOUT
-/// ROWID paths when the statement carries no `OR <action>` of its own (mirrors
-/// the rowid path's `find_conflicts` `constraint_oc`). A collision only on a
-/// standalone unique index — which cannot declare an action — defaults to
-/// `Abort`.
-fn wr_collision_action(meta: &TableMeta, new_row: &[Value], other: &[Value]) -> OnConflict {
-    for (set, oc, _) in &meta.unique {
-        if set.iter().any(|&c| matches!(new_row[c], Value::Null)) {
-            continue; // a NULL makes the key distinct
-        }
-        let same = set.iter().all(|&c| {
-            crate::value::cmp_values_coll(&other[c], &new_row[c], meta.columns[c].collation).is_eq()
-        });
-        if same {
-            return *oc;
-        }
-    }
-    OnConflict::Abort
 }
 
 /// Whether building a UNIQUE index over `tuples` (the indexed key values of each

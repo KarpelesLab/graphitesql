@@ -96,3 +96,39 @@ fn rowid_ipk_checked_before_unique() {
         .to_string();
     assert!(e.contains("UNIQUE constraint failed: t.a"), "got: {e}");
 }
+
+/// The WITHOUT ROWID path resolves the same way (its clustered PRIMARY KEY is
+/// just another inline set in the reverse-declaration order — no separate rowid
+/// step).
+fn wr_outcome(a: &str, b: &str) -> String {
+    let mut c = Connection::open_memory().unwrap();
+    c.execute_batch(&format!(
+        "CREATE TABLE t(k PRIMARY KEY, a UNIQUE ON CONFLICT {a}, b UNIQUE ON CONFLICT {b})
+             WITHOUT ROWID;
+         INSERT INTO t VALUES(0,10,100),(1,20,200);"
+    ))
+    .unwrap();
+    match c.execute("INSERT INTO t VALUES(2,10,200)") {
+        Err(e) => e.to_string(),
+        Ok(_) => c
+            .query("SELECT a, b FROM t ORDER BY a")
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| match (&r[0], &r[1]) {
+                (Value::Integer(a), Value::Integer(b)) => format!("{a}:{b}"),
+                o => panic!("{o:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join(","),
+    }
+}
+
+#[test]
+fn without_rowid_follows_the_same_order() {
+    assert!(wr_outcome("ABORT", "REPLACE").contains("UNIQUE constraint failed: t.a"));
+    assert!(wr_outcome("REPLACE", "ABORT").contains("UNIQUE constraint failed: t.b"));
+    assert_eq!(wr_outcome("ABORT", "IGNORE"), "10:100,20:200");
+    assert_eq!(wr_outcome("REPLACE", "IGNORE"), "10:100,20:200");
+    assert_eq!(wr_outcome("REPLACE", "REPLACE"), "10:200");
+}
