@@ -74,6 +74,7 @@ int sqlite3_bind_int(sqlite3_stmt *stmt, int idx, int v);
 int sqlite3_bind_int64(sqlite3_stmt *stmt, int idx, sqlite3_int64 v);
 int sqlite3_bind_double(sqlite3_stmt *stmt, int idx, double v);
 int sqlite3_bind_null(sqlite3_stmt *stmt, int idx);
+int sqlite3_bind_zeroblob(sqlite3_stmt *stmt, int idx, int n);
 int sqlite3_bind_text(sqlite3_stmt *stmt, int idx, const char *text, int nByte, void(*d)(void*));
 int sqlite3_bind_blob(sqlite3_stmt *stmt, int idx, const void *data, int nByte, void(*d)(void*));
 
@@ -129,6 +130,7 @@ const unsigned char *sqlite3_value_text(sqlite3_value *v);
 const void *sqlite3_value_blob(sqlite3_value *v);
 
 void sqlite3_result_null(sqlite3_context *ctx);
+void sqlite3_result_zeroblob(sqlite3_context *ctx, int n);
 void sqlite3_result_int(sqlite3_context *ctx, int v);
 void sqlite3_result_int64(sqlite3_context *ctx, sqlite3_int64 v);
 void sqlite3_result_double(sqlite3_context *ctx, double v);

@@ -46,6 +46,10 @@ pub const SQLITE_OK: c_int = 0;
 pub const SQLITE_ERROR: c_int = 1;
 pub const SQLITE_NOMEM: c_int = 7;
 pub const SQLITE_RANGE: c_int = 25;
+pub const SQLITE_TOOBIG: c_int = 18;
+
+/// SQLite's `SQLITE_MAX_LENGTH`: the largest blob a `zeroblob` may materialize.
+const CAPI_MAX_BLOB_LEN: c_longlong = 1_000_000_000;
 pub const SQLITE_ROW: c_int = 100;
 pub const SQLITE_DONE: c_int = 101;
 
@@ -885,6 +889,31 @@ pub unsafe extern "C" fn sqlite3_bind_null(stmt: *mut sqlite3_stmt, idx: c_int) 
     bind_at(unsafe { &mut *stmt }, idx, Value::Null)
 }
 
+/// Bind an all-zeroes BLOB of `n` bytes to parameter `idx` (SQLite's
+/// `sqlite3_bind_zeroblob`). A negative `n` binds an empty blob; an oversized `n`
+/// returns `SQLITE_TOOBIG`. (SQLite defers the allocation; graphite materializes
+/// it, which is equivalent for a supported length.)
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_zeroblob(
+    stmt: *mut sqlite3_stmt,
+    idx: c_int,
+    n: c_int,
+) -> c_int {
+    if stmt.is_null() {
+        return SQLITE_ERROR;
+    }
+    let n = n as c_longlong;
+    if n > CAPI_MAX_BLOB_LEN {
+        return SQLITE_TOOBIG;
+    }
+    let len = n.max(0) as usize;
+    bind_at(
+        unsafe { &mut *stmt },
+        idx,
+        Value::Blob(alloc::vec![0u8; len]),
+    )
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sqlite3_bind_text(
     stmt: *mut sqlite3_stmt,
@@ -1444,6 +1473,20 @@ pub unsafe extern "C" fn sqlite3_value_blob(v: *mut sqlite3_value) -> *const c_v
 pub unsafe extern "C" fn sqlite3_result_null(ctx: *mut sqlite3_context) {
     if let Some(c) = unsafe { ctx.as_mut() } {
         c.result = Value::Null;
+    }
+}
+
+/// Set the function result to an all-zeroes BLOB of `n` bytes (SQLite's
+/// `sqlite3_result_zeroblob`). A negative `n` yields an empty blob; an oversized
+/// `n` sets a `SQLITE_TOOBIG` error on the context instead.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_result_zeroblob(ctx: *mut sqlite3_context, n: c_int) {
+    if let Some(c) = unsafe { ctx.as_mut() } {
+        if n as c_longlong > CAPI_MAX_BLOB_LEN {
+            c.error = Some(String::from("string or blob too big"));
+            return;
+        }
+        c.result = Value::Blob(alloc::vec![0u8; n.max(0) as usize]);
     }
 }
 

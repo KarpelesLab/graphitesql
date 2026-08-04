@@ -30,6 +30,12 @@ static void times_k(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   sqlite3_result_int64(ctx, sqlite3_value_int64(argv[0]) * k);
 }
 
+/* A UDF that returns an N-byte all-zeroes blob via sqlite3_result_zeroblob. */
+static void zb(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  (void)argc;
+  sqlite3_result_zeroblob(ctx, (int)sqlite3_value_int64(argv[0]));
+}
+
 /* A UDF that concatenates its two text args. */
 static void concat2(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc;
@@ -212,6 +218,16 @@ int main(void) {
   CHECK("blob bytes match", got && memcmp(got, raw, 4) == 0);
   sqlite3_finalize(bstmt);
 
+  /* sqlite3_bind_zeroblob: a 5-byte zero blob binds and reads back correctly. */
+  sqlite3_stmt *zbs = NULL;
+  sqlite3_prepare_v2(db, "SELECT length(?1), hex(?1)", -1, &zbs, NULL);
+  CHECK("bind_zeroblob ok", sqlite3_bind_zeroblob(zbs, 1, 5) == SQLITE_OK);
+  CHECK("zeroblob step -> ROW", sqlite3_step(zbs) == SQLITE_ROW);
+  CHECK("zeroblob length 5", sqlite3_column_int(zbs, 0) == 5);
+  CHECK("zeroblob hex 0000000000",
+        strcmp((const char *)sqlite3_column_text(zbs, 1), "0000000000") == 0);
+  sqlite3_finalize(zbs);
+
   /* INSERT ... RETURNING drives the row path (step -> ROW), not just DONE. */
   sqlite3_stmt *ret = NULL;
   rc = sqlite3_prepare_v2(db,
@@ -257,12 +273,17 @@ int main(void) {
   CHECK("create_function times_k", rc == SQLITE_OK);
   rc = sqlite3_create_function(db, "concat2", 2, SQLITE_UTF8, NULL, concat2, NULL, NULL);
   CHECK("create_function concat2", rc == SQLITE_OK);
+  rc = sqlite3_create_function(db, "zb", 1, SQLITE_UTF8, NULL, zb, NULL, NULL);
+  CHECK("create_function zb", rc == SQLITE_OK);
 
   sqlite3_stmt *ufn = NULL;
-  sqlite3_prepare_v2(db, "SELECT times_k(5), concat2('foo','bar')", -1, &ufn, NULL);
+  sqlite3_prepare_v2(db, "SELECT times_k(5), concat2('foo','bar'), length(zb(3)), typeof(zb(3))",
+                     -1, &ufn, NULL);
   CHECK("udf step -> ROW", sqlite3_step(ufn) == SQLITE_ROW);
   CHECK("times_k(5) == 50", sqlite3_column_int64(ufn, 0) == 50);
   CHECK("concat2 == foobar", strcmp((const char *)sqlite3_column_text(ufn, 1), "foobar") == 0);
+  CHECK("result_zeroblob length 3", sqlite3_column_int(ufn, 2) == 3);
+  CHECK("result_zeroblob is blob", strcmp((const char *)sqlite3_column_text(ufn, 3), "blob") == 0);
   sqlite3_finalize(ufn);
 
   /* A UDF used inside a WHERE clause over table rows. */
