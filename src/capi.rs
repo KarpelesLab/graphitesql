@@ -38,7 +38,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::ffi::{c_char, c_double, c_int, c_longlong, c_uchar, c_void};
+use core::ffi::{c_char, c_double, c_int, c_longlong, c_uchar, c_uint, c_ulonglong, c_void};
 use std::ffi::{CStr, CString};
 
 // --- Result codes (subset of sqlite3.h) ---------------------------------------
@@ -69,6 +69,10 @@ pub const SQLITE_TRANSIENT: isize = -1;
 
 const LIBVERSION: &CStr = c"3.50.4";
 const LIBVERSION_NUMBER: c_int = 3_050_004;
+/// The upstream `sqlite3_sourceid()` string for 3.50.4 (the differential oracle
+/// version this shim targets), reported verbatim for API compatibility.
+const SOURCEID: &CStr =
+    c"2025-07-30 19:33:53 4d8adfb30e03f9cf27f800a2c1ba3c48fb4ca1b08b0f5ed59a4d5ecbf45ealt1";
 
 /// A database connection. Mirrors the opaque `sqlite3` handle.
 pub struct sqlite3 {
@@ -339,6 +343,44 @@ pub extern "C" fn sqlite3_libversion_number() -> c_int {
     LIBVERSION_NUMBER
 }
 
+/// The `sqlite3_sourceid()` build identifier (matches the 3.50.4 oracle).
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_sourceid() -> *const c_char {
+    SOURCEID.as_ptr()
+}
+
+/// Reports 1 (`sqlite3_threadsafe`) so `libsqlite3` consumers that gate on a
+/// nonzero value load. Note: this shim adds no internal per-connection mutexes,
+/// so — like SQLite's multi-thread mode — a single connection must not be used
+/// concurrently from two threads; separate connections per thread are fine.
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_threadsafe() -> c_int {
+    1
+}
+
+/// Library lifecycle no-ops: the engine has no global state to set up or tear
+/// down, so these succeed unconditionally (`sqlite3_initialize`,
+/// `sqlite3_shutdown`, `sqlite3_os_init`, `sqlite3_os_end`).
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_initialize() -> c_int {
+    SQLITE_OK
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_shutdown() -> c_int {
+    SQLITE_OK
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_os_init() -> c_int {
+    SQLITE_OK
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_os_end() -> c_int {
+    SQLITE_OK
+}
+
 // --- open / close -------------------------------------------------------------
 
 fn open_connection(path: &str) -> Result<Connection, String> {
@@ -462,12 +504,39 @@ pub unsafe extern "C" fn sqlite3_last_insert_rowid(db: *mut sqlite3) -> c_longlo
     unsafe { &*db }.last_insert_rowid
 }
 
+/// Override the value `sqlite3_last_insert_rowid` returns (SQLite's
+/// `sqlite3_set_last_insert_rowid`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_set_last_insert_rowid(db: *mut sqlite3, rowid: c_longlong) {
+    if let Some(db) = unsafe { db.as_mut() } {
+        db.last_insert_rowid = rowid;
+    }
+}
+
+/// 64-bit form of [`sqlite3_changes`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_changes64(db: *mut sqlite3) -> c_longlong {
+    if db.is_null() {
+        return 0;
+    }
+    unsafe { &*db }.changes as c_longlong
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sqlite3_total_changes(db: *mut sqlite3) -> c_int {
     if db.is_null() {
         return 0;
     }
     unsafe { &*db }.conn.total_changes() as c_int
+}
+
+/// 64-bit form of [`sqlite3_total_changes`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_total_changes64(db: *mut sqlite3) -> c_longlong {
+    if db.is_null() {
+        return 0;
+    }
+    unsafe { &*db }.conn.total_changes() as c_longlong
 }
 
 /// 1 in autocommit mode, 0 inside an explicit `BEGIN`…`COMMIT` transaction.
@@ -2360,4 +2429,283 @@ pub unsafe extern "C" fn sqlite3_stmt_readonly(stmt: *mut sqlite3_stmt) -> c_int
     }
     let stmt = unsafe { &*stmt };
     (is_row_producer(&stmt.sql) && !has_returning(&stmt.sql)) as c_int
+}
+
+// --- ASCII case-insensitive string helpers (sqlite3StrICmp / patternCompare) ---
+
+/// ASCII case-fold used by `sqlite3_stricmp`/`sqlite3_strnicmp` — SQLite's
+/// `UpperToLower` table only folds `A`..`Z`.
+#[inline]
+fn upper_to_lower(c: u8) -> u8 {
+    if c.is_ascii_uppercase() { c + 32 } else { c }
+}
+
+/// `sqlite3_stricmp`: case-insensitive (ASCII) comparison of two NUL-terminated
+/// strings, returning a negative/zero/positive `int` like `strcmp` on the
+/// case-folded bytes. Ported from `sqlite3StrICmp`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_stricmp(left: *const c_char, right: *const c_char) -> c_int {
+    if left.is_null() {
+        return if right.is_null() { 0 } else { -1 };
+    }
+    if right.is_null() {
+        return 1;
+    }
+    let mut a = left as *const u8;
+    let mut b = right as *const u8;
+    loop {
+        let c = unsafe { *a };
+        let x = unsafe { *b };
+        if c == x {
+            if c == 0 {
+                return 0;
+            }
+        } else {
+            let d = upper_to_lower(c) as c_int - upper_to_lower(x) as c_int;
+            if d != 0 {
+                return d;
+            }
+        }
+        a = unsafe { a.add(1) };
+        b = unsafe { b.add(1) };
+    }
+}
+
+/// `sqlite3_strnicmp`: like [`sqlite3_stricmp`] but compares at most `n` bytes.
+/// Ported from `sqlite3_strnicmp`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_strnicmp(
+    left: *const c_char,
+    right: *const c_char,
+    n: c_int,
+) -> c_int {
+    if left.is_null() {
+        return if right.is_null() { 0 } else { -1 };
+    }
+    if right.is_null() {
+        return 1;
+    }
+    let mut a = left as *const u8;
+    let mut b = right as *const u8;
+    let mut n = n;
+    while n > 0 {
+        let ca = unsafe { *a };
+        if ca == 0 || upper_to_lower(ca) != upper_to_lower(unsafe { *b }) {
+            break;
+        }
+        a = unsafe { a.add(1) };
+        b = unsafe { b.add(1) };
+        n -= 1;
+    }
+    if n <= 0 {
+        0
+    } else {
+        upper_to_lower(unsafe { *a }) as c_int - upper_to_lower(unsafe { *b }) as c_int
+    }
+}
+
+/// `sqlite3_strlike(P, S, esc)`: 0 if `S` matches the `LIKE` pattern `P` (with
+/// `esc` as the escape character, or none when `esc == 0`), non-zero otherwise.
+/// `LIKE` is case-insensitive over ASCII, matching SQLite.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_strlike(
+    glob: *const c_char,
+    str: *const c_char,
+    esc: c_uint,
+) -> c_int {
+    if glob.is_null() || str.is_null() {
+        return 1;
+    }
+    let pattern = unsafe { CStr::from_ptr(glob) }.to_bytes();
+    let text = unsafe { CStr::from_ptr(str) }.to_bytes();
+    let escape = if esc == 0 {
+        None
+    } else {
+        core::char::from_u32(esc)
+    };
+    if crate::exec::eval::like_match_escape_bytes(pattern, text, escape, false) {
+        0
+    } else {
+        1
+    }
+}
+
+/// `sqlite3_strglob(P, S)`: 0 if `S` matches the `GLOB` pattern `P`, non-zero
+/// otherwise.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_strglob(glob: *const c_char, str: *const c_char) -> c_int {
+    if glob.is_null() || str.is_null() {
+        return 1;
+    }
+    let pattern = unsafe { CStr::from_ptr(glob) }.to_bytes();
+    let text = unsafe { CStr::from_ptr(str) }.to_bytes();
+    if crate::exec::eval::glob_match_bytes(pattern, text) {
+        0
+    } else {
+        1
+    }
+}
+
+// --- 64-bit bind/result variants and value/result extras ----------------------
+
+/// 64-bit-length form of [`sqlite3_bind_text`] (the `encoding` byte is accepted
+/// for signature compatibility; only UTF-8 text is stored).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_text64(
+    stmt: *mut sqlite3_stmt,
+    idx: c_int,
+    text: *const c_char,
+    n_byte: c_ulonglong,
+    destructor: isize,
+    _encoding: c_uchar,
+) -> c_int {
+    let n = clamp_len_i64(n_byte);
+    if n < 0 {
+        return SQLITE_TOOBIG;
+    }
+    unsafe { sqlite3_bind_text(stmt, idx, text, n, destructor) }
+}
+
+/// 64-bit-length form of [`sqlite3_bind_blob`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_blob64(
+    stmt: *mut sqlite3_stmt,
+    idx: c_int,
+    data: *const c_void,
+    n_byte: c_ulonglong,
+    destructor: isize,
+) -> c_int {
+    let n = clamp_len_i64(n_byte);
+    if n < 0 {
+        return SQLITE_TOOBIG;
+    }
+    unsafe { sqlite3_bind_blob(stmt, idx, data, n, destructor) }
+}
+
+/// 64-bit-length form of [`sqlite3_bind_zeroblob`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_zeroblob64(
+    stmt: *mut sqlite3_stmt,
+    idx: c_int,
+    n: c_ulonglong,
+) -> c_int {
+    if stmt.is_null() {
+        return SQLITE_ERROR;
+    }
+    if n > CAPI_MAX_BLOB_LEN as c_ulonglong {
+        return SQLITE_TOOBIG;
+    }
+    bind_at(
+        unsafe { &mut *stmt },
+        idx,
+        Value::Blob(alloc::vec![0u8; n as usize]),
+    )
+}
+
+/// 64-bit-length form of [`sqlite3_result_text`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_result_text64(
+    ctx: *mut sqlite3_context,
+    text: *const c_char,
+    n_byte: c_ulonglong,
+    destructor: isize,
+    _encoding: c_uchar,
+) {
+    let n = clamp_len_i64(n_byte);
+    if n < 0 {
+        unsafe { sqlite3_result_error_toobig(ctx) };
+        return;
+    }
+    unsafe { sqlite3_result_text(ctx, text, n, destructor) };
+}
+
+/// 64-bit-length form of [`sqlite3_result_blob`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_result_blob64(
+    ctx: *mut sqlite3_context,
+    data: *const c_void,
+    n_byte: c_ulonglong,
+    destructor: isize,
+) {
+    let n = clamp_len_i64(n_byte);
+    if n < 0 {
+        unsafe { sqlite3_result_error_toobig(ctx) };
+        return;
+    }
+    unsafe { sqlite3_result_blob(ctx, data, n, destructor) };
+}
+
+/// 64-bit-length form of [`sqlite3_result_zeroblob`] (returns a result code).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_result_zeroblob64(
+    ctx: *mut sqlite3_context,
+    n: c_ulonglong,
+) -> c_int {
+    if n > CAPI_MAX_BLOB_LEN as c_ulonglong {
+        if let Some(c) = unsafe { ctx.as_mut() } {
+            c.error = Some(String::from("string or blob too big"));
+        }
+        return SQLITE_TOOBIG;
+    }
+    if let Some(c) = unsafe { ctx.as_mut() } {
+        c.result = Value::Blob(alloc::vec![0u8; n as usize]);
+    }
+    SQLITE_OK
+}
+
+/// Set the function result to an out-of-range-length error
+/// (`sqlite3_result_error_toobig`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_result_error_toobig(ctx: *mut sqlite3_context) {
+    if let Some(c) = unsafe { ctx.as_mut() } {
+        c.error = Some(String::from("string or blob too big"));
+    }
+}
+
+/// Set the function result to an out-of-memory error
+/// (`sqlite3_result_error_nomem`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_result_error_nomem(ctx: *mut sqlite3_context) {
+    if let Some(c) = unsafe { ctx.as_mut() } {
+        c.error = Some(String::from("out of memory"));
+    }
+}
+
+/// Set the function result to an error carrying the English text of result code
+/// `err_code` (`sqlite3_result_error_code`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_result_error_code(ctx: *mut sqlite3_context, err_code: c_int) {
+    if let Some(c) = unsafe { ctx.as_mut() } {
+        let msg = unsafe { CStr::from_ptr(sqlite3_errstr(err_code)) }
+            .to_string_lossy()
+            .into_owned();
+        c.error = Some(msg);
+    }
+}
+
+/// `sqlite3_value_numeric_type`: apply numeric affinity to a text value in place
+/// (an integer-looking text becomes `INTEGER`, a real-looking one `FLOAT`) and
+/// return the value's resulting fundamental type. Non-text values are unchanged.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_value_numeric_type(v: *mut sqlite3_value) -> c_int {
+    let Some(v) = (unsafe { v.as_mut() }) else {
+        return SQLITE_NULL;
+    };
+    if matches!(v.v, Value::Text(_))
+        && let Some(n) = crate::exec::eval::to_number_strict(&v.v)
+    {
+        v.v = n;
+    }
+    value_type(&v.v)
+}
+
+/// Clamp a C `sqlite3_uint64` byte length to an `int`, returning -1 (→ TOOBIG)
+/// when it exceeds `SQLITE_MAX_LENGTH`.
+#[inline]
+fn clamp_len_i64(n: c_ulonglong) -> c_int {
+    if n > CAPI_MAX_BLOB_LEN as c_ulonglong {
+        -1
+    } else {
+        n as c_int
+    }
 }

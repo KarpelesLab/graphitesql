@@ -576,6 +576,48 @@ int main(void) {
 
   CHECK("version string", strcmp(sqlite3_libversion(), "3.50.4") == 0);
 
+  /* Library info / lifecycle. */
+  CHECK("sourceid prefix", strncmp(sqlite3_sourceid(), "2025-07-30 19:33:53", 19) == 0);
+  CHECK("threadsafe nonzero", sqlite3_threadsafe() != 0);
+  CHECK("initialize OK", sqlite3_initialize() == SQLITE_OK);
+  CHECK("shutdown OK", sqlite3_shutdown() == SQLITE_OK);
+
+  /* Case-insensitive string helpers. */
+  CHECK("stricmp equal", sqlite3_stricmp("Hello", "hELLo") == 0);
+  CHECK("stricmp less", sqlite3_stricmp("abc", "abd") < 0);
+  CHECK("stricmp greater", sqlite3_stricmp("abd", "abc") > 0);
+  CHECK("stricmp prefix", sqlite3_stricmp("abc", "abcd") < 0);
+  CHECK("strnicmp equal-n", sqlite3_strnicmp("ABCxyz", "abcQQQ", 3) == 0);
+  CHECK("strnicmp diff-n", sqlite3_strnicmp("ABCxyz", "abd", 3) != 0);
+  CHECK("strlike match", sqlite3_strlike("h_llo", "HELLO", 0) == 0);
+  CHECK("strlike percent", sqlite3_strlike("h%o", "hello", 0) == 0);
+  CHECK("strlike no-match", sqlite3_strlike("h_llo", "hxxlo", 0) != 0);
+  CHECK("strlike escape", sqlite3_strlike("50\\%", "50%", '\\') == 0);
+  CHECK("strglob match", sqlite3_strglob("h[aeiou]llo", "hello") == 0);
+  CHECK("strglob star", sqlite3_strglob("h*o", "hello") == 0);
+  CHECK("strglob no-match", sqlite3_strglob("h[aeiou]llo", "hyllo") != 0);
+
+  /* set_last_insert_rowid / changes64. */
+  sqlite3_set_last_insert_rowid(db, 4242);
+  CHECK("set_last_insert_rowid", sqlite3_last_insert_rowid(db) == 4242);
+  CHECK("total_changes64 nonneg", sqlite3_total_changes64(db) >= 0);
+
+  /* 64-bit bind + value_numeric_type. */
+  {
+    sqlite3_stmt *s = NULL;
+    sqlite3_prepare_v2(db, "SELECT length(?1), typeof(?1)", -1, &s, NULL);
+    sqlite3_bind_text64(s, 1, "hello", 5, SQLITE_TRANSIENT, SQLITE_UTF8);
+    CHECK("bind_text64 step", sqlite3_step(s) == SQLITE_ROW);
+    CHECK("bind_text64 length", sqlite3_column_int(s, 0) == 5);
+    sqlite3_finalize(s);
+
+    sqlite3_prepare_v2(db, "SELECT length(?1)", -1, &s, NULL);
+    sqlite3_bind_zeroblob64(s, 1, 7);
+    CHECK("bind_zeroblob64 step", sqlite3_step(s) == SQLITE_ROW);
+    CHECK("bind_zeroblob64 length", sqlite3_column_int(s, 0) == 7);
+    sqlite3_finalize(s);
+  }
+
   sqlite3_close(db);
 
   printf(failures ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", failures);

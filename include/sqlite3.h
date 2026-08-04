@@ -12,6 +12,7 @@ extern "C" {
 typedef struct sqlite3 sqlite3;
 typedef struct sqlite3_stmt sqlite3_stmt;
 typedef long long int sqlite3_int64;
+typedef unsigned long long int sqlite3_uint64;
 
 /* Result codes */
 #define SQLITE_OK      0
@@ -37,6 +38,17 @@ typedef long long int sqlite3_int64;
 
 const char *sqlite3_libversion(void);
 int sqlite3_libversion_number(void);
+const char *sqlite3_sourceid(void);
+int sqlite3_threadsafe(void);
+int sqlite3_initialize(void);
+int sqlite3_shutdown(void);
+int sqlite3_os_init(void);
+int sqlite3_os_end(void);
+
+int sqlite3_stricmp(const char *, const char *);
+int sqlite3_strnicmp(const char *, const char *, int);
+int sqlite3_strlike(const char *zGlob, const char *zStr, unsigned int cEsc);
+int sqlite3_strglob(const char *zGlob, const char *zStr);
 
 int sqlite3_open(const char *filename, sqlite3 **ppDb);
 int sqlite3_open_v2(const char *filename, sqlite3 **ppDb, int flags, const char *zVfs);
@@ -53,8 +65,11 @@ int sqlite3_extended_errcode(sqlite3 *db);
 int sqlite3_error_offset(sqlite3 *db);
 const char *sqlite3_errstr(int rc);
 int sqlite3_changes(sqlite3 *db);
+sqlite3_int64 sqlite3_changes64(sqlite3 *db);
 int sqlite3_total_changes(sqlite3 *db);
+sqlite3_int64 sqlite3_total_changes64(sqlite3 *db);
 sqlite3_int64 sqlite3_last_insert_rowid(sqlite3 *db);
+void sqlite3_set_last_insert_rowid(sqlite3 *db, sqlite3_int64 rowid);
 int sqlite3_get_autocommit(sqlite3 *db);
 int sqlite3_busy_timeout(sqlite3 *db, int ms);
 void sqlite3_interrupt(sqlite3 *db);
@@ -75,8 +90,13 @@ int sqlite3_bind_int64(sqlite3_stmt *stmt, int idx, sqlite3_int64 v);
 int sqlite3_bind_double(sqlite3_stmt *stmt, int idx, double v);
 int sqlite3_bind_null(sqlite3_stmt *stmt, int idx);
 int sqlite3_bind_zeroblob(sqlite3_stmt *stmt, int idx, int n);
+int sqlite3_bind_zeroblob64(sqlite3_stmt *stmt, int idx, sqlite3_uint64 n);
 int sqlite3_bind_text(sqlite3_stmt *stmt, int idx, const char *text, int nByte, void(*d)(void*));
+int sqlite3_bind_text64(sqlite3_stmt *stmt, int idx, const char *text, sqlite3_uint64 nByte,
+    void(*d)(void*), unsigned char encoding);
 int sqlite3_bind_blob(sqlite3_stmt *stmt, int idx, const void *data, int nByte, void(*d)(void*));
+int sqlite3_bind_blob64(sqlite3_stmt *stmt, int idx, const void *data, sqlite3_uint64 nByte,
+    void(*d)(void*));
 
 int sqlite3_bind_parameter_count(sqlite3_stmt *stmt);
 const char *sqlite3_bind_parameter_name(sqlite3_stmt *stmt, int idx);
@@ -126,17 +146,26 @@ int sqlite3_value_int(sqlite3_value *v);
 sqlite3_int64 sqlite3_value_int64(sqlite3_value *v);
 double sqlite3_value_double(sqlite3_value *v);
 int sqlite3_value_bytes(sqlite3_value *v);
+int sqlite3_value_numeric_type(sqlite3_value *v);
 const unsigned char *sqlite3_value_text(sqlite3_value *v);
 const void *sqlite3_value_blob(sqlite3_value *v);
 
 void sqlite3_result_null(sqlite3_context *ctx);
 void sqlite3_result_zeroblob(sqlite3_context *ctx, int n);
+int sqlite3_result_zeroblob64(sqlite3_context *ctx, sqlite3_uint64 n);
 void sqlite3_result_int(sqlite3_context *ctx, int v);
 void sqlite3_result_int64(sqlite3_context *ctx, sqlite3_int64 v);
 void sqlite3_result_double(sqlite3_context *ctx, double v);
 void sqlite3_result_text(sqlite3_context *ctx, const char *text, int nByte, void(*d)(void*));
+void sqlite3_result_text64(sqlite3_context *ctx, const char *text, sqlite3_uint64 nByte,
+    void(*d)(void*), unsigned char encoding);
 void sqlite3_result_blob(sqlite3_context *ctx, const void *data, int nByte, void(*d)(void*));
+void sqlite3_result_blob64(sqlite3_context *ctx, const void *data, sqlite3_uint64 nByte,
+    void(*d)(void*));
 void sqlite3_result_error(sqlite3_context *ctx, const char *msg, int nByte);
+void sqlite3_result_error_toobig(sqlite3_context *ctx);
+void sqlite3_result_error_nomem(sqlite3_context *ctx);
+void sqlite3_result_error_code(sqlite3_context *ctx, int errCode);
 
 /* UTF-16 entry points (native byte order; nByte args are in bytes) */
 int sqlite3_open16(const void *zFilename, sqlite3 **ppDb);
