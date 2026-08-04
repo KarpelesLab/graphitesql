@@ -3,4 +3,5 @@
 pub mod float;
 pub mod fpdecode;
 pub mod ieee754;
+pub mod sha;
 pub mod varint;

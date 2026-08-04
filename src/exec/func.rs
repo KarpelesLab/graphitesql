@@ -16,6 +16,10 @@ use alloc::vec::Vec;
 /// rather than attempting a multi-gigabyte allocation.
 const MAX_BLOB_LEN: usize = 1_000_000_000;
 
+/// Lower-case hexadecimal digits, for rendering the `sha1()` digest as text
+/// (sqlite's `sha1()` returns the hash as lower-case hex, like its extension).
+const HEX_DIGITS: [u8; 16] = *b"0123456789abcdef";
+
 /// Names that *can* be aggregates (used for catalog/name checks).
 pub fn is_aggregate(name: &str) -> bool {
     matches!(
@@ -162,6 +166,10 @@ const FUNCTION_LIST: &[FunctionListEntry] = &[
     ("replace", 's', 3),
     ("round", 's', -1),
     ("rtrim", 's', -1),
+    ("sha1", 's', 1),
+    // `sha3` is registered at both arities (X and X,size), like sqlite.
+    ("sha3", 's', 1),
+    ("sha3", 's', 2),
     ("sign", 's', 1),
     ("sin", 's', 1),
     ("sinh", 's', 1),
@@ -745,6 +753,54 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                     None => Value::Null,
                 },
                 _ => Value::Null,
+            }
+        }
+        // sha1(X): SHA-1 of X's bytes, rendered as a 40-byte BLOB of lower-case
+        // hex (matching `ext/misc/sha1.c` `sha1Func`, which passes the hex text to
+        // `sqlite3_result_blob` — the binary-digest variant is the separate
+        // `sha1b`). A BLOB hashes as-is; any other non-NULL type hashes its UTF-8
+        // text rendering (sqlite's `value_text`); NULL yields NULL.
+        "sha1" => {
+            arity(&lname, args, 1)?;
+            match &v[0] {
+                Value::Null => Value::Null,
+                other => {
+                    let digest = crate::util::sha::sha1(&eval::text_bytes(other));
+                    let mut hex = Vec::with_capacity(40);
+                    for byte in digest {
+                        hex.push(HEX_DIGITS[(byte >> 4) as usize]);
+                        hex.push(HEX_DIGITS[(byte & 0x0f) as usize]);
+                    }
+                    Value::Blob(hex)
+                }
+            }
+        }
+        // sha3(X[, size]): SHA3/Keccak digest of X's bytes, `size` in bits
+        // (224/256/384/512, default 256). Byte handling matches sha1. Port of
+        // `ext/misc/shathree.c` `sha3Func` — the size is validated before the
+        // NULL short-circuit, so `sha3(NULL, 999)` still errors.
+        "sha3" => {
+            if args.len() != 1 && args.len() != 2 {
+                return Err(wrong_arg_count("sha3"));
+            }
+            let bits: u16 = if args.len() == 2 {
+                match eval::to_int_value(&v[1]) {
+                    224 => 224,
+                    256 => 256,
+                    384 => 384,
+                    512 => 512,
+                    _ => {
+                        return Err(Error::Error(
+                            "SHA3 size should be one of: 224 256 384 512".into(),
+                        ));
+                    }
+                }
+            } else {
+                256
+            };
+            match &v[0] {
+                Value::Null => Value::Null,
+                other => Value::Blob(crate::util::sha::sha3(&eval::text_bytes(other), bits)),
             }
         }
         "char" => char_fn(&v),
