@@ -25,7 +25,9 @@ fn bare_word_default_reprints_verbatim() {
     let mut c = Connection::open_memory().unwrap();
     c.execute("CREATE TABLE t(a DEFAULT abc)").unwrap();
     assert_eq!(
-        c.query("SELECT sql FROM sqlite_master WHERE name='t'").unwrap().rows[0][0],
+        c.query("SELECT sql FROM sqlite_master WHERE name='t'")
+            .unwrap()
+            .rows[0][0],
         Value::Text("CREATE TABLE t(a DEFAULT abc)".into())
     );
 }

@@ -394,15 +394,290 @@ const PIO2_3: f64 = 6.223372171896613e-14;
 ///
 /// Subtracting a single rounded `π/2` loses one bit of `r` per bit of `k`, which
 /// wrecks the last few significant digits of `sin`/`cos` for arguments more than
-/// a few multiples of π. Instead this uses Cody–Waite reduction with π/2 split
-/// into `PIO2_1 + PIO2_2 + PIO2_3`, and forms `k·PIO2_1` as an error-free product
-/// so the leading cancellation `x − k·PIO2_1` carries no rounding error.
+/// a few multiples of π. For `|x| < 2^20·(π/2)` (≈1.6 million) this uses
+/// Cody–Waite reduction with π/2 split into `PIO2_1 + PIO2_2 + PIO2_3`, forming
+/// `k·PIO2_1` as an error-free product so the leading cancellation `x − k·PIO2_1`
+/// carries no rounding error.
+///
+/// For larger `|x|` the Cody–Waite `k = round(x·2/π)` no longer fits in the
+/// mantissa (and `k as i64` overflows outright past ~9.2e18), so the reduction
+/// loses all precision — e.g. `sin(1e20)` used to return `-1.5e45`, far outside
+/// `[-1, 1]`. Those arguments are routed through the Payne–Hanek reduction
+/// (`rem_pio2_large`, a port of fdlibm's `__kernel_rem_pio2`), which multiplies
+/// `x` by a long table of the bits of `2/π` and keeps only the fractional part,
+/// giving a full-precision `(k, r)` for any finite `x`.
 fn reduce_quarter_pi(x: f64) -> (i64, f64) {
-    let k = round(x * (2.0 / PI));
-    let (p1, e1) = two_prod(k, PIO2_1);
-    let r = ((x - p1) - e1) - k * PIO2_2;
-    let r = r - k * PIO2_3;
-    (k as i64, r)
+    // Fast Cody–Waite path: |x| < 2^20·(π/2). Accurate and cheap here.
+    if abs(x) < 1_048_576.0 * (PI / 2.0) {
+        let k = round(x * (2.0 / PI));
+        let (p1, e1) = two_prod(k, PIO2_1);
+        let r = ((x - p1) - e1) - k * PIO2_2;
+        let r = r - k * PIO2_3;
+        return (k as i64, r);
+    }
+    // Large |x|: Payne–Hanek. `x` is finite here (`sin`/`cos` reject non-finite
+    // before calling), so the fdlibm inf/NaN guard is unnecessary.
+    let u = x.to_bits();
+    let sign = (u >> 63) != 0;
+    let ix = ((u >> 32) & 0x7fff_ffff) as u32;
+
+    // z = scalbn(|x|, -ilogb(x)+23): keep the 52 mantissa bits, force the
+    // exponent to 0x3ff+23 so z ∈ [2^23, 2^24) carries x's significand.
+    let mut zbits = u & (u64::MAX >> 12);
+    zbits |= (0x3ff + 23) << 52;
+    let mut z = f64::from_bits(zbits);
+
+    // Break the significand into three 24-bit chunks tx[0..3].
+    let mut tx = [0.0f64; 3];
+    for slot in tx.iter_mut().take(2) {
+        *slot = (z as i32) as f64;
+        z = (z - *slot) * TWO24;
+    }
+    tx[2] = z;
+    let mut nx = 3usize;
+    while nx > 1 && tx[nx - 1] == 0.0 {
+        nx -= 1;
+    }
+
+    let e0 = (ix >> 20) as i32 - (0x3ff + 23);
+    let (n, y0, y1) = rem_pio2_large(&tx[..nx], e0, nx);
+    if sign {
+        (-(n as i64), -(y0 + y1))
+    } else {
+        (n as i64, y0 + y1)
+    }
+}
+
+/// `2^24` and `2^-24`, the 24-bit chunk radix used by the Payne–Hanek reduction.
+const TWO24: f64 = 16_777_216.0;
+const TWON24: f64 = 1.0 / 16_777_216.0;
+
+/// First 66 24-bit chunks of `2/π` (fdlibm `ipio2`): chunk `i` weighs
+/// `2^(-24(i+1))`. 66 entries cover every finite `f64` exponent (the largest
+/// needs ≈`(e0-3)/24 + jk ≈ 45` terms, plus a few for the recompute step).
+#[rustfmt::skip]
+const IPIO2: [i32; 66] = [
+    0xA2F983, 0x6E4E44, 0x1529FC, 0x2757D1, 0xF534DD, 0xC0DB62,
+    0x95993C, 0x439041, 0xFE5163, 0xABDEBB, 0xC561B7, 0x246E3A,
+    0x424DD2, 0xE00649, 0x2EEA09, 0xD1921C, 0xFE1DEB, 0x1CB129,
+    0xA73EE8, 0x8235F5, 0x2EBB44, 0x84E99C, 0x7026B4, 0x5F7E41,
+    0x3991D6, 0x398353, 0x39F49C, 0x845F8B, 0xBDF928, 0x3B1FF8,
+    0x97FFDE, 0x05980F, 0xEF2F11, 0x8B5A0A, 0x6D1F6D, 0x367ECF,
+    0x27CB09, 0xB74F46, 0x3F669E, 0x5FEA2D, 0x7527BA, 0xC7EBE5,
+    0xF17B3D, 0x0739F7, 0x8A5292, 0xEA6BFB, 0x5FB11F, 0x8D5D08,
+    0x560330, 0x46FC7B, 0x6BABF0, 0xCFBC20, 0x9AF436, 0x1DA9E3,
+    0x91615E, 0xE61B08, 0x659985, 0x5F14A0, 0x68408D, 0xFFD880,
+    0x4D7327, 0x310606, 0x1556CA, 0x73A8C9, 0x60E27B, 0xC08C6B,
+];
+
+/// π/2 cut into 24-bit chunks (fdlibm `PIo2`); their sum reconstructs π/2 to
+/// well beyond double precision.
+#[rustfmt::skip]
+const PIO2_CHUNKS: [f64; 8] = [
+    1.570_796_251_296_997,
+    7.549_789_415_861_596e-08,
+    5.390_302_529_957_765e-15,
+    3.282_003_415_807_913e-22,
+    1.270_655_753_080_676e-29,
+    1.229_333_089_811_113_3e-36,
+    2.733_700_538_164_645_6e-44,
+    2.167_416_838_778_048_2e-51,
+];
+
+/// Payne–Hanek range reduction (fdlibm `__kernel_rem_pio2`, `prec = 1` /
+/// double). Given `x` broken into `nx` 24-bit chunks with `x[0]·2^e0` matching
+/// the top 24 bits, returns `(n, y0, y1)` where `y0 + y1 = x − n·(π/2)`,
+/// `|y0+y1| < π/2`, and `n & 7` is the quadrant count. This is a faithful
+/// translation of the C: it multiplies `x` by the `IPIO2` bits of `2/π`, drops
+/// the (huge integer) part known to be `0 mod 8`, and distils the fraction.
+fn rem_pio2_large(x: &[f64], e0: i32, nx: usize) -> (i32, f64, f64) {
+    // prec = 1 (double): jk = 4 initial terms of IPIO2, jp = jk terms of PIo2.
+    let jk = 4i32;
+    let jp = jk;
+
+    let jx = nx as i32 - 1;
+    let mut jv = (e0 - 3) / 24;
+    if jv < 0 {
+        jv = 0;
+    }
+    let mut q0 = e0 - 24 * (jv + 1);
+
+    let mut f = [0.0f64; 20];
+    let mut q = [0.0f64; 20];
+    let mut iq = [0i32; 20];
+    let mut fq = [0.0f64; 20];
+
+    // f[i] = ipio2[jv - jx + i], zero-padded on the low side.
+    let m = jx + jk;
+    for (i, fi) in f.iter_mut().take((m + 1) as usize).enumerate() {
+        let j = jv - jx + i as i32;
+        *fi = if j < 0 { 0.0 } else { IPIO2[j as usize] as f64 };
+    }
+
+    // q[i] = Σ_j x[j]·f[jx+i-j], the 24-bit chunks of x·(2/π).
+    for i in 0..=jk {
+        let mut fw = 0.0;
+        for jj in 0..=jx {
+            fw += x[jj as usize] * f[(jx + i - jj) as usize];
+        }
+        q[i as usize] = fw;
+    }
+
+    let mut jz = jk;
+    let n;
+    let ih;
+    let mut z;
+    loop {
+        // Distil q[] into the integer chunks iq[], reversed.
+        let mut i = 0i32;
+        let mut jj = jz;
+        z = q[jz as usize];
+        while jj > 0 {
+            let fw = ((TWON24 * z) as i32) as f64;
+            iq[i as usize] = (z - TWO24 * fw) as i32;
+            z = q[(jj - 1) as usize] + fw;
+            i += 1;
+            jj -= 1;
+        }
+
+        // Compute n = the integer part mod 8, leaving z as the fraction.
+        z = ldexp(z, q0);
+        z -= 8.0 * floor(z * 0.125);
+        let mut nn = z as i32;
+        z -= nn as f64;
+        let mut ihh = 0i32;
+        if q0 > 0 {
+            let i2 = iq[(jz - 1) as usize] >> (24 - q0);
+            nn += i2;
+            iq[(jz - 1) as usize] -= i2 << (24 - q0);
+            ihh = iq[(jz - 1) as usize] >> (23 - q0);
+        } else if q0 == 0 {
+            ihh = iq[(jz - 1) as usize] >> 23;
+        } else if z >= 0.5 {
+            ihh = 2;
+        }
+
+        if ihh > 0 {
+            // q > 0.5: replace q by 1 - q and bump n (sign flip of the result).
+            nn += 1;
+            let mut carry = 0i32;
+            for iqi in iq.iter_mut().take(jz as usize) {
+                let jv2 = *iqi;
+                if carry == 0 {
+                    if jv2 != 0 {
+                        carry = 1;
+                        *iqi = 0x100_0000 - jv2;
+                    }
+                } else {
+                    *iqi = 0xff_ffff - jv2;
+                }
+            }
+            if q0 > 0 {
+                match q0 {
+                    1 => iq[(jz - 1) as usize] &= 0x7f_ffff,
+                    2 => iq[(jz - 1) as usize] &= 0x3f_ffff,
+                    _ => {}
+                }
+            }
+            if ihh == 2 {
+                z = 1.0 - z;
+                if carry != 0 {
+                    z -= ldexp(1.0, q0);
+                }
+            }
+        }
+
+        // If the fraction cancelled to zero we may have lost all significance;
+        // extend q[] with more terms of 2/π and redistil.
+        if z == 0.0 {
+            let mut acc = 0i32;
+            let mut i2 = jz - 1;
+            while i2 >= jk {
+                acc |= iq[i2 as usize];
+                i2 -= 1;
+            }
+            if acc == 0 {
+                let mut k = 1i32;
+                while iq[(jk - k) as usize] == 0 {
+                    k += 1;
+                }
+                for i2 in (jz + 1)..=(jz + k) {
+                    f[(jx + i2) as usize] = IPIO2[(jv + i2) as usize] as f64;
+                    let mut fw = 0.0;
+                    for jj2 in 0..=jx {
+                        fw += x[jj2 as usize] * f[(jx + i2 - jj2) as usize];
+                    }
+                    q[i2 as usize] = fw;
+                }
+                jz += k;
+                continue;
+            }
+        }
+
+        n = nn;
+        ih = ihh;
+        break;
+    }
+
+    // Chop off trailing zero chunks, or split a residual into a fresh 24-bit
+    // chunk, so iq[0..=jz] holds the fraction exactly.
+    if z == 0.0 {
+        jz -= 1;
+        q0 -= 24;
+        while iq[jz as usize] == 0 {
+            jz -= 1;
+            q0 -= 24;
+        }
+    } else {
+        z = ldexp(z, -q0);
+        if z >= TWO24 {
+            let fw = ((TWON24 * z) as i32) as f64;
+            iq[jz as usize] = (z - TWO24 * fw) as i32;
+            jz += 1;
+            q0 += 24;
+            iq[jz as usize] = fw as i32;
+        } else {
+            iq[jz as usize] = z as i32;
+        }
+    }
+
+    // Convert the integer chunks back to floating point, most-significant first.
+    let mut fw = ldexp(1.0, q0);
+    let mut i = jz;
+    while i >= 0 {
+        q[i as usize] = fw * (iq[i as usize] as f64);
+        fw *= TWON24;
+        i -= 1;
+    }
+
+    // Multiply the fraction by the chunked π/2 to recover the remainder.
+    let mut i = jz;
+    while i >= 0 {
+        let mut fw2 = 0.0;
+        let mut k = 0i32;
+        while k <= jp && k <= jz - i {
+            fw2 += PIO2_CHUNKS[k as usize] * q[(i + k) as usize];
+            k += 1;
+        }
+        fq[(jz - i) as usize] = fw2;
+        i -= 1;
+    }
+
+    // Compress fq[] into the double-double result y0 + y1 (prec = 1).
+    let mut hi = 0.0;
+    let mut i = jz;
+    while i >= 0 {
+        hi += fq[i as usize];
+        i -= 1;
+    }
+    let y0 = if ih == 0 { hi } else { -hi };
+    let mut lo = fq[0] - hi;
+    for i in 1..=jz {
+        lo += fq[i as usize];
+    }
+    let y1 = if ih == 0 { lo } else { -lo };
+
+    (n & 7, y0, y1)
 }
 
 fn sin_kernel(r: f64) -> f64 {
@@ -731,6 +1006,31 @@ mod tests {
         // On the +x axis the result is ±0 (rendered as `0.0` either way).
         assert_eq!(atan2(-0.0, 1.0), 0.0);
         assert_eq!(atan2(0.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn trig_large_argument_bounded_and_accurate() {
+        // Before the Payne–Hanek reduction, `k as i64` overflowed for |x| past
+        // ~9.2e18, so `sin(1e20)` returned ~-1.5e45 (nonsense). Every result must
+        // now stay in [-1, 1] and match the libm reference sqlite uses.
+        for &x in &[1e15, 1e18, 1e20, 1e100, 1e300] {
+            for &s in &[1.0, -1.0] {
+                let v = s * x;
+                assert!(sin(v).abs() <= 1.0, "sin({v}) = {} out of range", sin(v));
+                assert!(cos(v).abs() <= 1.0, "cos({v}) = {} out of range", cos(v));
+                // sin² + cos² == 1 to full precision confirms the reduction is
+                // internally consistent (a bad `k`/`r` breaks this identity).
+                let id = sin(v) * sin(v) + cos(v) * cos(v);
+                assert!((id - 1.0).abs() < 1e-12, "sin²+cos²({v}) = {id}");
+            }
+        }
+        // Reference values from sqlite3 3.50.4 (system libm).
+        close(sin(1e20), -0.645_251_285_265_781);
+        close(cos(1e20), 0.763_970_404_441_728);
+        close(tan(1e20), -0.844_602_463_019_884);
+        close(sin(1e300), -0.817_881_912_115_909);
+        // Boundary just below the fast-path cutoff stays accurate too.
+        close(sin(1.6e6), -0.541_401_092_198_301);
     }
 
     #[test]
