@@ -462,15 +462,14 @@ impl Parser {
                 "current_date" => now_datetime_fn("date"),
                 "current_time" => now_datetime_fn("time"),
                 "current_timestamp" => now_datetime_fn("datetime"),
-                // A bare word (`DEFAULT abc`) is a valid literal default in SQLite,
-                // stored as the identifier text.
-                _ => Expr::Column {
-                    schema: None,
-                    table: None,
-                    column: w,
-                    quoted: false,
-                    span: Span::none(),
-                },
+                // An UNPARENTHESIZED bare word (`DEFAULT abc`) is a valid default
+                // in SQLite — the identifier is taken as a STRING literal (its
+                // text), e.g. `DEFAULT abc` stores `'abc'`. (A parenthesized
+                // `DEFAULT (abc)` is a real expression and, being a column
+                // reference, is rejected as non-constant — that path uses `expr()`,
+                // not this one.) The verbatim source text is captured separately
+                // for the schema reprint.
+                _ => Expr::Literal(Literal::Str(w)),
             },
             Some(Token::Ident(name)) => Expr::Column {
                 schema: None,
