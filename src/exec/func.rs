@@ -163,6 +163,7 @@ const FUNCTION_LIST: &[FunctionListEntry] = &[
     ("radians", 's', 1),
     ("random", 's', 0),
     ("randomblob", 's', 1),
+    ("regexp", 's', 2),
     ("replace", 's', 3),
     ("round", 's', -1),
     ("rtrim", 's', -1),
@@ -620,6 +621,23 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             } else {
                 let m = eval::glob_match_bytes(&eval::text_bytes(&v[0]), &eval::text_bytes(&v[1]));
                 Value::Integer(m as i64)
+            }
+        }
+        "regexp" => {
+            // regexp(pattern, subject) is the function form of `subject REGEXP
+            // pattern` (the parser desugars `X REGEXP Y` to `regexp(Y, X)`, so the
+            // pattern is the FIRST argument). Uses SQLite's own regex engine; an
+            // invalid pattern raises the same error text sqlite reports.
+            arity(&lname, args, 2)?;
+            if v.iter().take(2).any(|x| matches!(x, Value::Null)) {
+                Value::Null
+            } else {
+                let matched = crate::util::regex::regexp_match(
+                    &eval::text_bytes(&v[0]),
+                    &eval::text_bytes(&v[1]),
+                )
+                .map_err(|e| Error::Error(String::from(e)))?;
+                Value::Integer(matched as i64)
             }
         }
         "lower" => {
