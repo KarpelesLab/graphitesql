@@ -122,6 +122,11 @@ fn one_shot_error_rendering_matches_sqlite() {
         "DELETE FROM sqlite_temp_schema",
         "INSERT INTO sqlite_temp_master VALUES(1,2,3,4,5)",
         "SELECT",
+        // A non-deterministic function in a generated column / index expression /
+        // partial-index WHERE is a prepare-time error with a caret on the function.
+        "CREATE TABLE t(a, b GENERATED ALWAYS AS (random()) STORED)",
+        "CREATE TABLE t(a); CREATE INDEX ix ON t(random())",
+        "CREATE TABLE t(a); CREATE INDEX ix ON t(a) WHERE a > random()",
         // A malformed foreign key, `RAISE()` outside a trigger, and `DISTINCT`
         // inside a window function are all compiled-away (prepare-time), no caret.
         "PRAGMA foreign_keys=ON; CREATE TABLE p(a, b); CREATE TABLE c(x REFERENCES p(a)); \

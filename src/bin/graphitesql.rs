@@ -2631,6 +2631,9 @@ fn is_prepare_error(e: &graphitesql::Error, msg: &str, sql: &str) -> bool {
                 // `DISTINCT` inside a window function's argument list is a compile
                 // error.
                 "DISTINCT is not supported for window functions",
+                // A non-deterministic function in a generated column / index
+                // expression / partial-index WHERE is rejected at compile time.
+                "non-deterministic functions prohibited",
             ];
             // Patterns that carry a leading ordinal / function name, so a prefix
             // match won't do (`2nd ORDER BY term out of range`, `abs() may not be

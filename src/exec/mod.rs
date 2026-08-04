@@ -7929,9 +7929,13 @@ impl Connection {
                         ));
                     }
                     ColumnConstraint::Generated { expr, .. } if expr_is_nondeterministic(expr) => {
-                        return Err(Error::Error(
-                            "non-deterministic functions prohibited in generated columns".into(),
-                        ));
+                        let msg = "non-deterministic functions prohibited in generated columns";
+                        // SQLite reports this at prepare time with a caret on the
+                        // offending function; carry its source offset when known.
+                        return Err(match nondeterministic_fn_offset(expr) {
+                            Some(off) => Error::ErrorAt(msg.into(), off as usize),
+                            None => Error::Error(msg.into()),
+                        });
                     }
                     _ => {}
                 }
@@ -13335,9 +13339,11 @@ impl Connection {
             }
             self.reject_unresolved_functions(key)?;
             if expr_is_nondeterministic(key) {
-                return Err(Error::Error(
-                    "non-deterministic functions prohibited in index expressions".into(),
-                ));
+                let msg = "non-deterministic functions prohibited in index expressions";
+                return Err(match nondeterministic_fn_offset(key) {
+                    Some(off) => Error::ErrorAt(msg.into(), off as usize),
+                    None => Error::Error(msg.into()),
+                });
             }
             if let Some(name) = first_aggregate_call_name(key) {
                 return Err(Error::Error(format!(
@@ -13372,9 +13378,11 @@ impl Connection {
             }
             self.reject_unresolved_functions(p)?;
             if expr_is_nondeterministic(p) {
-                return Err(Error::Error(
-                    "non-deterministic functions prohibited in partial index WHERE clauses".into(),
-                ));
+                let msg = "non-deterministic functions prohibited in partial index WHERE clauses";
+                return Err(match nondeterministic_fn_offset(p) {
+                    Some(off) => Error::ErrorAt(msg.into(), off as usize),
+                    None => Error::Error(msg.into()),
+                });
             }
             if let Some(name) = first_aggregate_call_name(p) {
                 return Err(Error::Error(format!(
@@ -42451,6 +42459,26 @@ fn expr_is_nondeterministic(e: &Expr) -> bool {
         }
     });
     found
+}
+
+/// The source byte offset of the first non-deterministic function call in `e`
+/// (its name token), for the shell's error caret. `None` for a synthetic /
+/// span-less call. Mirrors [`expr_is_nondeterministic`].
+fn nondeterministic_fn_offset(e: &Expr) -> Option<u32> {
+    let mut off = None;
+    window::visit(e, &mut |n| {
+        if off.is_none()
+            && let Expr::Function { name, span, .. } = n
+            && matches!(
+                name.to_ascii_lowercase().as_str(),
+                "random" | "randomblob" | "last_insert_rowid" | "changes" | "total_changes"
+            )
+            && let Some((start, _)) = span.0
+        {
+            off = Some(start);
+        }
+    });
+    off
 }
 
 /// The rigid column type of a `STRICT` table column.
