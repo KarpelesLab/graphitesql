@@ -97,6 +97,15 @@ const FUNCTION_LIST: &[FunctionListEntry] = &[
     ("geopoly_xform", 's', 7),
     ("glob", 's', 2),
     ("hex", 's', 1),
+    // `ieee754` is registered at both arities (decompose vs recompose), like
+    // sqlite; the executor dispatches on `args.len()`.
+    ("ieee754", 's', 1),
+    ("ieee754", 's', 2),
+    ("ieee754_exponent", 's', 1),
+    ("ieee754_from_blob", 's', 1),
+    ("ieee754_inc", 's', 2),
+    ("ieee754_mantissa", 's', 1),
+    ("ieee754_to_blob", 's', 1),
     ("if", 's', 3),
     ("ifnull", 's', 2),
     ("iif", 's', 3),
@@ -689,6 +698,54 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         "hex" => {
             arity(&lname, args, 1)?;
             Value::Text(hex_encode(&v[0]).into())
+        }
+        // The `ieee754` extension: decompose/recompose a double into an exact
+        // `mantissa · 2^exponent`, and convert doubles to/from their 8-byte blob.
+        // An 8-byte BLOB argument to the 1-arg forms is reinterpreted as the
+        // double; other/NULL arguments coerce via value_double/int64 (NULL → 0),
+        // matching sqlite (so `ieee754(NULL)` is `'ieee754(0,-1075)'`).
+        "ieee754" => match args.len() {
+            1 => {
+                let (m, e) = crate::util::ieee754::parts(ieee754_double_arg(&v[0]));
+                Value::Text(alloc::format!("ieee754({m},{e})").into())
+            }
+            2 => match crate::util::ieee754::compose(
+                eval::to_int_value(&v[0]),
+                eval::to_int_value(&v[1]),
+            ) {
+                Some(r) => Value::Real(r),
+                None => Value::Null,
+            },
+            _ => return Err(wrong_arg_count(&lname)),
+        },
+        "ieee754_mantissa" => {
+            arity(&lname, args, 1)?;
+            Value::Integer(crate::util::ieee754::parts(ieee754_double_arg(&v[0])).0)
+        }
+        "ieee754_exponent" => {
+            arity(&lname, args, 1)?;
+            Value::Integer(crate::util::ieee754::parts(ieee754_double_arg(&v[0])).1 as i64)
+        }
+        "ieee754_to_blob" => {
+            arity(&lname, args, 1)?;
+            Value::Blob(crate::util::ieee754::to_blob(real_arg(&v[0]).unwrap_or(0.0)).to_vec())
+        }
+        "ieee754_inc" => {
+            arity(&lname, args, 2)?;
+            Value::Real(crate::util::ieee754::inc(
+                real_arg(&v[0]).unwrap_or(0.0),
+                eval::to_int_value(&v[1]),
+            ))
+        }
+        "ieee754_from_blob" => {
+            arity(&lname, args, 1)?;
+            match &v[0] {
+                Value::Blob(b) => match crate::util::ieee754::from_blob(b) {
+                    Some(r) => Value::Real(r),
+                    None => Value::Null,
+                },
+                _ => Value::Null,
+            }
         }
         "char" => char_fn(&v),
         "unicode" => {
@@ -1807,6 +1864,17 @@ fn byte_map_text(v: &Value, f: impl Fn(&u8) -> u8) -> Value {
 /// `0.0` and silently feed it to `sqrt`/`log`/`pow`/…
 fn real_arg(v: &Value) -> Option<f64> {
     eval::to_number_strict(v).map(|n| eval::to_f64(&n))
+}
+
+/// The double a 1-argument `ieee754`/`ieee754_mantissa`/`ieee754_exponent` reads:
+/// an exactly-8-byte BLOB is reinterpreted (big-endian) as the raw bits of a
+/// double; anything else coerces via `sqlite3_value_double` (NULL / non-numeric
+/// → `0.0`). Mirrors the blob branch of `ieee754func`.
+fn ieee754_double_arg(v: &Value) -> f64 {
+    match v {
+        Value::Blob(b) if b.len() == 8 => crate::util::ieee754::from_blob(b).unwrap_or(0.0),
+        other => real_arg(other).unwrap_or(0.0),
+    }
 }
 
 /// Wrap a computed math result, matching SQLite's split between a *domain error*
