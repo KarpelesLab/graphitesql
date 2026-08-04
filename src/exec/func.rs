@@ -84,6 +84,11 @@ const FUNCTION_LIST: &[FunctionListEntry] = &[
     ("cosh", 's', 1),
     ("date", 's', -1),
     ("datetime", 's', -1),
+    ("decimal", 's', 1),
+    ("decimal_add", 's', 2),
+    ("decimal_cmp", 's', 2),
+    ("decimal_mul", 's', 2),
+    ("decimal_sub", 's', 2),
     ("degrees", 's', 1),
     ("exp", 's', 1),
     ("floor", 's', 1),
@@ -1460,6 +1465,49 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 _ => Value::Null,
             }
         }
+        // Arbitrary-precision decimal arithmetic (SQLite's `decimal` extension).
+        "decimal" => {
+            arity(&lname, args, 1)?;
+            match decimal_from_value(&v[0]) {
+                Some(d) => Value::Text(d.to_decimal_string().into()),
+                None => Value::Null,
+            }
+        }
+        "decimal_add" | "decimal_sub" => {
+            arity(&lname, args, 2)?;
+            // `decimal_new(_, bTextOnly=1)`: every input is interpreted as text,
+            // so `NULL` yields no Decimal object at all. SQLite's add/sub then
+            // hit `decimal_result(NULL)`, which reports an out-of-memory error
+            // rather than propagating NULL — replicate that exactly.
+            match (decimal_text(&v[0]), decimal_text(&v[1])) {
+                (Some(mut a), Some(b)) => {
+                    if lname == "decimal_sub" {
+                        a.sub(b);
+                    } else {
+                        a.add(b);
+                    }
+                    Value::Text(a.to_decimal_string().into())
+                }
+                _ => return Err(Error::Error("out of memory".into())),
+            }
+        }
+        "decimal_mul" => {
+            arity(&lname, args, 2)?;
+            match (decimal_text(&v[0]), decimal_text(&v[1])) {
+                (Some(mut a), Some(b)) => {
+                    a.mul(&b);
+                    Value::Text(a.to_decimal_string().into())
+                }
+                _ => Value::Null,
+            }
+        }
+        "decimal_cmp" => {
+            arity(&lname, args, 2)?;
+            match (decimal_text(&v[0]), decimal_text(&v[1])) {
+                (Some(a), Some(b)) => Value::Integer(a.compare(&b) as i64),
+                _ => Value::Null,
+            }
+        }
         // Date/time functions (see `super::datetime`).
         "date" => super::datetime::date(&v),
         "time" => super::datetime::time(&v),
@@ -1898,6 +1946,44 @@ fn soundex(s: &str) -> String {
 /// TEXT model is NUL-preserving (e.g. the JSON5 `\0` escape stores a real NUL
 /// character — see `tests/json5.rs`), and `length`/`unicode` count through it,
 /// so truncating TEXT here would be inconsistent with the rest of the engine.
+/// Build a `Decimal` from a value the way SQLite's `decimal_new(_, bTextOnly=1)`
+/// does: every non-NULL input is parsed as decimal text (integers/reals via
+/// their text rendering, blobs as their raw bytes). NULL yields `None`, which
+/// the caller maps to SQLite's per-function NULL behavior.
+fn decimal_text(v: &Value) -> Option<crate::util::decimal::Decimal> {
+    match v {
+        Value::Null => None,
+        Value::Text(t) => Some(crate::util::decimal::Decimal::from_bytes(t.as_bytes())),
+        Value::Blob(b) => Some(crate::util::decimal::Decimal::from_bytes(b)),
+        other => Some(crate::util::decimal::Decimal::from_bytes(
+            eval::to_text(other).as_bytes(),
+        )),
+    }
+}
+
+/// Build a `Decimal` from a value the way SQLite's `decimal_new(_, bTextOnly=0)`
+/// does (used by `decimal(X)`): text/integer parse as decimal text, a real is
+/// expanded to its exact binary value, an 8-byte blob is read big-endian as an
+/// IEEE-754 double and likewise expanded, and any other blob length (or NULL, or
+/// a non-finite float) yields `None`.
+fn decimal_from_value(v: &Value) -> Option<crate::util::decimal::Decimal> {
+    use crate::util::decimal::Decimal;
+    match v {
+        Value::Null => None,
+        Value::Text(t) => Some(Decimal::from_bytes(t.as_bytes())),
+        Value::Integer(_) => Some(Decimal::from_bytes(eval::to_text(v).as_bytes())),
+        Value::Real(r) => Decimal::from_double(*r),
+        Value::Blob(b) => {
+            if b.len() == 8 {
+                let bits = u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+                Decimal::from_double(f64::from_bits(bits))
+            } else {
+                None
+            }
+        }
+    }
+}
+
 fn c_text(v: &Value) -> String {
     match v {
         Value::Blob(b) => {
