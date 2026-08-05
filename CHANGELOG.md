@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/KarpelesLab/graphitesql/compare/v0.1.6...v0.1.7) - 2026-08-05
+
+### Added
+
+- *(func)* add median/percentile/percentile_cont/percentile_disc aggregates
+- *(func)* add base64() blob<->text conversion
+- *(capi)* add string helpers, 64-bit bind/result variants, and library info
+- *(func)* add decimal arbitrary-precision arithmetic functions
+- *(func)* add regexp() powering X REGEXP Y
+- *(capi)* add sqlite3_bind_zeroblob and sqlite3_result_zeroblob
+- *(func)* add sha1() and sha3() hash functions
+- *(func)* add the ieee754 extension functions
+- *(trigger)* WITHOUT ROWID ON CONFLICT DO UPDATE fires UPDATE triggers
+- *(trigger)* fire row triggers on WITHOUT ROWID table DML
+- *(fk)* honor PRAGMA defer_foreign_keys
+
+### Fixed
+
+- *(math)* correct large-argument range reduction for sin/cos/tan (Payne-Hanek)
+- *(parser)* accept a bare-word column DEFAULT as a string literal
+- *(cli)* caret + prepare phase for non-deterministic-function errors
+- *(without-rowid)* resolve multi-constraint ON CONFLICT in check order
+- *(conflict)* resolve multi-constraint ON CONFLICT in sqlite's check order
+- *(conflict)* honor INTEGER PRIMARY KEY ON CONFLICT for a sole rowid conflict
+- *(without-rowid)* honor column-declared ON CONFLICT action
+- *(without-rowid)* honor UPDATE OR IGNORE / OR REPLACE conflict policy
+- *(trigger)* RETURNING on INSTEAD OF UPDATE / DELETE views
+- *(cli)* classify foreign-key-mismatch / RAISE / DISTINCT-window as prepare errors
+- *(fk)* SET NULL / SET DEFAULT enforces the child's NOT NULL constraint
+- *(fk)* foreign_key_check covers WITHOUT ROWID children and orders fkid
+- *(parser)* reject a schema-qualified PRAGMA argument (main.t)
+- *(trigger)* RETURNING on an INSTEAD OF view INSERT
+- *(fk)* foreign-key actions fire the child row's triggers
+- *(exec)* total_changes() counts trigger-body and FK-action rows
+- *(parser)* reject CREATE TEMP INDEX / TEMP VIRTUAL TABLE as syntax errors
+- *(fk)* DROP TABLE enforces foreign keys like sqlite's implicit delete
+- *(window)* RANGE offset over a non-numeric ORDER BY collapses to peers
+- *(window)* non-integer lag/lead offset yields the default
+- *(window)* reject FILTER on a non-aggregate window function
+- *(window)* named-window refinement inherits the base window
+- *(exec)* bound trigger/FK-cascade recursion instead of overflowing the stack
+- *(datetime)* truncate sub-millisecond fractional seconds like sqlite
+- *(json)* preserve the JSON integer -0 sign
+- *(pragma)* introspection PRAGMAs see TEMP tables (temp shadows main)
+- *(ddl)* a trigger may share its name with a table/view/index
+
+### Testing
+
+- *(window)* fix RANGE-over-text test to bind a mutable Connection
+
 ## [0.1.6](https://github.com/KarpelesLab/graphitesql/compare/v0.1.5...v0.1.6) - 2026-07-23
 
 ### Documentation
