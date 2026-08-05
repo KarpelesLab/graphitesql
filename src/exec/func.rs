@@ -24,7 +24,18 @@ const HEX_DIGITS: [u8; 16] = *b"0123456789abcdef";
 pub fn is_aggregate(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "count" | "sum" | "total" | "avg" | "min" | "max" | "group_concat" | "geopoly_group_bbox"
+        "count"
+            | "sum"
+            | "total"
+            | "avg"
+            | "min"
+            | "max"
+            | "group_concat"
+            | "geopoly_group_bbox"
+            | "median"
+            | "percentile"
+            | "percentile_cont"
+            | "percentile_disc"
     )
 }
 
@@ -43,6 +54,11 @@ pub fn is_aggregate_call(name: &str, nargs: usize, star: bool) -> bool {
         // geopoly_group_bbox has no scalar counterpart, so it is an aggregate at
         // any argument count (the arity guard reports a wrong count).
         "geopoly_group_bbox" => true,
+        // The percentile family (`median`, `percentile`, `percentile_cont`,
+        // `percentile_disc`) has no scalar counterpart, so each is an aggregate
+        // at any argument count — a wrong count then reaches the aggregate arity
+        // guard rather than falling through to "no such function".
+        "median" | "percentile" | "percentile_cont" | "percentile_disc" => true,
         "min" | "max" => star || nargs == 1,
         _ => false,
     }
@@ -216,7 +232,11 @@ const FUNCTION_LIST: &[FunctionListEntry] = &[
     ("jsonb_group_array", 'a', 1),
     ("jsonb_group_object", 'a', 2),
     ("max", 'a', 1),
+    ("median", 'a', 1),
     ("min", 'a', 1),
+    ("percentile", 'a', 2),
+    ("percentile_cont", 'a', 2),
+    ("percentile_disc", 'a', 2),
     ("string_agg", 'a', 2),
     ("sum", 'a', 1),
     ("total", 'a', 1),

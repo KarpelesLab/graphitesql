@@ -27669,14 +27669,19 @@ impl Connection {
                     return;
                 }
                 let max_args = match lname.as_str() {
-                    "group_concat" | "string_agg" | "json_group_object" | "jsonb_group_object" => 2,
+                    "group_concat" | "string_agg" | "json_group_object" | "jsonb_group_object"
+                    | "percentile" | "percentile_cont" | "percentile_disc" => 2,
                     _ => 1,
                 };
                 let too_many = args.len() > max_args;
                 let too_few = (args.is_empty() && lname != "count")
                     || (lname == "string_agg" && args.len() < 2)
                     || ((lname == "json_group_object" || lname == "jsonb_group_object")
-                        && args.len() < 2);
+                        && args.len() < 2)
+                    || (matches!(
+                        lname.as_str(),
+                        "percentile" | "percentile_cont" | "percentile_disc"
+                    ) && args.len() < 2);
                 if too_many || too_few {
                     err = Some(Error::Error(alloc::format!(
                         "wrong number of arguments to function {lname}()"
@@ -38880,7 +38885,8 @@ impl Connection {
         //    `json[b]_group_object` pair; every other builtin aggregate takes one.
         if !self.aggregates.contains_key(&lname) {
             let max_args = match lname.as_str() {
-                "group_concat" | "string_agg" | "json_group_object" | "jsonb_group_object" => 2,
+                "group_concat" | "string_agg" | "json_group_object" | "jsonb_group_object"
+                | "percentile" | "percentile_cont" | "percentile_disc" => 2,
                 _ => 1,
             };
             if args.len() > max_args {
@@ -39056,6 +39062,33 @@ impl Connection {
                 }
                 None => Value::Null,
             });
+        }
+
+        // The percentile family (`median`, `percentile`, `percentile_cont`,
+        // `percentile_disc`) collects the group's non-NULL numeric values,
+        // validating the per-row fraction argument, then reads off the sorted
+        // array at the requested fraction (see `eval::PercentileAcc`).
+        if let Some(kind) = crate::util::percentile::PercentileKind::from_name(&lname) {
+            // Exact-arity guard: `median` takes one argument, the others two.
+            // (The generic upper/lower bounds above catch the gross cases; this
+            // pins the `median(x, y)` / `percentile(x)` shapes precisely.)
+            if args.len() != kind.n_arg() {
+                return Err(Error::Error(format!(
+                    "wrong number of arguments to function {lname}()"
+                )));
+            }
+            let mut acc = eval::PercentileAcc::new(kind);
+            for &i in group {
+                let ctx = rows[i].ctx(columns, params).with_subqueries(self);
+                let y = eval::eval(&args[0], &ctx)?;
+                let frac = if kind.n_arg() == 2 {
+                    Some(eval::eval(&args[1], &ctx)?)
+                } else {
+                    None
+                };
+                acc.step(&y, frac.as_ref())?;
+            }
+            return acc.finalize();
         }
 
         // Gather the (non-NULL for most) argument values across the group.
@@ -44205,6 +44238,20 @@ fn ntile_bucket(p: usize, m: usize, buckets: i64) -> i64 {
 /// Evaluate an aggregate window function over a frame of per-row argument
 /// values, matching `compute_aggregate`'s numeric semantics.
 fn window_aggregate(lname: &str, star: bool, frame: &[&Vec<Value>]) -> Result<Value> {
+    // The percentile family as a window function: recompute over the current
+    // frame's rows. Each frame row carries the call's evaluated arguments —
+    // `row[0]` the value, `row[1]` the fraction (for the two-argument forms).
+    // The result is identical to SQLite's incremental (xInverse) implementation;
+    // only the per-frame cost differs.
+    if let Some(kind) = crate::util::percentile::PercentileKind::from_name(lname) {
+        let mut acc = eval::PercentileAcc::new(kind);
+        for row in frame {
+            let y = row.first().cloned().unwrap_or(Value::Null);
+            let frac = if kind.n_arg() == 2 { row.get(1) } else { None };
+            acc.step(&y, frac)?;
+        }
+        return acc.finalize();
+    }
     let mut vals: Vec<Value> = Vec::new();
     for row in frame {
         if star {

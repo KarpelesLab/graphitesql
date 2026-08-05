@@ -2086,6 +2086,115 @@ pub fn avg_value(vals: &[Value]) -> Option<f64> {
     Some(r / vals.len() as f64)
 }
 
+/// A running `median`/`percentile`/`percentile_cont`/`percentile_disc`
+/// accumulator — the SQL-level driver shared by both aggregate engines (the
+/// tree-walker and the window path). It performs the same per-row validation as
+/// SQLite's `percentStep` (`ext/misc/percentile.c`) and delegates the final
+/// sort-and-compute math to [`crate::util::percentile::compute`].
+///
+/// Order of checks per row mirrors `percentStep` exactly: the fraction argument
+/// is validated *first* (even on a NULL-value row), the "same fraction for all
+/// rows" invariant is enforced next, and only then is a NULL value ignored or a
+/// non-NULL value type-checked and collected.
+pub(crate) struct PercentileAcc {
+    kind: crate::util::percentile::PercentileKind,
+    /// The collected non-NULL numeric inputs (unsorted; sorted at finalize).
+    vals: Vec<f64>,
+    /// The fraction `P` (in 0..=1), remembered from the very first row —
+    /// including a NULL-value row — and then frozen for the group.
+    rpct: f64,
+    /// Whether any row has been stepped yet (drives the first-row capture of
+    /// `rpct`). SQLite remembers the fraction on the first `xStep` regardless of
+    /// whether that row's value is NULL, and never revises it.
+    seen_any: bool,
+}
+
+impl PercentileAcc {
+    /// A fresh accumulator for the given percentile-family function.
+    pub(crate) fn new(kind: crate::util::percentile::PercentileKind) -> Self {
+        Self {
+            kind,
+            vals: Vec::new(),
+            rpct: 0.5,
+            seen_any: false,
+        }
+    }
+
+    /// Fold one row: `y` is the value argument (`argv[0]`); `frac` is the
+    /// fraction argument (`argv[1]`) for the two-argument forms, or `None` for
+    /// `median`.
+    pub(crate) fn step(&mut self, y: &Value, frac: Option<&Value>) -> Result<()> {
+        let name = self.kind.name();
+        // 1. Determine and validate this row's fraction (before any NULL check).
+        let rpct = match frac {
+            // `median`: fraction fixed at 0.5, no argument to validate.
+            None => 0.5,
+            Some(fv) => {
+                let numeric = to_number_strict(fv).is_some();
+                let r = to_f64(fv) / self.kind.mx_frac();
+                if !numeric || !(0.0..=1.0).contains(&r) {
+                    return Err(Error::Error(alloc::format!(
+                        "the fraction argument to {name}() is not between 0.0 and {:.1}",
+                        self.kind.mx_frac()
+                    )));
+                }
+                r
+            }
+        };
+        // 2. The fraction must be the same for every row. It is captured on the
+        //    very first row (even one whose value is NULL) and then frozen; a
+        //    later row differing by more than 0.001 is an error.
+        if !self.seen_any {
+            self.rpct = rpct;
+            self.seen_any = true;
+        } else if crate::util::float::abs(self.rpct - rpct) > 0.001 {
+            return Err(Error::Error(alloc::format!(
+                "the fraction argument to {name}() is not the same for all input rows"
+            )));
+        }
+        // 3. Ignore rows whose value is NULL.
+        if matches!(y, Value::Null) {
+            return Ok(());
+        }
+        // 4. The value's *storage class* must be INTEGER or FLOAT. Unlike the
+        //    fraction argument, SQLite's `percentStep` tests the value with
+        //    `sqlite3_value_type` (not `_numeric_type`), so a TEXT value errors
+        //    even when it looks numeric (`'1'`), and so does a BLOB. Affinity
+        //    applied at storage time still counts — an INTEGER-affinity column
+        //    holding `'1'` is stored as an integer and is accepted.
+        let yv = match y {
+            Value::Integer(i) => *i as f64,
+            Value::Real(r) => *r,
+            _ => {
+                return Err(Error::Error(alloc::format!(
+                    "input to {name}() is not numeric"
+                )));
+            }
+        };
+        // 5. Infinity is rejected (NaN never reaches here — SQLite stores it as NULL).
+        if yv.is_infinite() {
+            return Err(Error::Error(alloc::format!("Inf input to {name}()")));
+        }
+        self.vals.push(yv);
+        Ok(())
+    }
+
+    /// Finalize: NULL for an empty (all-NULL / no-row) group, else the REAL
+    /// percentile value.
+    pub(crate) fn finalize(&self) -> Result<Value> {
+        if self.vals.is_empty() {
+            return Ok(Value::Null);
+        }
+        let mut a = self.vals.clone();
+        a.sort_by(f64::total_cmp);
+        Ok(Value::Real(crate::util::percentile::compute(
+            &a,
+            self.rpct,
+            self.kind.is_discrete(),
+        )))
+    }
+}
+
 /// The raw bytes of a value's text representation, used by `||`. A blob
 /// contributes its bytes verbatim (no UTF-8 coercion); every other class
 /// contributes the bytes of its [`to_text`] form. Unlike `to_text(..).into_bytes()`
