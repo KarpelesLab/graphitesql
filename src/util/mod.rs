@@ -1,5 +1,6 @@
 //! Low-level, fully-specified building blocks shared across the engine.
 
+pub mod base64;
 pub mod decimal;
 pub mod float;
 pub mod fpdecode;

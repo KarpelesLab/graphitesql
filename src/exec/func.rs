@@ -73,6 +73,7 @@ const FUNCTION_LIST: &[FunctionListEntry] = &[
     ("atan", 's', 1),
     ("atan2", 's', 2),
     ("atanh", 's', 1),
+    ("base64", 's', 1),
     ("ceil", 's', 1),
     ("ceiling", 's', 1),
     ("changes", 's', 0),
@@ -729,6 +730,21 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
         "hex" => {
             arity(&lname, args, 1)?;
             Value::Text(hex_encode(&v[0]).into())
+        }
+        // The `base64` extension: a BLOB is encoded to base64 text, TEXT is
+        // decoded back to a BLOB; any other type (incl. NULL) is an error —
+        // matching `ext/misc/base64.c`.
+        "base64" => {
+            arity(&lname, args, 1)?;
+            match &v[0] {
+                Value::Blob(b) => Value::Text(crate::util::base64::encode(b).into()),
+                Value::Text(t) => Value::Blob(crate::util::base64::decode(t.as_bytes())),
+                _ => {
+                    return Err(Error::Error(String::from(
+                        "base64 accepts only blob or text",
+                    )));
+                }
+            }
         }
         // The `ieee754` extension: decompose/recompose a double into an exact
         // `mantissa · 2^exponent`, and convert doubles to/from their 8-byte blob.
