@@ -81,6 +81,15 @@ pub type FunctionListEntry = (&'static str, char, i32);
 /// `-4`). Not sorted here — [`function_list`] sorts by name.
 const FUNCTION_LIST: &[FunctionListEntry] = &[
     // --- scalar ---
+    // The JSON arrow operators and the `current_*` date/time keywords are
+    // handled specially by the parser/evaluator (not the scalar dispatch), but
+    // sqlite still reports them in `pragma_function_list`, so list them here for
+    // parity (the runtime sort places them correctly).
+    ("->", 's', 2),
+    ("->>", 's', 2),
+    ("current_date", 's', 0),
+    ("current_time", 's', 0),
+    ("current_timestamp", 's', 0),
     ("abs", 's', 1),
     ("acos", 's', 1),
     ("acosh", 's', 1),
