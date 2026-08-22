@@ -151,7 +151,7 @@ fn decode_text(body: &[u8], encoding: TextEncoding) -> Result<Vec<u8>> {
             if !body.len().is_multiple_of(2) {
                 return Err(Error::Corrupt("odd-length UTF-16 text".into()));
             }
-            let units = body.chunks_exact(2).map(|c| match encoding {
+            let units = body.as_chunks::<2>().0.iter().map(|c| match encoding {
                 TextEncoding::Utf16Be => u16::from_be_bytes([c[0], c[1]]),
                 _ => u16::from_le_bytes([c[0], c[1]]),
             });

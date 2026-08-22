@@ -39091,6 +39091,25 @@ impl Connection {
             return acc.finalize();
         }
 
+        // `decimal_sum(X)` (SQLite's `decimal` extension): arbitrary-precision
+        // sum. The accumulator initializes to `0` on the first row (even a NULL
+        // one), so a non-empty group yields a `"0"`-based decimal string and an
+        // empty group yields NULL (see `eval::DecimalSumAcc`).
+        if lname == "decimal_sum" {
+            if args.len() != 1 {
+                return Err(Error::Error(format!(
+                    "wrong number of arguments to function {lname}()"
+                )));
+            }
+            let mut acc = eval::DecimalSumAcc::new();
+            for &i in group {
+                let ctx = rows[i].ctx(columns, params).with_subqueries(self);
+                let x = eval::eval(&args[0], &ctx)?;
+                acc.step(&x);
+            }
+            return Ok(acc.finalize());
+        }
+
         // Gather the (non-NULL for most) argument values across the group.
         let mut vals: Vec<Value> = Vec::new();
         let mut count_rows = 0usize; // for count(*)
@@ -44251,6 +44270,18 @@ fn window_aggregate(lname: &str, star: bool, frame: &[&Vec<Value>]) -> Result<Va
             acc.step(&y, frac)?;
         }
         return acc.finalize();
+    }
+    // `decimal_sum` as a window function: recompute over the current frame's
+    // rows. Every frame row (`row[0]` the value) is stepped, so the first-row
+    // initialization to `0` still applies; identical to SQLite's incremental
+    // implementation, only the per-frame cost differs.
+    if lname == "decimal_sum" {
+        let mut acc = eval::DecimalSumAcc::new();
+        for row in frame {
+            let x = row.first().cloned().unwrap_or(Value::Null);
+            acc.step(&x);
+        }
+        return Ok(acc.finalize());
     }
     let mut vals: Vec<Value> = Vec::new();
     for row in frame {

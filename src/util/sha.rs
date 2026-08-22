@@ -32,7 +32,7 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
     }
     msg.extend_from_slice(&ml.to_be_bytes());
 
-    for block in msg.chunks_exact(64) {
+    for block in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 80];
         for (i, word) in w.iter_mut().take(16).enumerate() {
             let b = &block[i * 4..i * 4 + 4];
@@ -207,7 +207,7 @@ pub fn sha3(data: &[u8], bits: u16) -> Vec<u8> {
 /// XOR a rate-sized block (a multiple of 8 bytes) into the state as
 /// little-endian 64-bit lanes.
 fn absorb(state: &mut [u64; 25], block: &[u8]) {
-    for (i, chunk) in block.chunks_exact(8).enumerate() {
+    for (i, chunk) in block.as_chunks::<8>().0.iter().enumerate() {
         state[i] ^= u64::from_le_bytes([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);

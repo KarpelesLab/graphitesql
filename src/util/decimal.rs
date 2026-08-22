@@ -339,6 +339,101 @@ impl Decimal {
         z
     }
 
+    /// Render the value in scientific notation, mirroring `decimal_result_sci`
+    /// (the renderer behind `decimal_exp(X)` and `decimal_pow2(N)`).
+    ///
+    /// The output is always `<sign><lead>.<frac>e<sign><exp>` where the sign is
+    /// shown explicitly (`+`/`-`), there is exactly one digit before the point,
+    /// and the exponent carries its sign plus at least two zero-padded digits
+    /// (`e+00`, `e-03`, `e+38`, `e+123`). Trailing significand zeros are dropped;
+    /// a zero value renders as `+0.0e+00`.
+    pub fn to_sci_string(&self) -> String {
+        let orig_n_digit = self.digits.len() as i64;
+        // Drop trailing zeros from the significand.
+        let mut n_digit = orig_n_digit;
+        while n_digit > 0 && self.digits[(n_digit - 1) as usize] == 0 {
+            n_digit -= 1;
+        }
+        // Count leading zeros.
+        let mut n_zero = 0i64;
+        while n_zero < n_digit && self.digits[n_zero as usize] == 0 {
+            n_zero += 1;
+        }
+        let mut n_frac = self.n_frac + (n_digit - orig_n_digit);
+        n_digit -= n_zero;
+        // A value that reduced to nothing renders as the single digit `0`.
+        let zero_case = n_digit == 0;
+        if zero_case {
+            n_digit = 1;
+            n_frac = 0;
+        }
+        // Access the k-th significand digit (post leading-zero strip).
+        let get = |k: i64| -> u8 {
+            if zero_case {
+                0
+            } else {
+                self.digits[(n_zero + k) as usize]
+            }
+        };
+
+        let mut z = String::with_capacity((n_digit as usize) + 8);
+        z.push(if self.sign { '-' } else { '+' });
+        z.push((get(0) + b'0') as char);
+        z.push('.');
+        if n_digit == 1 {
+            z.push('0');
+        } else {
+            for k in 1..n_digit {
+                z.push((get(k) + b'0') as char);
+            }
+        }
+        // Exponent, formatted like C `printf("e%+03d", exp)`: an explicit sign
+        // then the magnitude zero-padded to at least two digits.
+        let exp = n_digit - n_frac - 1;
+        z.push('e');
+        z.push(if exp < 0 { '-' } else { '+' });
+        let mut mag = (exp as i128).unsigned_abs() as u64;
+        let mut buf = [0u8; 20];
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (mag % 10) as u8;
+            mag /= 10;
+            if mag == 0 {
+                break;
+            }
+        }
+        while buf.len() - i < 2 {
+            i -= 1;
+            buf[i] = b'0';
+        }
+        z.push_str(core::str::from_utf8(&buf[i..]).unwrap());
+        z
+    }
+
+    /// The canonical decimal zero as SQLite's aggregate initializers spell it:
+    /// a single `0` digit with no fractional part (`a=[0]`, `nDigit=1`,
+    /// `nFrac=0`). Distinct from `parse("0")`, which strips to an empty digit
+    /// array — this matches the exact representation `decimalSumStep` starts from.
+    pub fn zero() -> Decimal {
+        Decimal {
+            sign: false,
+            digits: vec![0],
+            n_frac: 0,
+        }
+    }
+
+    /// Build a decimal that is exactly `2**n`, mirroring `decimalPow2` /
+    /// `decimal_pow2(N)`. Returns `None` for `|n| > 20000` (SQLite's guard, which
+    /// surfaces as SQL `NULL`). Takes an `i64` so out-of-`i32` magnitudes also
+    /// land in the `None` guard rather than wrapping.
+    pub fn pow2(n: i64) -> Option<Decimal> {
+        if !(-20000..=20000).contains(&n) {
+            return None;
+        }
+        Decimal::from_pow2(n as i32)
+    }
+
     /// Build a decimal that is exactly `2**n`, mirroring `decimalPow2`.
     /// Returns `None` for `|n| > 20000` (SQLite's guard).
     fn from_pow2(mut n: i32) -> Option<Decimal> {
@@ -545,6 +640,53 @@ mod tests {
         assert_eq!(cmp("-5", "-3"), -1);
         assert_eq!(cmp("0.10", "0.1"), 1);
         assert_eq!(cmp("100.00", "100"), 1);
+    }
+
+    fn sci(a: &str) -> String {
+        Decimal::parse(a).to_sci_string()
+    }
+
+    #[test]
+    fn scientific_notation() {
+        // Verified byte-for-byte against sqlite3 3.50.4 `decimal_exp`.
+        assert_eq!(sci("1.5"), "+1.5e+00");
+        assert_eq!(sci("123"), "+1.23e+02");
+        assert_eq!(sci("0"), "+0.0e+00");
+        assert_eq!(sci("0.00"), "+0.0e+00");
+        assert_eq!(sci("1e10"), "+1.0e+10");
+        assert_eq!(sci("0.000123"), "+1.23e-04");
+        assert_eq!(sci("-123.456"), "-1.23456e+02");
+        // A single significant digit still gets a `.0` mantissa tail.
+        assert_eq!(sci("42"), "+4.2e+01");
+        assert_eq!(sci("3"), "+3.0e+00");
+    }
+
+    #[test]
+    fn pow2_values() {
+        // Verified against sqlite3 3.50.4 `decimal_pow2`.
+        assert_eq!(Decimal::pow2(0).unwrap().to_sci_string(), "+1.0e+00");
+        assert_eq!(Decimal::pow2(5).unwrap().to_sci_string(), "+3.2e+01");
+        assert_eq!(Decimal::pow2(-3).unwrap().to_sci_string(), "+1.25e-01");
+        assert_eq!(
+            Decimal::pow2(128).unwrap().to_sci_string(),
+            "+3.40282366920938463463374607431768211456e+38"
+        );
+        // Out of range -> None (surfaces as an out-of-memory error, not NULL).
+        assert!(Decimal::pow2(20001).is_none());
+        assert!(Decimal::pow2(-20001).is_none());
+        assert!(Decimal::pow2(i64::MAX).is_none());
+    }
+
+    #[test]
+    fn zero_representation() {
+        // `Decimal::zero()` is the sum-initializer's exact shape (a=[0], nFrac=0)
+        // and renders as "0"; adding into it behaves like a fresh sum.
+        assert_eq!(Decimal::zero().to_decimal_string(), "0");
+        let mut z = Decimal::zero();
+        z.add(Decimal::parse("1.1"));
+        z.add(Decimal::parse("2.22"));
+        z.add(Decimal::parse("3.333"));
+        assert_eq!(z.to_decimal_string(), "6.653");
     }
 
     #[test]

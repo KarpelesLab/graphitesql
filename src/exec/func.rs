@@ -36,6 +36,7 @@ pub fn is_aggregate(name: &str) -> bool {
             | "percentile"
             | "percentile_cont"
             | "percentile_disc"
+            | "decimal_sum"
     )
 }
 
@@ -59,6 +60,10 @@ pub fn is_aggregate_call(name: &str, nargs: usize, star: bool) -> bool {
         // at any argument count — a wrong count then reaches the aggregate arity
         // guard rather than falling through to "no such function".
         "median" | "percentile" | "percentile_cont" | "percentile_disc" => true,
+        // `decimal_sum` (SQLite's `decimal` extension) is aggregate-only, so it
+        // is an aggregate at any argument count — a wrong count reaches the
+        // aggregate arity guard rather than falling through to "no such function".
+        "decimal_sum" => true,
         "min" | "max" => star || nargs == 1,
         _ => false,
     }
@@ -114,8 +119,11 @@ const FUNCTION_LIST: &[FunctionListEntry] = &[
     ("decimal", 's', 1),
     ("decimal_add", 's', 2),
     ("decimal_cmp", 's', 2),
+    ("decimal_exp", 's', 1),
     ("decimal_mul", 's', 2),
+    ("decimal_pow2", 's', 1),
     ("decimal_sub", 's', 2),
+    ("decimal_sum", 'a', 1),
     ("degrees", 's', 1),
     ("exp", 's', 1),
     ("floor", 's', 1),
@@ -1532,6 +1540,33 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
             match decimal_from_value(&v[0]) {
                 Some(d) => Value::Text(d.to_decimal_string().into()),
                 None => Value::Null,
+            }
+        }
+        "decimal_exp" => {
+            arity(&lname, args, 1)?;
+            // Same value as `decimal(X)` (the `bTextOnly=0` interpretation), but
+            // rendered in scientific notation (`decimal_result_sci`).
+            match decimal_from_value(&v[0]) {
+                Some(d) => Value::Text(d.to_sci_string().into()),
+                None => Value::Null,
+            }
+        }
+        "decimal_pow2" => {
+            arity(&lname, args, 1)?;
+            // `decimal_pow2(N)` acts only on an INTEGER argument; any other
+            // storage class (text/real/blob/NULL) leaves the result unset → NULL.
+            // SQLite reads the argument with `sqlite3_value_int` (a 32-bit
+            // truncation) before its `|N|>20000` guard, and an out-of-range N
+            // makes `decimal_result_sci` see a NULL Decimal and raise the same
+            // out-of-memory error as `decimal_add`'s NULL path (not SQL NULL).
+            match &v[0] {
+                Value::Integer(n) => {
+                    match crate::util::decimal::Decimal::pow2((*n as i32) as i64) {
+                        Some(d) => Value::Text(d.to_sci_string().into()),
+                        None => return Err(Error::Error("out of memory".into())),
+                    }
+                }
+                _ => Value::Null,
             }
         }
         "decimal_add" | "decimal_sub" => {

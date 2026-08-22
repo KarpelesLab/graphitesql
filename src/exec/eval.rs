@@ -2195,6 +2195,50 @@ impl PercentileAcc {
     }
 }
 
+/// A running `decimal_sum(X)` accumulator (SQLite's `decimal` extension,
+/// `decimalSumStep`/`decimalSumFinalize`) — the arbitrary-precision analogue of
+/// `sum`, shared by both aggregate engines (tree-walker and window path).
+///
+/// The accumulator is initialized to decimal `0` on the *first* stepped row —
+/// even one whose value is NULL — so any group with at least one row finalizes
+/// to a `"0"`-based decimal string, while a group with *no* rows finalizes to
+/// NULL. Each non-NULL row's argument is interpreted the `decimal_new(bTextOnly=1)`
+/// way (text/blob as raw bytes, integer/real via their text rendering) and added.
+pub(crate) struct DecimalSumAcc {
+    /// `None` until the first row is stepped, then the running decimal total.
+    acc: Option<crate::util::decimal::Decimal>,
+}
+
+impl DecimalSumAcc {
+    /// A fresh, un-stepped accumulator (finalizes to NULL if never stepped).
+    pub(crate) fn new() -> Self {
+        Self { acc: None }
+    }
+
+    /// Fold one row's value argument into the running total.
+    pub(crate) fn step(&mut self, v: &Value) {
+        use crate::util::decimal::Decimal;
+        // The very first row (NULL or not) allocates the `0` accumulator.
+        let acc = self.acc.get_or_insert_with(Decimal::zero);
+        // `bTextOnly=1`: a NULL value contributes nothing; everything else is
+        // parsed as decimal text (blobs/text as raw bytes, int/real via text).
+        match v {
+            Value::Null => {}
+            Value::Text(t) => acc.add(Decimal::from_bytes(t.as_bytes())),
+            Value::Blob(b) => acc.add(Decimal::from_bytes(b)),
+            other => acc.add(Decimal::from_bytes(to_text(other).as_bytes())),
+        }
+    }
+
+    /// Finalize: NULL for a zero-row group, else the PLAIN-notation decimal sum.
+    pub(crate) fn finalize(&self) -> Value {
+        match &self.acc {
+            Some(d) => Value::Text(d.to_decimal_string().into()),
+            None => Value::Null,
+        }
+    }
+}
+
 /// The raw bytes of a value's text representation, used by `||`. A blob
 /// contributes its bytes verbatim (no UTF-8 coercion); every other class
 /// contributes the bytes of its [`to_text`] form. Unlike `to_text(..).into_bytes()`
