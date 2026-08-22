@@ -90,6 +90,7 @@ const FUNCTION_LIST: &[FunctionListEntry] = &[
     ("atan2", 's', 2),
     ("atanh", 's', 1),
     ("base64", 's', 1),
+    ("base85", 's', 1),
     ("ceil", 's', 1),
     ("ceiling", 's', 1),
     ("changes", 's', 0),
@@ -762,6 +763,21 @@ pub fn eval_scalar(name: &str, args: &[Expr], star: bool, ctx: &EvalCtx) -> Resu
                 _ => {
                     return Err(Error::Error(String::from(
                         "base64 accepts only blob or text",
+                    )));
+                }
+            }
+        }
+        // The `base85` extension: BLOB → base85 text, TEXT → decoded BLOB; any
+        // other type (incl. NULL) errors. The message ends with a period, unlike
+        // base64 — matching `ext/misc/base85.c` verbatim.
+        "base85" => {
+            arity(&lname, args, 1)?;
+            match &v[0] {
+                Value::Blob(b) => Value::Text(crate::util::base85::encode(b).into()),
+                Value::Text(t) => Value::Blob(crate::util::base85::decode(t.as_bytes())),
+                _ => {
+                    return Err(Error::Error(String::from(
+                        "base85 accepts only blob or text.",
                     )));
                 }
             }
