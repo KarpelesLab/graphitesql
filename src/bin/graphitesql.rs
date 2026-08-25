@@ -402,10 +402,12 @@ impl Shell {
                 .unwrap_or(search_from);
             search_from = off + stmt.len();
             let line = start_line + sql[..off].bytes().filter(|&b| b == b'\n').count();
-            // On error, carry the failing statement text and its line so the caller
-            // can render SQLite's `Parse`/`Runtime error near line N` message.
+            // On error, carry the source from the failing statement to the END of
+            // the input buffer (not just this statement) and its line, so the
+            // caller renders SQLite's caret context — which echoes the whole
+            // prepared buffer, `; …`-trailing statements included — like the shell.
             if let Err(e) = self.run_one(conn, stmt) {
-                return Err((e, stmt.to_string(), line));
+                return Err((e, sql[off..].to_string(), line));
             }
         }
         Ok(())
@@ -2795,23 +2797,47 @@ fn locate_token(sql: &str, token: &str) -> Option<usize> {
 /// char boundaries), the line is capped at 78 bytes, and the caret flips from the
 /// right-pointing form (`^--- error here`) to the left-pointing one
 /// (`error here ---^`) once the offset reaches 25.
+/// Render SQLite's `^--- error here` source-context block for an error at byte
+/// offset `off` within `src` — a faithful port of the shell's
+/// `shell_error_context` (`src/shell.c.in`). `src` is the SQL that was prepared,
+/// i.e. from the failing statement to the end of the input buffer; the block
+/// shows a ≤78-byte window around the offset with every whitespace byte mapped
+/// to a single space *in place* (so newlines/tabs collapse the text onto one
+/// line without shifting the caret) and the caret at `off`.
 fn caret_block(src: &str, off: usize) -> String {
-    // Slide the window start forward until the offset is within 50 of it.
+    let bytes = src.as_bytes();
+    // Slide the window start forward one codepoint at a time until the (byte)
+    // offset is within 50 of it, exactly as the C does (decrementing the offset
+    // for the lead byte and every UTF-8 continuation byte skipped).
     let mut start = 0usize;
     let mut ioff = off;
     while ioff > 50 {
-        let ch_len = src[start..].chars().next().map_or(1, |c| c.len_utf8());
-        start += ch_len;
+        start += 1;
         ioff -= 1;
+        while start < bytes.len() && (bytes[start] & 0xc0) == 0x80 {
+            start += 1;
+            ioff -= 1;
+        }
     }
-    // Displayed line: from `start`, capped at 78 bytes on a char boundary, and with
-    // any trailing newline removed.
-    let tail = src[start..].trim_end_matches(['\n', '\r']);
-    let mut end = tail.len().min(78);
-    while end < tail.len() && !tail.is_char_boundary(end) {
-        end -= 1;
+    // Displayed slice: from `start`, with the trailing line terminator dropped
+    // (SQLite's line reader strips it before the buffer reaches prepare, so the
+    // context never ends in a mapped-newline space), then capped at 78 bytes
+    // without splitting a codepoint.
+    let rest = src[start..].trim_end_matches(['\n', '\r']);
+    let mut len = rest.len().min(78);
+    while len > 0 && !rest.is_char_boundary(len) {
+        len -= 1;
     }
-    let shown = &tail[..end];
+    // Map each ASCII-whitespace byte to a space in place (`IsSpace` → ' '). Only
+    // bytes < 0x80 are touched, so the result stays valid UTF-8 and the same
+    // byte length, keeping the caret offset correct.
+    let mut shown = rest.as_bytes()[..len].to_vec();
+    for b in shown.iter_mut() {
+        if matches!(*b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+            *b = b' ';
+        }
+    }
+    let shown = String::from_utf8(shown).unwrap_or_default();
     let caret = if ioff < 25 {
         format!("{}^--- error here", " ".repeat(2 + ioff))
     } else {
@@ -2845,26 +2871,6 @@ fn render_cli_error(sql: &str, e: &graphitesql::Error) -> String {
     }
 }
 
-/// Collapse every run of whitespace (including newlines) in `s` to a single space,
-/// trimming the ends — the SQLite shell renders a multi-line offending statement as
-/// one space-joined line under the error caret.
-fn collapse_ws(s: &str) -> String {
-    let mut out = String::new();
-    let mut prev_ws = false;
-    for c in s.trim().chars() {
-        if c.is_whitespace() {
-            if !prev_ws {
-                out.push(' ');
-                prev_ws = true;
-            }
-        } else {
-            out.push(c);
-            prev_ws = false;
-        }
-    }
-    out
-}
-
 /// Render an error the way the SQLite CLI does when running a *script* (piped stdin,
 /// `.read`, or interactive): `Parse error near line N: <msg>` — with the offending
 /// statement (whitespace-collapsed) and a `^--- error here` caret when the message
@@ -2874,20 +2880,18 @@ fn collapse_ws(s: &str) -> String {
 /// (which uses the one-shot `-arg` wording).
 fn render_script_error(sql: &str, e: &graphitesql::Error, line: usize) -> String {
     let msg = raw_error_message(e);
-    let flat = collapse_ws(sql);
     if is_prepare_error(e, &msg, sql) {
-        // The parser's byte offset is into the original `sql`; it aligns with the
-        // whitespace-collapsed `flat` only when no collapse happened (a single-line
-        // statement, which the shell trims). Use it then (exact even for a repeated
-        // token); otherwise fall back to text-locating the token in `flat`.
+        // `caret_block` maps whitespace to spaces in place (length-preserving), so
+        // the parser's byte offset stays valid even for a multi-line statement;
+        // fall back to text-locating the token for errors that carry no offset.
         let off = e
             .parse_offset()
-            .filter(|_| flat == sql)
-            .or_else(|| error_offending_token(&msg).and_then(|t| locate_offending(&flat, t)));
+            .filter(|&o| o <= sql.len())
+            .or_else(|| error_offending_token(&msg).and_then(|t| locate_offending(sql, t)));
         if let Some(off) = off {
             return format!(
                 "Parse error near line {line}: {msg}\n{}",
-                caret_block(&flat, off)
+                caret_block(sql, off)
             );
         }
         return format!("Parse error near line {line}: {msg}");

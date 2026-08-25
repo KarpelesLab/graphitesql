@@ -4,10 +4,13 @@
 //! `Error: stepping, <msg> [(<code>)]` for a run-time error. Previously graphite
 //! printed a bare `Error: <msg>` with graphite's own `error:` / `SQL error:` tag.
 //!
-//! The offending-token caret is located by a text search of the failed statement,
-//! which is byte-exact with SQLite for the common cases (an identifier that appears
-//! once in code); a couple of edge cases — a repeated operator token (`===`) and a
-//! very long statement that SQLite windows — are not reproduced and are omitted.
+//! The offending-token caret is located by the parser's exact byte offset (like
+//! `sqlite3_error_offset`), so repeated tokens (`===`), doubled function-arity
+//! errors, and far-right (windowed) offsets all land correctly. The source line
+//! echoed under the caret matches `shell_error_context`: it spans from the failing
+//! statement to the end of the prepared buffer (trailing `; …` statements
+//! included) with every whitespace character mapped to a single space, so a
+//! multi-line statement renders on one line.
 //!
 //! Verified against sqlite3 3.50.4.
 
@@ -178,6 +181,19 @@ fn one_shot_error_rendering_matches_sqlite() {
         "CREATE TABLE t(a); SELECT length(a), length() FROM t",
         "CREATE TABLE t(a); SELECT abs(a,a), abs(a) FROM t",
         "CREATE TABLE t(a); SELECT foo(a), foo(a) FROM t",
+        // A multi-line statement is echoed on ONE line under the caret (every
+        // whitespace char maps to a space), matching `shell_error_context`.
+        "SELECT\n  bad here",
+        "SELECT a,\n       b,\n       bad here\nFROM t",
+        "CREATE TABLE t(\n  a INT,\n  b BOGUS TYPE!!\n)",
+        // Tabs and runs of spaces are preserved as-is (mapped 1:1 to spaces, not
+        // run-collapsed), so the caret column stays aligned with SQLite.
+        "SELECT\t\tbad\there",
+        // Two statements on one line where the FIRST errors: the echoed context
+        // runs to the end of the buffer, `; SELECT 1` included (one-shot exits on
+        // the first error, so the trailing statement never runs — no stdout to
+        // interleave with the stderr error).
+        "SELECT bad here; SELECT 1",
     ];
     for sql in cases {
         assert_eq!(out("sqlite3", sql), out(g, sql), "for {sql}");
@@ -210,6 +226,10 @@ fn script_mode_error_rendering_matches_sqlite() {
         "SELECT\n1\n,\nnope.bad;\n",
         // Two statements on one line: the second's error still reports that line.
         "CREATE TABLE t(a);\nSELECT 1; SELECT bad.col;\n",
+        // The echoed context runs to the end of the input buffer, so a syntax
+        // error in a statement followed by more statements (across a newline)
+        // shows them all, whitespace-mapped onto one line.
+        "SELECT bad here; SELECT 1;\nSELECT 2;\n",
         // A long statement uses the right-anchored `error here ---^` caret form.
         "SELECT aaaaaaaaaaaaaaaaaaaaaaaaaaaa FROM x SELET;\n",
         // A far-right error token is windowed here too (offset > 50).
