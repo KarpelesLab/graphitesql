@@ -618,6 +618,97 @@ int main(void) {
     sqlite3_finalize(s);
   }
 
+  /* sqlite3_get_table / sqlite3_free_table. */
+  {
+    sqlite3_exec(db,
+      "CREATE TABLE gt(a,b); INSERT INTO gt VALUES(1,'x'),(2,NULL);", 0, 0, 0);
+    char **az = NULL; int nr = -1, nc = -1; char *gerr = NULL;
+    int grc = sqlite3_get_table(db, "SELECT a,b FROM gt ORDER BY a",
+                                &az, &nr, &nc, &gerr);
+    CHECK("get_table rc", grc == SQLITE_OK);
+    CHECK("get_table nRow", nr == 2);
+    CHECK("get_table nColumn", nc == 2);
+    /* Layout: [a, b, "1", "x", "2", NULL]. */
+    CHECK("get_table colname0", az && strcmp(az[0], "a") == 0);
+    CHECK("get_table colname1", az && strcmp(az[1], "b") == 0);
+    CHECK("get_table cell00", az && strcmp(az[2], "1") == 0);
+    CHECK("get_table cell01", az && strcmp(az[3], "x") == 0);
+    CHECK("get_table cell10", az && strcmp(az[4], "2") == 0);
+    CHECK("get_table NULL cell", az && az[5] == NULL);
+    sqlite3_free_table(az);
+
+    /* Zero-rows quirk: nRow=0 AND nColumn=0, non-NULL result, rc OK. */
+    az = NULL; nr = -1; nc = -1;
+    grc = sqlite3_get_table(db, "SELECT a,b FROM gt WHERE a > 100",
+                            &az, &nr, &nc, &gerr);
+    CHECK("get_table empty rc", grc == SQLITE_OK);
+    CHECK("get_table empty nRow", nr == 0);
+    CHECK("get_table empty nColumn", nc == 0);
+    CHECK("get_table empty non-null", az != NULL);
+    sqlite3_free_table(az);
+
+    /* Incompatible queries → SQLITE_ERROR, classic message, *paz=0. */
+    az = NULL; nr = -1; nc = -1; gerr = NULL;
+    grc = sqlite3_get_table(db, "SELECT a FROM gt; SELECT a,b FROM gt;",
+                            &az, &nr, &nc, &gerr);
+    CHECK("get_table incompat rc", grc == SQLITE_ERROR);
+    CHECK("get_table incompat null", az == NULL);
+    CHECK("get_table incompat msg",
+          gerr && strcmp(gerr,
+            "sqlite3_get_table() called with two or more incompatible queries") == 0);
+    sqlite3_free(gerr);
+  }
+
+  /* SQL keyword introspection. */
+  CHECK("keyword_count positive", sqlite3_keyword_count() > 0);
+  CHECK("keyword_check SELECT", sqlite3_keyword_check("SELECT", 6) == 1);
+  CHECK("keyword_check lower", sqlite3_keyword_check("select", 6) == 1);
+  CHECK("keyword_check non-kw", sqlite3_keyword_check("notakw", 6) == 0);
+  CHECK("keyword_check partial", sqlite3_keyword_check("SEL", 3) == 0);
+  {
+    const char *kn = NULL; int kl = 0;
+    CHECK("keyword_name[0] ok", sqlite3_keyword_name(0, &kn, &kl) == SQLITE_OK);
+    CHECK("keyword_name[0] REINDEX", kn && kl == 7 && strncmp(kn, "REINDEX", 7) == 0);
+    /* Every reported name must round-trip through keyword_check. */
+    int all_kw = 1, n = sqlite3_keyword_count();
+    for (int i = 0; i < n; i++) {
+      const char *z = NULL; int l = 0;
+      if (sqlite3_keyword_name(i, &z, &l) != SQLITE_OK || !sqlite3_keyword_check(z, l))
+        all_kw = 0;
+    }
+    CHECK("keyword_name all round-trip", all_kw);
+    CHECK("keyword_name out-of-range", sqlite3_keyword_name(n, &kn, &kl) == SQLITE_ERROR);
+    CHECK("keyword_name negative", sqlite3_keyword_name(-1, &kn, &kl) == SQLITE_ERROR);
+  }
+
+  /* prepare (v1) + prepare16 / prepare16_v3 + complete16. */
+  {
+    sqlite3_stmt *s = NULL;
+    CHECK("prepare v1", sqlite3_prepare(db, "SELECT 7", -1, &s, NULL) == SQLITE_OK);
+    CHECK("prepare v1 step", sqlite3_step(s) == SQLITE_ROW);
+    CHECK("prepare v1 value", sqlite3_column_int(s, 0) == 7);
+    sqlite3_finalize(s);
+
+    /* UTF-16 (native order) "SELECT 9". */
+    unsigned short u16[] = {'S','E','L','E','C','T',' ','9', 0};
+    s = NULL;
+    CHECK("prepare16", sqlite3_prepare16(db, u16, -1, &s, NULL) == SQLITE_OK);
+    CHECK("prepare16 step", sqlite3_step(s) == SQLITE_ROW);
+    CHECK("prepare16 value", sqlite3_column_int(s, 0) == 9);
+    sqlite3_finalize(s);
+
+    s = NULL;
+    CHECK("prepare16_v3", sqlite3_prepare16_v3(db, u16, -1, 0, &s, NULL) == SQLITE_OK);
+    CHECK("prepare16_v3 step", sqlite3_step(s) == SQLITE_ROW);
+    sqlite3_finalize(s);
+
+    /* complete16 on "SELECT 1;" (complete) and "SELECT 1" (incomplete). */
+    unsigned short c1[] = {'S','E','L','E','C','T',' ','1',';', 0};
+    unsigned short c2[] = {'S','E','L','E','C','T',' ','1', 0};
+    CHECK("complete16 true", sqlite3_complete16(c1) == 1);
+    CHECK("complete16 false", sqlite3_complete16(c2) == 0);
+  }
+
   sqlite3_close(db);
 
   printf(failures ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", failures);

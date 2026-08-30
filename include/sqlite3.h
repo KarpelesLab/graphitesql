@@ -74,6 +74,8 @@ int sqlite3_get_autocommit(sqlite3 *db);
 int sqlite3_busy_timeout(sqlite3 *db, int ms);
 void sqlite3_interrupt(sqlite3 *db);
 
+int sqlite3_prepare(sqlite3 *db, const char *sql, int nByte,
+                    sqlite3_stmt **ppStmt, const char **pzTail);
 int sqlite3_prepare_v2(sqlite3 *db, const char *sql, int nByte,
                        sqlite3_stmt **ppStmt, const char **pzTail);
 int sqlite3_prepare_v3(sqlite3 *db, const char *sql, int nByte, unsigned int prepFlags,
@@ -169,8 +171,13 @@ void sqlite3_result_error_code(sqlite3_context *ctx, int errCode);
 
 /* UTF-16 entry points (native byte order; nByte args are in bytes) */
 int sqlite3_open16(const void *zFilename, sqlite3 **ppDb);
+int sqlite3_prepare16(sqlite3 *db, const void *zSql, int nByte,
+                      sqlite3_stmt **ppStmt, const void **pzTail);
 int sqlite3_prepare16_v2(sqlite3 *db, const void *zSql, int nByte,
                          sqlite3_stmt **ppStmt, const void **pzTail);
+int sqlite3_prepare16_v3(sqlite3 *db, const void *zSql, int nByte, unsigned int prepFlags,
+                         sqlite3_stmt **ppStmt, const void **pzTail);
+int sqlite3_complete16(const void *zSql);
 int sqlite3_bind_text16(sqlite3_stmt *stmt, int idx, const void *text, int nByte, void(*d)(void*));
 const void *sqlite3_column_text16(sqlite3_stmt *stmt, int col);
 int sqlite3_column_bytes16(sqlite3_stmt *stmt, int col);
@@ -227,6 +234,16 @@ int sqlite3_blob_close(sqlite3_blob *blob);
 
 int sqlite3_complete(const char *sql);
 int sqlite3_stmt_readonly(sqlite3_stmt *stmt);
+
+/* Convenience wrapper: run SQL and return the whole result as a flat char** */
+int sqlite3_get_table(sqlite3 *db, const char *zSql, char ***pazResult,
+                      int *pnRow, int *pnColumn, char **pzErrMsg);
+void sqlite3_free_table(char **result);
+
+/* SQL keyword introspection */
+int sqlite3_keyword_count(void);
+int sqlite3_keyword_name(int i, const char **pzName, int *pnName);
+int sqlite3_keyword_check(const char *zName, int nName);
 
 void sqlite3_free(void *p);
 

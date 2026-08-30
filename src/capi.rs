@@ -701,6 +701,21 @@ unsafe fn write_errmsg(errmsg: *mut *mut c_char, msg: &str) {
 
 // --- prepare / step / finalize ------------------------------------------------
 
+/// The legacy `sqlite3_prepare` (v1). The only v1/v2 difference is that a v1
+/// statement does not auto-reprepare on a schema change; this shim's materialized
+/// model never exposes a stale prepared plan, so v1 is a straight synonym of
+/// `sqlite3_prepare_v2`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_prepare(
+    db: *mut sqlite3,
+    sql: *const c_char,
+    n_byte: c_int,
+    pp_stmt: *mut *mut sqlite3_stmt,
+    pz_tail: *mut *const c_char,
+) -> c_int {
+    unsafe { sqlite3_prepare_v2(db, sql, n_byte, pp_stmt, pz_tail) }
+}
+
 /// Like `sqlite3_prepare_v2` with a `prepFlags` argument; the flags (persistent,
 /// no-vtab, normalize) don't affect this shim's materialized model, so it simply
 /// delegates.
@@ -1748,6 +1763,33 @@ pub unsafe extern "C" fn sqlite3_prepare16_v2(
     unsafe { sqlite3_prepare_v2(db, c.as_ptr(), -1, pp_stmt, core::ptr::null_mut()) }
 }
 
+/// The legacy `sqlite3_prepare16` (v1); like `sqlite3_prepare16_v2` but with the
+/// v1 no-reprepare semantics, which this shim does not distinguish. Delegates.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_prepare16(
+    db: *mut sqlite3,
+    sql: *const c_void,
+    n_byte: c_int,
+    pp_stmt: *mut *mut sqlite3_stmt,
+    pz_tail: *mut *const c_void,
+) -> c_int {
+    unsafe { sqlite3_prepare16_v2(db, sql, n_byte, pp_stmt, pz_tail) }
+}
+
+/// `sqlite3_prepare16_v3`: `sqlite3_prepare16_v2` plus a `prepFlags` argument. The
+/// flags don't affect this shim's materialized model, so it delegates.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_prepare16_v3(
+    db: *mut sqlite3,
+    sql: *const c_void,
+    n_byte: c_int,
+    _prep_flags: core::ffi::c_uint,
+    pp_stmt: *mut *mut sqlite3_stmt,
+    pz_tail: *mut *const c_void,
+) -> c_int {
+    unsafe { sqlite3_prepare16_v2(db, sql, n_byte, pp_stmt, pz_tail) }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sqlite3_bind_text16(
     stmt: *mut sqlite3_stmt,
@@ -2302,6 +2344,375 @@ pub unsafe extern "C" fn sqlite3_free(p: *mut c_void) {
     }
 }
 
+// --- sqlite3_get_table / sqlite3_free_table -----------------------------------
+//
+// A faithful port of `src/table.c`. The result is a single flat `char**` block:
+//
+//   [ hidden count | col0name … col(nCol-1)name | cell(0,0) … cell(nRow-1,nCol-1) ]
+//
+// `*pazResult` points at the FIRST NAME (i.e. one past the hidden count slot), so
+// its usable length is `nColumn * (nRow + 1)`. A SQL NULL cell is a NULL `char*`
+// (not the string "NULL"). The names are learned only from the first result row
+// that ever arrives, so a query returning **zero rows yields nRow=0 AND nColumn=0**
+// (verified against the 3.50.4 oracle). Two row-producing statements with
+// different column counts abort with SQLITE_ERROR and the classic message.
+//
+// Allocation scheme (see also `sqlite3_free_table`): the block is a
+// `Box<[*mut c_char]>` of length `nData == 1 + nColumn*(nRow+1)`. Slot 0 stores
+// `nData` itself (as a pointer), exactly like SQLite's `azResult[-1]`; the
+// remaining slots hold each cell string via `CString::into_raw` (so an individual
+// cell is also freeable by this shim's `sqlite3_free`), or NULL. We hand the
+// caller `block.add(1)`. `sqlite3_free_table` recovers the block by stepping back
+// one slot, reads `nData` = the block length, frees each non-NULL cell string,
+// then reconstructs and drops the boxed slice — so get_table and free_table are
+// the only two routines that know this layout, and they agree.
+
+/// `sqlite3_get_table`: run `zSql` (all `;`-separated statements) and marshal the
+/// result rows into one flat `char**` array. See the module note above for the
+/// layout and the zero-rows / incompatible-queries quirks.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_get_table(
+    db: *mut sqlite3,
+    z_sql: *const c_char,
+    paz_result: *mut *mut *mut c_char,
+    pn_row: *mut c_int,
+    pn_column: *mut c_int,
+    pz_errmsg: *mut *mut c_char,
+) -> c_int {
+    if db.is_null() || paz_result.is_null() {
+        return SQLITE_ERROR;
+    }
+    unsafe {
+        *paz_result = core::ptr::null_mut();
+        if !pn_column.is_null() {
+            *pn_column = 0;
+        }
+        if !pn_row.is_null() {
+            *pn_row = 0;
+        }
+        if !pz_errmsg.is_null() {
+            *pz_errmsg = core::ptr::null_mut();
+        }
+    }
+    let db = unsafe { &mut *db };
+    db.clear_error();
+    let sql = unsafe { cstr(z_sql) };
+
+    // Owned accumulator (flat, row-major): column names first, then one entry per
+    // cell. `None` marks a SQL NULL cell. Kept in Rust ownership so that on an
+    // error we simply drop it — no manual freeing, no leak.
+    let mut cells: Vec<Option<Vec<u8>>> = Vec::new();
+    let mut n_col: usize = 0;
+    let mut n_row: usize = 0;
+
+    for stmt in split_statements(sql) {
+        let stmt = stmt.trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        let is_reader = is_row_producer(stmt);
+        let outcome = if is_reader {
+            db.conn.query(stmt).map(Some)
+        } else if has_returning(stmt) {
+            db.conn
+                .execute_returning(stmt, &Params::default())
+                .map(Some)
+        } else {
+            db.conn.execute(stmt).map(|n| {
+                db.changes = n as c_int;
+                None
+            })
+        };
+        match outcome {
+            Ok(maybe_qr) => {
+                db.last_insert_rowid = db.conn.last_insert_rowid();
+                if let Some(qr) = maybe_qr {
+                    let this_cols = qr.columns.len();
+                    for row in &qr.rows {
+                        if n_row == 0 {
+                            // First result row overall: learn the columns + emit names.
+                            n_col = this_cols;
+                            for c in &qr.columns {
+                                cells.push(Some(c.as_str().as_bytes().to_vec()));
+                            }
+                        } else if this_cols != n_col {
+                            let msg =
+                                "sqlite3_get_table() called with two or more incompatible queries";
+                            db.set_error(SQLITE_ERROR, msg);
+                            unsafe { write_errmsg(pz_errmsg, msg) };
+                            return SQLITE_ERROR;
+                        }
+                        for v in row {
+                            cells.push(value_to_text(v));
+                        }
+                        n_row += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                db.set_error(SQLITE_ERROR, &msg);
+                unsafe { write_errmsg(pz_errmsg, &msg) };
+                return SQLITE_ERROR;
+            }
+        }
+    }
+
+    // Materialize the flat block: slot 0 = nData, then every cell as a raw
+    // CString (NULL cell → NULL pointer).
+    let n_data = 1 + cells.len(); // cells.len() == n_col*(n_row+1)
+    let mut block: Vec<*mut c_char> = Vec::with_capacity(n_data);
+    block.push(n_data as *mut c_char);
+    for c in cells {
+        match c {
+            Some(bytes) => block.push(CString::new(bytes).unwrap_or_default().into_raw()),
+            None => block.push(core::ptr::null_mut()),
+        }
+    }
+    let boxed: Box<[*mut c_char]> = block.into_boxed_slice();
+    let base = Box::into_raw(boxed) as *mut *mut c_char;
+    unsafe {
+        *paz_result = base.add(1);
+        if !pn_column.is_null() {
+            *pn_column = n_col as c_int;
+        }
+        if !pn_row.is_null() {
+            *pn_row = n_row as c_int;
+        }
+    }
+    SQLITE_OK
+}
+
+/// `sqlite3_free_table`: release a block returned by [`sqlite3_get_table`]. See
+/// the module note above for the layout this reverses.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_free_table(az_result: *mut *mut c_char) {
+    if az_result.is_null() {
+        return;
+    }
+    // Step back to slot 0 (the hidden count); it holds nData == the block length.
+    let base = unsafe { az_result.offset(-1) };
+    let n_data = unsafe { *base } as usize;
+    for i in 1..n_data {
+        let cell = unsafe { *base.add(i) };
+        if !cell.is_null() {
+            drop(unsafe { CString::from_raw(cell) });
+        }
+    }
+    let slice = core::ptr::slice_from_raw_parts_mut(base, n_data);
+    drop(unsafe { Box::from_raw(slice) });
+}
+
+// --- SQL keyword introspection ------------------------------------------------
+//
+// The exact keyword set and the exact order `sqlite3_keyword_name(i)` returns
+// were extracted from the real libsqlite3 3.50.4 (a throwaway program linking
+// `-lsqlite3` that printed `sqlite3_keyword_count()` and every
+// `sqlite3_keyword_name(i)`), then hardcoded verbatim below. The C test
+// cross-checks a sample against the oracle.
+
+/// SQLite's SQL keywords, in `sqlite3_keyword_name` index order (3.50.4).
+static SQL_KEYWORDS: [&CStr; 147] = [
+    c"REINDEX",
+    c"INDEXED",
+    c"INDEX",
+    c"DESC",
+    c"ESCAPE",
+    c"EACH",
+    c"CHECK",
+    c"KEY",
+    c"BEFORE",
+    c"FOREIGN",
+    c"FOR",
+    c"IGNORE",
+    c"REGEXP",
+    c"EXPLAIN",
+    c"INSTEAD",
+    c"ADD",
+    c"DATABASE",
+    c"AS",
+    c"SELECT",
+    c"TABLE",
+    c"LEFT",
+    c"THEN",
+    c"END",
+    c"DEFERRABLE",
+    c"ELSE",
+    c"EXCLUDE",
+    c"DELETE",
+    c"TEMPORARY",
+    c"TEMP",
+    c"OR",
+    c"ISNULL",
+    c"NULLS",
+    c"SAVEPOINT",
+    c"INTERSECT",
+    c"TIES",
+    c"NOTNULL",
+    c"NOT",
+    c"NO",
+    c"NULL",
+    c"LIKE",
+    c"EXCEPT",
+    c"TRANSACTION",
+    c"ACTION",
+    c"ON",
+    c"NATURAL",
+    c"ALTER",
+    c"RAISE",
+    c"EXCLUSIVE",
+    c"EXISTS",
+    c"CONSTRAINT",
+    c"INTO",
+    c"OFFSET",
+    c"OF",
+    c"SET",
+    c"TRIGGER",
+    c"RANGE",
+    c"GENERATED",
+    c"DETACH",
+    c"HAVING",
+    c"GLOB",
+    c"BEGIN",
+    c"INNER",
+    c"REFERENCES",
+    c"UNIQUE",
+    c"QUERY",
+    c"WITHOUT",
+    c"WITH",
+    c"OUTER",
+    c"RELEASE",
+    c"ATTACH",
+    c"BETWEEN",
+    c"NOTHING",
+    c"GROUPS",
+    c"GROUP",
+    c"CASCADE",
+    c"ASC",
+    c"DEFAULT",
+    c"CASE",
+    c"COLLATE",
+    c"CREATE",
+    c"CURRENT_DATE",
+    c"IMMEDIATE",
+    c"JOIN",
+    c"INSERT",
+    c"MATCH",
+    c"PLAN",
+    c"ANALYZE",
+    c"PRAGMA",
+    c"MATERIALIZED",
+    c"DEFERRED",
+    c"DISTINCT",
+    c"IS",
+    c"UPDATE",
+    c"VALUES",
+    c"VIRTUAL",
+    c"ALWAYS",
+    c"WHEN",
+    c"WHERE",
+    c"RECURSIVE",
+    c"ABORT",
+    c"AFTER",
+    c"RENAME",
+    c"AND",
+    c"DROP",
+    c"PARTITION",
+    c"AUTOINCREMENT",
+    c"TO",
+    c"IN",
+    c"CAST",
+    c"COLUMN",
+    c"COMMIT",
+    c"CONFLICT",
+    c"CROSS",
+    c"CURRENT_TIMESTAMP",
+    c"CURRENT_TIME",
+    c"CURRENT",
+    c"PRECEDING",
+    c"FAIL",
+    c"LAST",
+    c"FILTER",
+    c"REPLACE",
+    c"FIRST",
+    c"FOLLOWING",
+    c"FROM",
+    c"FULL",
+    c"LIMIT",
+    c"IF",
+    c"ORDER",
+    c"RESTRICT",
+    c"OTHERS",
+    c"OVER",
+    c"RETURNING",
+    c"RIGHT",
+    c"ROLLBACK",
+    c"ROWS",
+    c"ROW",
+    c"UNBOUNDED",
+    c"UNION",
+    c"USING",
+    c"VACUUM",
+    c"VIEW",
+    c"WINDOW",
+    c"DO",
+    c"BY",
+    c"INITIALLY",
+    c"ALL",
+    c"PRIMARY",
+];
+
+/// `sqlite3_keyword_count`: the number of SQL keywords known to the parser.
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_keyword_count() -> c_int {
+    SQL_KEYWORDS.len() as c_int
+}
+
+/// `sqlite3_keyword_name`: for a valid index `i` in `[0, keyword_count)`, write the
+/// keyword's (upper-case) name pointer and byte length and return `SQLITE_OK`;
+/// otherwise return `SQLITE_ERROR`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_keyword_name(
+    i: c_int,
+    pz_name: *mut *const c_char,
+    pn_name: *mut c_int,
+) -> c_int {
+    if i < 0 || (i as usize) >= SQL_KEYWORDS.len() {
+        return SQLITE_ERROR;
+    }
+    let kw = SQL_KEYWORDS[i as usize];
+    unsafe {
+        if !pz_name.is_null() {
+            *pz_name = kw.as_ptr();
+        }
+        if !pn_name.is_null() {
+            *pn_name = kw.to_bytes().len() as c_int;
+        }
+    }
+    SQLITE_OK
+}
+
+/// `sqlite3_keyword_check`: return 1 if the `n_name`-byte name is a SQL keyword
+/// (case-insensitive, ASCII), else 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_keyword_check(z_name: *const c_char, n_name: c_int) -> c_int {
+    if z_name.is_null() || n_name < 0 {
+        return 0;
+    }
+    let name = unsafe { core::slice::from_raw_parts(z_name as *const u8, n_name as usize) };
+    for kw in SQL_KEYWORDS {
+        let k = kw.to_bytes();
+        if k.len() == name.len()
+            && k.iter()
+                .zip(name)
+                .all(|(a, b)| upper_to_lower(*a) == upper_to_lower(*b))
+        {
+            return 1;
+        }
+    }
+    0
+}
+
 // --- statement splitting ------------------------------------------------------
 
 /// Return `(first_statement, byte_offset_of_tail)` — the first `;`-terminated
@@ -2417,6 +2828,15 @@ pub unsafe extern "C" fn sqlite3_complete(sql: *const c_char) -> c_int {
         rest = &rest[end..];
     }
     (saw_semi && strip_ws_comments(rest).is_empty()) as c_int
+}
+
+/// `sqlite3_complete16`: the UTF-16 form of [`sqlite3_complete`]. Decodes the
+/// native-endian, NUL-terminated UTF-16 buffer to UTF-8 and delegates.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_complete16(sql: *const c_void) -> c_int {
+    let s = unsafe { utf16_to_string(sql, -1) };
+    let c = CString::new(s).unwrap_or_default();
+    unsafe { sqlite3_complete(c.as_ptr()) }
 }
 
 /// `sqlite3_stmt_readonly`: true if the statement makes no direct changes to the
