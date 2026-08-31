@@ -53,6 +53,14 @@ const CAPI_MAX_BLOB_LEN: c_longlong = 1_000_000_000;
 pub const SQLITE_ROW: c_int = 100;
 pub const SQLITE_DONE: c_int = 101;
 
+/// `sqlite3_open_v2` flag: open the database read-only.
+pub const SQLITE_OPEN_READONLY: c_int = 0x0000_0001;
+
+// Transaction states (`sqlite3_txn_state`).
+pub const SQLITE_TXN_NONE: c_int = 0;
+pub const SQLITE_TXN_READ: c_int = 1;
+pub const SQLITE_TXN_WRITE: c_int = 2;
+
 // --- Fundamental datatypes ----------------------------------------------------
 pub const SQLITE_INTEGER: c_int = 1;
 pub const SQLITE_FLOAT: c_int = 2;
@@ -86,6 +94,16 @@ pub struct sqlite3 {
     /// Byte offset of the most recent error's offending token in the SQL, or -1
     /// when unknown — surfaced by `sqlite3_error_offset`.
     error_offset: c_int,
+    /// The filename this connection was opened with, NUL-terminated and stable for
+    /// the connection's lifetime — surfaced by `sqlite3_db_filename` for the `main`
+    /// schema. Empty for a temp/in-memory database.
+    filename: CString,
+    /// True if the connection was opened with `SQLITE_OPEN_READONLY` — surfaced by
+    /// `sqlite3_db_readonly`.
+    readonly: bool,
+    /// Raw pointers to the connection's live prepared statements, in creation
+    /// order — pushed on prepare, removed on finalize. Powers `sqlite3_next_stmt`.
+    stmts: Vec<*mut sqlite3_stmt>,
 }
 
 impl sqlite3 {
@@ -134,6 +152,10 @@ pub struct sqlite3_stmt {
     blob_scratch: Vec<Option<Vec<u8>>>,
     /// Same, for `column_text16` (UTF-16, NUL-terminated).
     text16_scratch: Vec<Option<Vec<u16>>>,
+    /// Backing storage for `sqlite3_column_value`: a heap `sqlite3_value` per
+    /// column, owned by the statement and valid until the next
+    /// `step`/`reset`/`finalize` (cleared alongside the text/blob scratch).
+    value_scratch: Vec<Option<Box<sqlite3_value>>>,
 }
 
 impl sqlite3_stmt {
@@ -145,6 +167,7 @@ impl sqlite3_stmt {
         self.text_scratch.clear();
         self.blob_scratch.clear();
         self.text16_scratch.clear();
+        self.value_scratch.clear();
     }
 }
 
@@ -403,13 +426,21 @@ pub unsafe extern "C" fn sqlite3_open(filename: *const c_char, pp_db: *mut *mut 
 pub unsafe extern "C" fn sqlite3_open_v2(
     filename: *const c_char,
     pp_db: *mut *mut sqlite3,
-    _flags: c_int,
+    flags: c_int,
     _vfs: *const c_char,
 ) -> c_int {
     if pp_db.is_null() {
         return SQLITE_ERROR;
     }
     let path = unsafe { cstr(filename) };
+    // `sqlite3_db_filename` reports "" for a temp/in-memory database, else the path.
+    let stored_name = if path.is_empty() || path == ":memory:" {
+        String::new()
+    } else {
+        path.to_string()
+    };
+    let fname = CString::new(stored_name).unwrap_or_default();
+    let readonly = flags & SQLITE_OPEN_READONLY != 0;
     match open_connection(path) {
         Ok(conn) => {
             let db = Box::new(sqlite3 {
@@ -420,6 +451,9 @@ pub unsafe extern "C" fn sqlite3_open_v2(
                 changes: 0,
                 last_insert_rowid: 0,
                 error_offset: -1,
+                filename: fname,
+                readonly,
+                stmts: Vec::new(),
             });
             unsafe { *pp_db = Box::into_raw(db) };
             SQLITE_OK
@@ -434,6 +468,9 @@ pub unsafe extern "C" fn sqlite3_open_v2(
                 changes: 0,
                 last_insert_rowid: 0,
                 error_offset: -1,
+                filename: fname,
+                readonly,
+                stmts: Vec::new(),
             });
             db.set_error(SQLITE_ERROR, &msg);
             unsafe { *pp_db = Box::into_raw(db) };
@@ -780,8 +817,12 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
         text_scratch: Vec::new(),
         blob_scratch: Vec::new(),
         text16_scratch: Vec::new(),
+        value_scratch: Vec::new(),
     });
-    unsafe { *pp_stmt = Box::into_raw(stmt) };
+    let raw = Box::into_raw(stmt);
+    // Track the live statement for `sqlite3_next_stmt`.
+    db_ref.stmts.push(raw);
+    unsafe { *pp_stmt = raw };
     SQLITE_OK
 }
 
@@ -850,9 +891,10 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> c_int {
         Some(qr) if stmt.next < qr.rows.len() => {
             stmt.cur = Some(stmt.next);
             stmt.next += 1;
-            // Invalidate the previous row's text/blob scratch.
+            // Invalidate the previous row's text/blob/value scratch.
             stmt.text_scratch.clear();
             stmt.blob_scratch.clear();
+            stmt.value_scratch.clear();
             SQLITE_ROW
         }
         // Exhausted row-producer, or a mutation (result stays None) — done.
@@ -881,6 +923,12 @@ pub unsafe extern "C" fn sqlite3_clear_bindings(stmt: *mut sqlite3_stmt) -> c_in
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> c_int {
     if !stmt.is_null() {
+        // De-register from the owning connection's live-statement list first, so a
+        // later `sqlite3_next_stmt` never hands back this dangling pointer.
+        let db = unsafe { &*stmt }.db;
+        if let Some(db) = unsafe { db.as_mut() } {
+            db.stmts.retain(|&p| p != stmt);
+        }
         drop(unsafe { Box::from_raw(stmt) });
     }
     SQLITE_OK
@@ -3128,4 +3176,474 @@ fn clamp_len_i64(n: c_ulonglong) -> c_int {
     } else {
         n as c_int
     }
+}
+
+// --- introspection: expanded_sql / stmt_isexplain / next_stmt -----------------
+
+/// Render a bound value as the SQL literal `sqlite3_expanded_sql` substitutes:
+/// an integer verbatim, a real via graphite's round-trip formatting, text
+/// single-quoted with `''` escaping, a blob as lowercase `x'..'`, and NULL as the
+/// bare word `NULL` — matching SQLite's `sqlite3VdbeExpandSql`.
+fn expand_literal(v: &Value) -> String {
+    match v {
+        Value::Null => String::from("NULL"),
+        Value::Integer(i) => format!("{i}"),
+        Value::Real(r) => crate::exec::eval::format_real(*r),
+        Value::Text(s) => {
+            // SQLite reads the text as a C string, so an embedded NUL truncates.
+            let s = s.split('\0').next().unwrap_or("");
+            format!("'{}'", s.replace('\'', "''"))
+        }
+        Value::Blob(b) => {
+            let mut out = String::with_capacity(b.len() * 2 + 3);
+            out.push_str("x'");
+            for byte in b {
+                out.push_str(&format!("{byte:02x}"));
+            }
+            out.push('\'');
+            out
+        }
+    }
+}
+
+/// The value bound to SQLite parameter `idx` (1-based) of `stmt`, or NULL when the
+/// index is unknown or the parameter is unbound.
+fn bound_value(stmt: &sqlite3_stmt, idx: usize) -> Value {
+    match stmt.param_names.get(idx - 1) {
+        Some(Some(name)) => stmt
+            .params
+            .named
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or(Value::Null),
+        Some(None) => stmt
+            .params
+            .positional
+            .get(idx - 1)
+            .cloned()
+            .unwrap_or(Value::Null),
+        None => Value::Null,
+    }
+}
+
+/// `sqlite3_expanded_sql`: the statement's SQL with every bound parameter replaced
+/// by its value as a SQL literal (an unbound parameter becomes `NULL`). Returns a
+/// heap C string the caller releases with `sqlite3_free`. The tokenizer mirrors
+/// `scan_params` so the parameter numbering matches exactly.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_expanded_sql(stmt: *mut sqlite3_stmt) -> *mut c_char {
+    if stmt.is_null() {
+        return core::ptr::null_mut();
+    }
+    let stmt = unsafe { &*stmt };
+    let sql = stmt.sql.as_str();
+    let b = sql.as_bytes();
+    let mut i = 0usize;
+    let mut last = 0usize;
+    let mut next_auto = 1usize;
+    // Mirror of `scan_params`' slot table so numbering stays identical.
+    let mut slots: Vec<Option<String>> = Vec::new();
+    let ensure = |slots: &mut Vec<Option<String>>, num: usize| {
+        if num > slots.len() {
+            slots.resize(num, None);
+        }
+    };
+    let mut out = String::with_capacity(sql.len());
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == q {
+                        if i + 1 < b.len() && b[i + 1] == q {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b'?' => {
+                let tok_start = i;
+                i += 1;
+                let start = i;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let idx = if i > start {
+                    match sql[start..i].parse::<usize>() {
+                        Ok(num) if num > 0 => {
+                            ensure(&mut slots, num);
+                            next_auto = next_auto.max(num + 1);
+                            num
+                        }
+                        _ => continue,
+                    }
+                } else {
+                    ensure(&mut slots, next_auto);
+                    let n = next_auto;
+                    next_auto += 1;
+                    n
+                };
+                out.push_str(&sql[last..tok_start]);
+                out.push_str(&expand_literal(&bound_value(stmt, idx)));
+                last = i;
+            }
+            b':' | b'@' | b'$' => {
+                let tok_start = i;
+                i += 1;
+                let nstart = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                if i > nstart {
+                    let name = &sql[tok_start..i];
+                    let idx =
+                        if let Some(pos) = slots.iter().position(|s| s.as_deref() == Some(name)) {
+                            pos + 1
+                        } else {
+                            ensure(&mut slots, next_auto);
+                            slots[next_auto - 1] = Some(name.to_string());
+                            let n = next_auto;
+                            next_auto += 1;
+                            n
+                        };
+                    out.push_str(&sql[last..tok_start]);
+                    out.push_str(&expand_literal(&bound_value(stmt, idx)));
+                    last = i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    out.push_str(&sql[last..]);
+    CString::new(out).unwrap_or_default().into_raw()
+}
+
+/// Case-insensitive check that `s` begins with the ASCII keyword `kw` on a word
+/// boundary (the following byte, if any, is not alphanumeric or `_`).
+fn starts_with_kw(s: &str, kw: &str) -> bool {
+    let sb = s.as_bytes();
+    let kb = kw.as_bytes();
+    if sb.len() < kb.len() {
+        return false;
+    }
+    if !sb[..kb.len()]
+        .iter()
+        .zip(kb)
+        .all(|(a, b)| upper_to_lower(*a) == upper_to_lower(*b))
+    {
+        return false;
+    }
+    match sb.get(kb.len()) {
+        Some(c) => !(c.is_ascii_alphanumeric() || *c == b'_'),
+        None => true,
+    }
+}
+
+/// `sqlite3_stmt_isexplain`: 2 for an `EXPLAIN QUERY PLAN`, 1 for a plain
+/// `EXPLAIN`, else 0. Decided from the statement text (leading keyword past any
+/// whitespace/comments, case-insensitive).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_stmt_isexplain(stmt: *mut sqlite3_stmt) -> c_int {
+    if stmt.is_null() {
+        return 0;
+    }
+    let s = strip_ws_comments(&unsafe { &*stmt }.sql);
+    if !starts_with_kw(s, "EXPLAIN") {
+        return 0;
+    }
+    let rest = strip_ws_comments(&s[7..]);
+    if starts_with_kw(rest, "QUERY") {
+        let rest2 = strip_ws_comments(&rest[5..]);
+        if starts_with_kw(rest2, "PLAN") {
+            return 2;
+        }
+    }
+    1
+}
+
+/// `sqlite3_next_stmt`: iterate the connection's live prepared statements. With a
+/// NULL `p_stmt` returns the first; otherwise the one after `p_stmt`; NULL at the
+/// end (or if `p_stmt` is not one of `db`'s statements).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_next_stmt(
+    db: *mut sqlite3,
+    p_stmt: *mut sqlite3_stmt,
+) -> *mut sqlite3_stmt {
+    if db.is_null() {
+        return core::ptr::null_mut();
+    }
+    let db = unsafe { &*db };
+    if p_stmt.is_null() {
+        return db.stmts.first().copied().unwrap_or(core::ptr::null_mut());
+    }
+    match db.stmts.iter().position(|&p| p == p_stmt) {
+        Some(i) => db
+            .stmts
+            .get(i + 1)
+            .copied()
+            .unwrap_or(core::ptr::null_mut()),
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// `sqlite3_db_filename`: the filename of database `z_db_name` (`main` etc.),
+/// `""` for a temp/in-memory database, or NULL for an unknown schema name. The
+/// returned pointer is stable for the connection's lifetime.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_db_filename(
+    db: *mut sqlite3,
+    z_db_name: *const c_char,
+) -> *const c_char {
+    if db.is_null() {
+        return core::ptr::null();
+    }
+    let db = unsafe { &*db };
+    // Only the `main` (and its alias, the NULL name) schema is tracked here.
+    let name = unsafe { cstr(z_db_name) };
+    if z_db_name.is_null() || name.eq_ignore_ascii_case("main") {
+        db.filename.as_ptr()
+    } else {
+        core::ptr::null()
+    }
+}
+
+/// `sqlite3_db_readonly`: 1 if database `z_db_name` is read-only, 0 if
+/// read-write, -1 if it is not an attached database. Only `main` is tracked; the
+/// read-only bit is captured from `sqlite3_open_v2`'s flags.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_db_readonly(db: *mut sqlite3, z_db_name: *const c_char) -> c_int {
+    if db.is_null() {
+        return -1;
+    }
+    let db = unsafe { &*db };
+    let name = unsafe { cstr(z_db_name) };
+    if z_db_name.is_null() || name.eq_ignore_ascii_case("main") {
+        db.readonly as c_int
+    } else {
+        -1
+    }
+}
+
+/// `sqlite3_txn_state`: the transaction state of schema `z_schema` (or the whole
+/// connection when NULL). Approximated from autocommit mode: `SQLITE_TXN_NONE` in
+/// autocommit, else `SQLITE_TXN_WRITE` (this shim does not distinguish a
+/// read-only open transaction from a writing one, so an in-transaction connection
+/// is always reported as WRITE).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_txn_state(db: *mut sqlite3, _z_schema: *const c_char) -> c_int {
+    if db.is_null() {
+        return -1;
+    }
+    if unsafe { &*db }.conn.is_autocommit() {
+        SQLITE_TXN_NONE
+    } else {
+        SQLITE_TXN_WRITE
+    }
+}
+
+// --- sqlite3_value / bind / result extras -------------------------------------
+
+/// `sqlite3_column_value`: a protected `sqlite3_value*` for result column `col`,
+/// owned by the statement and valid until the next `step`/`reset`/`finalize`.
+/// NULL when no row is current or the column is out of range.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_column_value(
+    stmt: *mut sqlite3_stmt,
+    col: c_int,
+) -> *mut sqlite3_value {
+    if stmt.is_null() || col < 0 {
+        return core::ptr::null_mut();
+    }
+    let stmt = unsafe { &mut *stmt };
+    let v = match stmt_cell(stmt, col) {
+        Some(v) => v.clone(),
+        None => return core::ptr::null_mut(),
+    };
+    let idx = col as usize;
+    if stmt.value_scratch.len() <= idx {
+        stmt.value_scratch.resize_with(idx + 1, || None);
+    }
+    // Own it in the per-column scratch (a `Box` keeps a stable address across any
+    // Vec growth); hand back a pointer into that heap allocation.
+    stmt.value_scratch[idx] = Some(Box::new(sqlite3_value { v, scratch: None }));
+    stmt.value_scratch[idx]
+        .as_deref_mut()
+        .map(|b| b as *mut sqlite3_value)
+        .unwrap_or(core::ptr::null_mut())
+}
+
+/// `sqlite3_bind_value`: bind parameter `idx` from a `sqlite3_value` (its inner
+/// value is cloned).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_bind_value(
+    stmt: *mut sqlite3_stmt,
+    idx: c_int,
+    val: *const sqlite3_value,
+) -> c_int {
+    if stmt.is_null() {
+        return SQLITE_ERROR;
+    }
+    let v = match unsafe { val.as_ref() } {
+        Some(v) => v.v.clone(),
+        None => Value::Null,
+    };
+    bind_at(unsafe { &mut *stmt }, idx, v)
+}
+
+/// `sqlite3_value_dup`: a heap copy of `val` the caller releases with
+/// [`sqlite3_value_free`]. NULL argument → NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_value_dup(val: *const sqlite3_value) -> *mut sqlite3_value {
+    match unsafe { val.as_ref() } {
+        Some(v) => Box::into_raw(Box::new(sqlite3_value {
+            v: v.v.clone(),
+            scratch: None,
+        })),
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// `sqlite3_value_free`: release a value returned by [`sqlite3_value_dup`]. NULL is
+/// a no-op.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_value_free(val: *mut sqlite3_value) {
+    if !val.is_null() {
+        drop(unsafe { Box::from_raw(val) });
+    }
+}
+
+/// `sqlite3_result_value`: set the function result from a `sqlite3_value` (its
+/// inner value is cloned).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_result_value(
+    ctx: *mut sqlite3_context,
+    val: *const sqlite3_value,
+) {
+    if let Some(c) = unsafe { ctx.as_mut() } {
+        c.result = match unsafe { val.as_ref() } {
+            Some(v) => v.v.clone(),
+            None => Value::Null,
+        };
+    }
+}
+
+// --- limits / memory / mutex (no-op or trivially-correct stubs) ----------------
+
+// `sqlite3_limit` category ids (subset of sqlite3.h) and their SQLite defaults.
+const SQLITE_LIMIT_LENGTH: c_int = 0;
+const SQLITE_LIMIT_SQL_LENGTH: c_int = 1;
+const SQLITE_LIMIT_COLUMN: c_int = 2;
+const SQLITE_LIMIT_EXPR_DEPTH: c_int = 3;
+const SQLITE_LIMIT_COMPOUND_SELECT: c_int = 4;
+const SQLITE_LIMIT_VDBE_OP: c_int = 5;
+const SQLITE_LIMIT_FUNCTION_ARG: c_int = 6;
+const SQLITE_LIMIT_ATTACHED: c_int = 7;
+const SQLITE_LIMIT_LIKE_PATTERN_LENGTH: c_int = 8;
+const SQLITE_LIMIT_VARIABLE_NUMBER: c_int = 9;
+const SQLITE_LIMIT_TRIGGER_DEPTH: c_int = 10;
+const SQLITE_LIMIT_WORKER_THREADS: c_int = 11;
+
+/// The compile-time default for a `sqlite3_limit` category (from SQLite 3.50.4's
+/// default `SQLITE_MAX_*`), or -1 for an unknown id.
+fn limit_default(id: c_int) -> c_int {
+    match id {
+        SQLITE_LIMIT_LENGTH => 1_000_000_000,
+        SQLITE_LIMIT_SQL_LENGTH => 1_000_000_000,
+        SQLITE_LIMIT_COLUMN => 2000,
+        SQLITE_LIMIT_EXPR_DEPTH => 1000,
+        SQLITE_LIMIT_COMPOUND_SELECT => 500,
+        SQLITE_LIMIT_VDBE_OP => 250_000_000,
+        SQLITE_LIMIT_FUNCTION_ARG => 127,
+        SQLITE_LIMIT_ATTACHED => 10,
+        SQLITE_LIMIT_LIKE_PATTERN_LENGTH => 50000,
+        SQLITE_LIMIT_VARIABLE_NUMBER => 32766,
+        SQLITE_LIMIT_TRIGGER_DEPTH => 1000,
+        SQLITE_LIMIT_WORKER_THREADS => 0,
+        _ => -1,
+    }
+}
+
+/// `sqlite3_limit`: report the current value of run-time limit `id`. This shim does
+/// not enforce limits, so the value is always the SQLite compile-time default and
+/// `new_val` is ignored (the call still returns the prior — i.e. default — value,
+/// as SQLite does). An unknown id returns -1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite3_limit(_db: *mut sqlite3, id: c_int, _new_val: c_int) -> c_int {
+    limit_default(id)
+}
+
+/// `sqlite3_soft_heap_limit64`: this shim tracks no allocations and enforces no
+/// heap limit, so it always reports the prior limit as 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_soft_heap_limit64(_n: c_longlong) -> c_longlong {
+    0
+}
+
+/// `sqlite3_hard_heap_limit64`: as [`sqlite3_soft_heap_limit64`], always 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_hard_heap_limit64(_n: c_longlong) -> c_longlong {
+    0
+}
+
+/// `sqlite3_memory_used`: this shim does not track its allocations, so it reports
+/// 0 bytes outstanding.
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_memory_used() -> c_longlong {
+    0
+}
+
+/// `sqlite3_memory_highwater`: as [`sqlite3_memory_used`], always 0 (the reset
+/// flag is ignored).
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_memory_highwater(_reset_flag: c_int) -> c_longlong {
+    0
+}
+
+/// An opaque mutex handle. This shim is single-threaded per connection and holds
+/// no real mutex, so the type is zero-sized and the handle is a shared sentinel.
+pub struct sqlite3_mutex {
+    _private: [u8; 0],
+}
+
+/// `sqlite3_mutex_alloc`: return a non-NULL sentinel handle (this shim performs no
+/// real locking, so every id maps to the same dangling sentinel, which the
+/// enter/leave/try/free no-ops accept without dereferencing).
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_mutex_alloc(_id: c_int) -> *mut sqlite3_mutex {
+    core::ptr::NonNull::<sqlite3_mutex>::dangling().as_ptr()
+}
+
+/// `sqlite3_mutex_free`: no-op (the sentinel owns nothing).
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_mutex_free(_m: *mut sqlite3_mutex) {}
+
+/// `sqlite3_mutex_enter`: no-op (single-threaded shim).
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_mutex_enter(_m: *mut sqlite3_mutex) {}
+
+/// `sqlite3_mutex_leave`: no-op (single-threaded shim).
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_mutex_leave(_m: *mut sqlite3_mutex) {}
+
+/// `sqlite3_mutex_try`: always succeeds (`SQLITE_OK`) — the lock is never held.
+#[unsafe(no_mangle)]
+pub extern "C" fn sqlite3_mutex_try(_m: *mut sqlite3_mutex) -> c_int {
+    SQLITE_OK
 }

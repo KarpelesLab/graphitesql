@@ -32,6 +32,28 @@ typedef unsigned long long int sqlite3_uint64;
 /* Text encodings */
 #define SQLITE_UTF8 1
 
+/* sqlite3_open_v2 flags (subset) */
+#define SQLITE_OPEN_READONLY 0x00000001
+
+/* Transaction states (sqlite3_txn_state) */
+#define SQLITE_TXN_NONE  0
+#define SQLITE_TXN_READ  1
+#define SQLITE_TXN_WRITE 2
+
+/* Run-time limit categories (sqlite3_limit) */
+#define SQLITE_LIMIT_LENGTH               0
+#define SQLITE_LIMIT_SQL_LENGTH           1
+#define SQLITE_LIMIT_COLUMN               2
+#define SQLITE_LIMIT_EXPR_DEPTH           3
+#define SQLITE_LIMIT_COMPOUND_SELECT      4
+#define SQLITE_LIMIT_VDBE_OP              5
+#define SQLITE_LIMIT_FUNCTION_ARG         6
+#define SQLITE_LIMIT_ATTACHED             7
+#define SQLITE_LIMIT_LIKE_PATTERN_LENGTH  8
+#define SQLITE_LIMIT_VARIABLE_NUMBER      9
+#define SQLITE_LIMIT_TRIGGER_DEPTH       10
+#define SQLITE_LIMIT_WORKER_THREADS      11
+
 /* bind_text/blob destructor sentinels */
 #define SQLITE_STATIC      ((void(*)(void*))0)
 #define SQLITE_TRANSIENT   ((void(*)(void*))-1)
@@ -234,6 +256,38 @@ int sqlite3_blob_close(sqlite3_blob *blob);
 
 int sqlite3_complete(const char *sql);
 int sqlite3_stmt_readonly(sqlite3_stmt *stmt);
+int sqlite3_stmt_isexplain(sqlite3_stmt *stmt);
+char *sqlite3_expanded_sql(sqlite3_stmt *stmt);
+sqlite3_stmt *sqlite3_next_stmt(sqlite3 *db, sqlite3_stmt *pStmt);
+
+/* Connection introspection */
+const char *sqlite3_db_filename(sqlite3 *db, const char *zDbName);
+int sqlite3_db_readonly(sqlite3 *db, const char *zDbName);
+int sqlite3_txn_state(sqlite3 *db, const char *zSchema);
+
+/* sqlite3_value / bind / result extras */
+sqlite3_value *sqlite3_column_value(sqlite3_stmt *stmt, int col);
+int sqlite3_bind_value(sqlite3_stmt *stmt, int idx, const sqlite3_value *val);
+sqlite3_value *sqlite3_value_dup(const sqlite3_value *val);
+void sqlite3_value_free(sqlite3_value *val);
+void sqlite3_result_value(sqlite3_context *ctx, const sqlite3_value *val);
+
+/* Run-time limits (no enforcement: reports the SQLite default) */
+int sqlite3_limit(sqlite3 *db, int id, int newVal);
+
+/* Heap / memory accounting (this shim tracks none: all report 0) */
+sqlite3_int64 sqlite3_soft_heap_limit64(sqlite3_int64 n);
+sqlite3_int64 sqlite3_hard_heap_limit64(sqlite3_int64 n);
+sqlite3_int64 sqlite3_memory_used(void);
+sqlite3_int64 sqlite3_memory_highwater(int resetFlag);
+
+/* Mutexes (single-threaded shim: no-ops) */
+typedef struct sqlite3_mutex sqlite3_mutex;
+sqlite3_mutex *sqlite3_mutex_alloc(int id);
+void sqlite3_mutex_free(sqlite3_mutex *m);
+void sqlite3_mutex_enter(sqlite3_mutex *m);
+void sqlite3_mutex_leave(sqlite3_mutex *m);
+int sqlite3_mutex_try(sqlite3_mutex *m);
 
 /* Convenience wrapper: run SQL and return the whole result as a flat char** */
 int sqlite3_get_table(sqlite3 *db, const char *zSql, char ***pazResult,

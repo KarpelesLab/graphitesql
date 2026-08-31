@@ -36,6 +36,12 @@ static void zb(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   sqlite3_result_zeroblob(ctx, (int)sqlite3_value_int64(argv[0]));
 }
 
+/* A UDF that echoes its argument back via sqlite3_result_value. */
+static void echo_fn(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+  (void)argc;
+  sqlite3_result_value(ctx, argv[0]);
+}
+
 /* A UDF that concatenates its two text args. */
 static void concat2(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
   (void)argc;
@@ -707,6 +713,158 @@ int main(void) {
     unsigned short c2[] = {'S','E','L','E','C','T',' ','1', 0};
     CHECK("complete16 true", sqlite3_complete16(c1) == 1);
     CHECK("complete16 false", sqlite3_complete16(c2) == 0);
+  }
+
+  /* sqlite3_expanded_sql: bound parameters substituted as SQL literals; an
+     unbound parameter becomes NULL. Cross-checks byte-for-byte vs the oracle. */
+  {
+    sqlite3_stmt *ex = NULL;
+    sqlite3_prepare_v2(db, "SELECT ?1, ?2, ?3, ?4, ?5", -1, &ex, NULL);
+    sqlite3_bind_int64(ex, 1, 42);
+    sqlite3_bind_double(ex, 2, 2.5);
+    sqlite3_bind_text(ex, 3, "O'Reilly", -1, SQLITE_TRANSIENT);
+    unsigned char eb[] = {0x01, 0xff};
+    sqlite3_bind_blob(ex, 4, eb, 2, SQLITE_TRANSIENT);
+    /* ?5 left unbound -> NULL */
+    char *xs = sqlite3_expanded_sql(ex);
+    CHECK("expanded_sql substitutes literals",
+          xs && strcmp(xs, "SELECT 42, 2.5, 'O''Reilly', x'01ff', NULL") == 0);
+    sqlite3_free(xs);
+    sqlite3_finalize(ex);
+  }
+
+  /* Named-parameter expansion (each occurrence substituted). */
+  {
+    sqlite3_stmt *ex = NULL;
+    sqlite3_prepare_v2(db, "SELECT :a, :a, @b", -1, &ex, NULL);
+    sqlite3_bind_int64(ex, sqlite3_bind_parameter_index(ex, ":a"), 7);
+    sqlite3_bind_text(ex, sqlite3_bind_parameter_index(ex, "@b"), "hi", -1, SQLITE_TRANSIENT);
+    char *xs = sqlite3_expanded_sql(ex);
+    CHECK("expanded_sql named params", xs && strcmp(xs, "SELECT 7, 7, 'hi'") == 0);
+    sqlite3_free(xs);
+    sqlite3_finalize(ex);
+  }
+
+  /* sqlite3_stmt_isexplain: 0 / 1 / 2. */
+  {
+    sqlite3_stmt *s0 = NULL, *s1 = NULL, *s2 = NULL;
+    sqlite3_prepare_v2(db, "SELECT 1", -1, &s0, NULL);
+    sqlite3_prepare_v2(db, "EXPLAIN SELECT 1", -1, &s1, NULL);
+    sqlite3_prepare_v2(db, "EXPLAIN QUERY PLAN SELECT 1", -1, &s2, NULL);
+    CHECK("isexplain plain 0", sqlite3_stmt_isexplain(s0) == 0);
+    CHECK("isexplain EXPLAIN 1", sqlite3_stmt_isexplain(s1) == 1);
+    CHECK("isexplain EXPLAIN QUERY PLAN 2", sqlite3_stmt_isexplain(s2) == 2);
+    sqlite3_finalize(s0);
+    sqlite3_finalize(s1);
+    sqlite3_finalize(s2);
+  }
+
+  /* sqlite3_column_value + sqlite3_value_dup/free + sqlite3_bind_value. */
+  {
+    sqlite3_stmt *cv = NULL;
+    sqlite3_prepare_v2(db, "SELECT 42, 'hi'", -1, &cv, NULL);
+    CHECK("column_value step", sqlite3_step(cv) == SQLITE_ROW);
+    sqlite3_value *v0 = sqlite3_column_value(cv, 0);
+    sqlite3_value *v1 = sqlite3_column_value(cv, 1);
+    CHECK("column_value int", v0 && sqlite3_value_int64(v0) == 42);
+    CHECK("column_value text", v1 && strcmp((const char *)sqlite3_value_text(v1), "hi") == 0);
+    CHECK("column_value type", sqlite3_value_type(v0) == SQLITE_INTEGER);
+    /* Dup survives the source statement being finalized. */
+    sqlite3_value *dup = sqlite3_value_dup(v0);
+    CHECK("value_dup non-null", dup != NULL);
+    /* Bind the live column value into a second statement. */
+    sqlite3_stmt *bv = NULL;
+    sqlite3_prepare_v2(db, "SELECT ?1 + 1", -1, &bv, NULL);
+    CHECK("bind_value ok", sqlite3_bind_value(bv, 1, v0) == SQLITE_OK);
+    CHECK("bind_value step", sqlite3_step(bv) == SQLITE_ROW);
+    CHECK("bind_value result", sqlite3_column_int64(bv, 0) == 43);
+    sqlite3_finalize(bv);
+    sqlite3_finalize(cv);
+    CHECK("value_dup usable after source finalize", sqlite3_value_int64(dup) == 42);
+    CHECK("value_dup NULL arg", sqlite3_value_dup(NULL) == NULL);
+    sqlite3_value_free(dup);
+    sqlite3_value_free(NULL); /* no-op */
+  }
+
+  /* sqlite3_result_value: a UDF that echoes its argument. */
+  {
+    sqlite3_create_function(db, "echo", 1, SQLITE_UTF8, NULL, echo_fn, NULL, NULL);
+    sqlite3_stmt *es = NULL;
+    sqlite3_prepare_v2(db, "SELECT echo(123), echo('yo')", -1, &es, NULL);
+    CHECK("result_value step", sqlite3_step(es) == SQLITE_ROW);
+    CHECK("result_value int", sqlite3_column_int64(es, 0) == 123);
+    CHECK("result_value text", strcmp((const char *)sqlite3_column_text(es, 1), "yo") == 0);
+    sqlite3_finalize(es);
+  }
+
+  /* sqlite3_next_stmt / db_filename / db_readonly / txn_state on a fresh conn. */
+  {
+    sqlite3 *ns = NULL;
+    sqlite3_open(":memory:", &ns);
+    CHECK("next_stmt empty conn", sqlite3_next_stmt(ns, NULL) == NULL);
+    sqlite3_stmt *a = NULL, *b = NULL;
+    sqlite3_prepare_v2(ns, "SELECT 1", -1, &a, NULL);
+    sqlite3_prepare_v2(ns, "SELECT 2", -1, &b, NULL);
+    int cnt = 0, saw_a = 0, saw_b = 0;
+    for (sqlite3_stmt *s = sqlite3_next_stmt(ns, NULL); s; s = sqlite3_next_stmt(ns, s)) {
+      cnt++;
+      if (s == a) saw_a = 1;
+      if (s == b) saw_b = 1;
+    }
+    CHECK("next_stmt lists both live stmts", cnt == 2 && saw_a && saw_b);
+    sqlite3_finalize(a);
+    cnt = 0; saw_b = 0;
+    for (sqlite3_stmt *s = sqlite3_next_stmt(ns, NULL); s; s = sqlite3_next_stmt(ns, s)) {
+      cnt++;
+      if (s == b) saw_b = 1;
+    }
+    CHECK("next_stmt after finalize one", cnt == 1 && saw_b);
+    sqlite3_finalize(b);
+    CHECK("next_stmt empty after all finalized", sqlite3_next_stmt(ns, NULL) == NULL);
+
+    /* db_filename: "" for in-memory main; NULL for unknown schema. */
+    CHECK("db_filename main empty (memory)", strcmp(sqlite3_db_filename(ns, "main"), "") == 0);
+    CHECK("db_filename NULL name == main", sqlite3_db_filename(ns, NULL) != NULL);
+    CHECK("db_filename unknown -> NULL", sqlite3_db_filename(ns, "nope") == NULL);
+    /* db_readonly: rw memory db -> 0; unknown schema -> -1. */
+    CHECK("db_readonly main rw", sqlite3_db_readonly(ns, "main") == 0);
+    CHECK("db_readonly unknown -> -1", sqlite3_db_readonly(ns, "nope") == -1);
+    /* txn_state: NONE in autocommit, WRITE inside a writing transaction. */
+    CHECK("txn_state NONE autocommit", sqlite3_txn_state(ns, NULL) == SQLITE_TXN_NONE);
+    sqlite3_exec(ns, "CREATE TABLE tx(x)", NULL, NULL, NULL);
+    sqlite3_exec(ns, "BEGIN", NULL, NULL, NULL);
+    sqlite3_exec(ns, "INSERT INTO tx VALUES(1)", NULL, NULL, NULL);
+    CHECK("txn_state WRITE in transaction", sqlite3_txn_state(ns, NULL) == SQLITE_TXN_WRITE);
+    sqlite3_exec(ns, "ROLLBACK", NULL, NULL, NULL);
+    sqlite3_close(ns);
+  }
+
+  /* sqlite3_limit: reports SQLite defaults; setter is a no-op here. */
+  CHECK("limit LENGTH default", sqlite3_limit(db, SQLITE_LIMIT_LENGTH, -1) == 1000000000);
+  CHECK("limit VARIABLE_NUMBER default", sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1) == 32766);
+  CHECK("limit ATTACHED default", sqlite3_limit(db, SQLITE_LIMIT_ATTACHED, -1) == 10);
+  CHECK("limit COLUMN default", sqlite3_limit(db, SQLITE_LIMIT_COLUMN, -1) == 2000);
+  CHECK("limit unknown id -> -1", sqlite3_limit(db, 99, -1) == -1);
+
+  /* Heap / memory accounting. soft/hard_heap_limit64 return the PRIOR limit,
+     0 by default (this shim never enforces one) — matches the oracle's first
+     call too. memory_used/highwater are a graphite approximation (always 0);
+     asserted as >= 0 so the same check also holds against real sqlite, which
+     reports live bytes. */
+  CHECK("soft_heap_limit64 prior 0", sqlite3_soft_heap_limit64(1000000) == 0);
+  CHECK("hard_heap_limit64 prior 0", sqlite3_hard_heap_limit64(1000000) == 0);
+  CHECK("memory_used >= 0", sqlite3_memory_used() >= 0);
+  CHECK("memory_highwater >= 0", sqlite3_memory_highwater(0) >= 0);
+
+  /* Mutexes: single-threaded no-op shim (non-NULL handle, try succeeds). */
+  {
+    sqlite3_mutex *m = sqlite3_mutex_alloc(0);
+    CHECK("mutex_alloc non-NULL", m != NULL);
+    sqlite3_mutex_enter(m);
+    sqlite3_mutex_leave(m);
+    CHECK("mutex_try OK", sqlite3_mutex_try(m) == SQLITE_OK);
+    sqlite3_mutex_leave(m);
+    sqlite3_mutex_free(m);
   }
 
   sqlite3_close(db);
