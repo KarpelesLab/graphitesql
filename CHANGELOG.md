@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/KarpelesLab/graphitesql/compare/v0.1.7...v0.1.8) - 2026-08-31
+
+### Added
+
+- *(capi)* add introspection, sqlite3_value, and limit/mutex symbols
+- *(capi)* add get_table, prepare v1/16/v3, complete16, keyword introspection
+
+### Testing
+
+- *(session)* verify composite-PK and WITHOUT ROWID changesets vs oracle
+
 ## [0.1.7](https://github.com/KarpelesLab/graphitesql/compare/v0.1.6...v0.1.7) - 2026-08-25
 
 ### Added
