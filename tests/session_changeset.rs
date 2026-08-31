@@ -773,6 +773,181 @@ fn apply_vs_oracle_broader_shapes() {
 }
 
 // ---------------------------------------------------------------------------
+// Additional differential coverage for composite / WITHOUT ROWID shapes: mixed
+// value types in both key and payload columns, and a single session spanning
+// several tables of differing key shapes. The oracle (when configured) is
+// authoritative; byte literals are pinned where the layout is stable.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn composite_pk_blob_and_real_keys() {
+    // A composite PK whose columns are a BLOB and a REAL, with mixed-type,
+    // NULL-containing payload columns. Exercises key hashing/ordering and value
+    // encoding for every storage class inside a composite key. The REAL key
+    // values are deliberately non-whole (see `real_pk_whole_number_note`).
+    check(
+        "CREATE TABLE t(k BLOB, r REAL, v, w, PRIMARY KEY(k, r));",
+        "INSERT INTO t VALUES(x'00ff', 2.5, 'hi', NULL); \
+         INSERT INTO t VALUES(x'ab', -1.5, 7, x'dead'); \
+         UPDATE t SET v='bye', w=3.5 WHERE k=x'00ff'; \
+         DELETE FROM t WHERE k=x'ab';",
+        None,
+    );
+}
+
+#[test]
+fn real_pk_whole_number_note() {
+    // A REAL primary-key column holding a *whole* number (e.g. -1.0) round-trips
+    // byte-exact for the ordinary INSERT / UPDATE / DELETE shapes: the FLOAT
+    // serial type is preserved on both the key and value side.
+    check(
+        "CREATE TABLE t(r REAL PRIMARY KEY, v);",
+        "INSERT INTO t VALUES(-1.0,7),(2.0,8);",
+        None,
+    );
+    check(
+        "CREATE TABLE t(r REAL PRIMARY KEY, v); INSERT INTO t VALUES(-1.0,7),(2.0,8),(3.5,9);",
+        "UPDATE t SET v=100 WHERE r=-1.0; DELETE FROM t WHERE r=2.0;",
+        None,
+    );
+    // NOTE (known residual, orthogonal to composite/WITHOUT ROWID support):
+    // a whole-number real inserted into a REAL column and then deleted *within
+    // the same session* does not coalesce byte-identically to SQLite. SQLite's
+    // preupdate NEW hook reports the value as an IntReal (INTEGER-typed) while
+    // the OLD hook reads it back as FLOAT after storage, so the two ops hash to
+    // different buckets and SQLite emits a standalone DELETE; graphite coalesces
+    // them to nothing. This depends on SQLite's internal MEM_IntReal preupdate
+    // typing and is tracked with the pre-existing REAL-affinity IntReal work,
+    // not the session key-shape work. Non-whole REAL keys are unaffected.
+}
+
+#[test]
+fn without_rowid_composite_mixed_types() {
+    // WITHOUT ROWID composite (TEXT, INTEGER) key with REAL/BLOB/TEXT/NULL
+    // payload columns across INSERT, key-preserving UPDATE, and DELETE.
+    check(
+        "CREATE TABLE t(a TEXT, b INTEGER, c, d, PRIMARY KEY(a, b)) WITHOUT ROWID; \
+         INSERT INTO t VALUES('x', 1, 1.5, x'aa'), ('y', 2, NULL, 'z');",
+        "INSERT INTO t VALUES('w', 9, x'00', 3.25); \
+         UPDATE t SET c='changed', d=NULL WHERE a='x' AND b=1; \
+         DELETE FROM t WHERE a='y' AND b=2;",
+        None,
+    );
+}
+
+#[test]
+fn without_rowid_key_change_is_delete_insert() {
+    // Changing a WITHOUT ROWID PK column is recorded as DELETE(old key) +
+    // INSERT(new key) — the clustered row physically moves.
+    check(
+        "CREATE TABLE t(a TEXT PRIMARY KEY, b) WITHOUT ROWID; INSERT INTO t VALUES('k', 5);",
+        "UPDATE t SET a='m' WHERE a='k';",
+        None,
+    );
+}
+
+#[test]
+fn multi_table_mixed_shapes_one_session() {
+    // A single session spanning three tables of different key shapes: an
+    // INTEGER-PK rowid table, a composite-PK rowid table, and a WITHOUT ROWID
+    // table. The changeset carries one 'T' section per touched table, in
+    // first-touch order, each with its own abPK flags.
+    check(
+        "CREATE TABLE r(id INTEGER PRIMARY KEY, v); \
+         CREATE TABLE c(a, b, v, PRIMARY KEY(a, b)); \
+         CREATE TABLE w(k TEXT PRIMARY KEY, v) WITHOUT ROWID;",
+        "INSERT INTO r VALUES(1, 'one'); \
+         INSERT INTO c VALUES(10, 20, 'thirty'); \
+         INSERT INTO w VALUES('key', 99); \
+         UPDATE r SET v='ONE' WHERE id=1; \
+         UPDATE c SET v='THIRTY' WHERE a=10 AND b=20; \
+         DELETE FROM w WHERE k='key';",
+        None,
+    );
+}
+
+#[test]
+fn without_rowid_multirow_bucket_order() {
+    // Many WITHOUT ROWID rows: the change-record order in the changeset follows
+    // SQLite's hash-bucket iteration, not insertion order. Oracle-authoritative.
+    check(
+        "CREATE TABLE t(k TEXT PRIMARY KEY, v) WITHOUT ROWID;",
+        "INSERT INTO t VALUES('alpha',1),('bravo',2),('charlie',3),('delta',4),\
+         ('echo',5),('foxtrot',6),('golf',7),('hotel',8);",
+        None,
+    );
+}
+
+#[test]
+fn multi_table_mixed_shapes_roundtrip() {
+    // Round-trip a mixed-shape multi-table changeset through apply and confirm
+    // both databases converge (independent of the oracle).
+    use graphitesql::Value;
+    let setup = "CREATE TABLE r(id INTEGER PRIMARY KEY, v); \
+                 CREATE TABLE c(a, b, v, PRIMARY KEY(a, b)); \
+                 CREATE TABLE w(k TEXT, n INTEGER, v, PRIMARY KEY(k, n)) WITHOUT ROWID; \
+                 INSERT INTO r VALUES(1,'r1'); \
+                 INSERT INTO c VALUES(1,2,'c12'); \
+                 INSERT INTO w VALUES('a',1,'w');";
+    let dml = "INSERT INTO r VALUES(2,'r2'); UPDATE r SET v='R1' WHERE id=1; \
+               INSERT INTO c VALUES(3,4,'c34'); DELETE FROM c WHERE a=1 AND b=2; \
+               UPDATE w SET v=x'ff' WHERE k='a' AND n=1; INSERT INTO w VALUES('b',5,NULL);";
+
+    let dump = |conn: &Connection| -> String {
+        let mut out = String::new();
+        for (tbl, ord) in [("r", "id"), ("c", "a,b"), ("w", "k,n")] {
+            let r = conn
+                .query(&format!("SELECT * FROM {tbl} ORDER BY {ord}"))
+                .unwrap();
+            out.push_str(tbl);
+            out.push(':');
+            for row in &r.rows {
+                let cells: Vec<String> = row
+                    .iter()
+                    .map(|v| match v {
+                        Value::Null => "NULL".to_string(),
+                        Value::Integer(i) => format!("{i}"),
+                        Value::Real(f) => format!("R{f}"),
+                        Value::Text(t) => format!("'{t}'"),
+                        Value::Blob(b) => format!(
+                            "x'{}'",
+                            b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+                        ),
+                    })
+                    .collect();
+                out.push_str(&cells.join("|"));
+                out.push(';');
+            }
+            out.push('\n');
+        }
+        out
+    };
+
+    let mut a = Connection::open_memory().unwrap();
+    a.execute_batch(setup).unwrap();
+    let session = a.create_session();
+    session.attach();
+    a.execute_batch(dml).unwrap();
+    let cs = a.session_changeset(&session).unwrap();
+    let post_a = dump(&a);
+
+    let mut b = Connection::open_memory().unwrap();
+    b.execute_batch(setup).unwrap();
+    b.changeset_apply(&cs).unwrap();
+    let post_b = dump(&b);
+
+    assert_eq!(post_a, post_b, "multi-table round-trip");
+
+    // Applied composite-PK / WITHOUT ROWID writes must leave a well-formed file.
+    let ic = b.query("PRAGMA integrity_check").unwrap();
+    assert_eq!(
+        ic.rows.first().and_then(|r| r.first()),
+        Some(&Value::Text("ok".into())),
+        "integrity_check after apply: {ic:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Changeset → changeset transforms: `Changeset::invert` / `Changeset::concat`
 // (roadmap D5). Byte-literal assertions always run; when `GRAPHITE_CSTOOL`
 // points at the C `cstool` oracle (amalgamation with SQLITE_ENABLE_SESSION),
